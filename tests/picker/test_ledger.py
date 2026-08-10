@@ -168,10 +168,22 @@ def test_option_packet_is_hash_checked_and_structure_unique(now):
     with pytest.raises(ValueError, match="structure fingerprint"):
         ledger.authorize_option_packet(duplicate_structure)
 
+    ledger.consume_option_packet(packet.packet_id, now)
+    next_day = replace(
+        packet,
+        packet_id="option-packet-next-day",
+        created_at=packet.created_at + timedelta(days=1),
+        valid_for_date=packet.valid_for_date + timedelta(days=1),
+        expires_at=packet.expires_at + timedelta(days=1),
+        packet_hash="",
+    )
+    ledger.authorize_option_packet(next_day)
+
 
 def test_option_positions_upsert_and_filter_without_changing_identity(now):
     ledger = InMemoryLedger()
     packet = option_packet(now)
+    ledger.authorize_option_packet(packet)
     position = option_position(packet, now)
     ledger.upsert_option_position(position)
 

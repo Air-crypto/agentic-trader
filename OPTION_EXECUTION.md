@@ -85,6 +85,10 @@ Mandatory closes take priority over all entries. Buy-to-close or sell-to-close
 is required on thesis invalidation, a 50% loss of premium for long calls/puts,
 a short-option buyback ask at twice the opening credit, database or account
 halt, operator rollback, or no later than five trading days before expiration.
+Entry halts and the kill-switch file put options into close-only mode; they do
+not block an exact, broker-reviewed risk-reducing close. Account identity,
+Level 2 access, contract/quantity matching, current quote, limit order, and
+regular-session checks still apply to every close.
 
 Assignment or exercise is not treated as a normal fill. If broker state shows
 assignment, exercise, an unknown option position, missing coverage, or released

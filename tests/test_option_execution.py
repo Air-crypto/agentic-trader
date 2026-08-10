@@ -26,6 +26,9 @@ def account(**overrides) -> OptionAccountSnapshot:
         "equity": 2_000.0,
         "cash": 2_000.0,
         "option_level": "option_level_2",
+        "orders_source": "broker",
+        "session_is_regular": True,
+        "agentic_allowed": True,
     }
     defaults.update(overrides)
     return OptionAccountSnapshot(**defaults)
@@ -65,6 +68,32 @@ def test_requires_level_2_and_agentic_account():
     assert "option_level_2_required" in low_level.reasons
     denied = evaluate_option_order(order(), account(agentic_allowed=False), now=NOW)
     assert "account_not_agentic_allowed" in denied.reasons
+
+
+def test_account_defaults_fail_closed_and_nonfinite_values_are_rejected():
+    defaults = OptionAccountSnapshot(
+        account_number=ACCOUNT,
+        equity=2_000.0,
+        cash=2_000.0,
+        option_level="option_level_2",
+    )
+    reasons = evaluate_option_order(order(), defaults, now=NOW).reasons
+    assert "account_not_agentic_allowed" in reasons
+    assert "option_order_count_not_broker_verified" in reasons
+    assert "outside_regular_trading_session" in reasons
+    with pytest.raises(ValueError, match="finite"):
+        account(equity=float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        order(limit_price=float("inf"))
+
+
+def test_strategy_allowlist_cannot_be_configured_to_allow_naked_options():
+    with pytest.raises(ValueError, match="hard allowlist"):
+        OptionExecutionLimits(allowed_strategies=("naked_call",))
+    with pytest.raises(ValueError, match="60"):
+        OptionExecutionLimits(max_quote_age_seconds=61)
+    with pytest.raises(ValueError, match="75"):
+        OptionExecutionLimits(max_long_debit=76)
 
 
 @pytest.mark.parametrize(
@@ -220,6 +249,25 @@ def test_kill_switch_blocks_option_orders(tmp_path):
     (tmp_path / "KILL_SWITCH").write_text("halt")
     decision = evaluate_option_order(order(), account(), root=tmp_path, now=NOW)
     assert "kill_switch_file_present" in decision.reasons
+
+
+def test_risk_reducing_close_remains_available_during_entry_halts(tmp_path):
+    (tmp_path / "KILL_SWITCH").write_text("halt entries")
+    close = order(
+        strategy="close",
+        side="sell",
+        position_effect="close",
+    )
+    decision = evaluate_option_order(
+        close,
+        account(
+            orders_today=4,
+            external_halt_reasons=("picker_database_halt:test",),
+        ),
+        root=tmp_path,
+        now=NOW,
+    )
+    assert decision.approved
 
 
 def test_ref_id_is_stable_and_changes_with_logical_identity():

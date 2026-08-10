@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS option_decision_packets (
     valid_for_date DATE NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     packet_hash TEXT NOT NULL UNIQUE CHECK (length(packet_hash) = 64),
-    structure_fingerprint TEXT NOT NULL UNIQUE
+    structure_fingerprint TEXT NOT NULL
         CHECK (length(structure_fingerprint) = 64),
     status TEXT NOT NULL DEFAULT 'authorized'
         CHECK (status IN ('authorized', 'consumed', 'revoked')),
@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS option_decision_packets (
 
 CREATE INDEX IF NOT EXISTS option_decision_packets_valid
     ON option_decision_packets (valid_for_date, expires_at)
+    WHERE status = 'authorized';
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_authorized_option_structure_per_day
+    ON option_decision_packets (valid_for_date, structure_fingerprint)
     WHERE status = 'authorized';
 
 CREATE OR REPLACE FUNCTION reject_option_packet_content_update()

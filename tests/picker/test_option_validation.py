@@ -156,18 +156,8 @@ def test_grounded_long_call_authorizes_one_limit_contract(
 def test_quantity_policy_cannot_expand_single_contract_authority(
     now, evidence, critic, draft
 ):
-    result = authorize(
-        option_draft(now),
-        [snapshot(now)],
-        evidence,
-        critic,
-        draft,
-        now,
-        policy=LiveOptionPolicy(quantity=2),
-    )
-
-    assert not result.accepted
-    assert "quantity_must_equal_one" in result.reasons
+    with pytest.raises(ValueError, match="quantity"):
+        LiveOptionPolicy(quantity=2)
 
 
 def test_packet_hash_and_id_are_deterministic(now, evidence, critic, draft):
@@ -206,6 +196,24 @@ def test_long_premium_trade_and_aggregate_caps_are_enforced(
     assert "long_premium_risk_exceeds_trade_cap" in expensive.reasons
     assert not aggregate.accepted
     assert "aggregate_long_premium_risk_exceeds_cap" in aggregate.reasons
+
+
+def test_nonfinite_risk_inputs_and_policy_limits_fail_closed(
+    now, evidence, critic, draft
+):
+    result = authorize(
+        option_draft(now),
+        [snapshot(now)],
+        evidence,
+        critic,
+        draft,
+        now,
+        account_equity=float("nan"),
+    )
+    assert not result.accepted
+    assert "account_equity_not_positive" in result.reasons
+    with pytest.raises(ValueError, match="hard ceiling"):
+        LiveOptionPolicy(max_spread_pct_midpoint=float("nan"))
 
 
 def test_covered_call_requires_and_encumbers_100_free_shares(

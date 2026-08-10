@@ -174,6 +174,36 @@ class PickerLedger(Protocol):
         broker_order_id: str | None = None,
     ) -> None: ...
 
+    def sync_option_open(
+        self,
+        position: ActiveOptionPosition,
+        event_id: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        ref_id: str,
+        broker_order_id: str,
+    ) -> None: ...
+
+    def sync_option_close(
+        self,
+        position: ActiveOptionPosition,
+        event_id: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        ref_id: str,
+        broker_order_id: str,
+        close_packet_id: str | None = None,
+    ) -> None: ...
+
+    def cancel_option_packet(
+        self,
+        packet_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> None: ...
+
 
 class InMemoryLedger:
     """Test ledger with the same immutability and uniqueness rules as Postgres."""
@@ -385,8 +415,10 @@ class InMemoryLedger:
         collision = next(
             (
                 item
-                for item in self.option_packets.values()
+                for packet_id, item in self.option_packets.items()
                 if item.structure_fingerprint == packet.structure_fingerprint
+                and item.valid_for_date == packet.valid_for_date
+                and self.option_packet_states[packet_id]["status"] == "authorized"
                 and item.packet_id != packet.packet_id
             ),
             None,
@@ -452,6 +484,10 @@ class InMemoryLedger:
     def upsert_option_position(self, position: ActiveOptionPosition) -> None:
         if not position.verify_hash():
             raise ValueError("Cannot store an option position with an invalid hash")
+        if position.packet_id not in self.option_packets:
+            raise ValueError(
+                f"Unknown option packet for position {position.position_id}"
+            )
         existing = self.option_positions_by_id.get(position.position_id)
         if existing is not None and (
             existing.underlying != position.underlying or existing.strategy != position.strategy
@@ -487,7 +523,12 @@ class InMemoryLedger:
         available_shares: dict[str, int],
         reserved_at: datetime | None = None,
     ) -> None:
-        self._option_packet_state(packet_id)
+        packet_state = self._option_packet_state(packet_id)
+        if packet_state["status"] != "authorized":
+            raise ValueError(
+                f"Option packet {packet_id} cannot reserve collateral from "
+                f"{packet_state['status']}"
+            )
         normalized_shares = _validate_option_reservation(
             collateral_amount,
             share_encumbrances,
@@ -575,6 +616,116 @@ class InMemoryLedger:
         if existing is not None and existing != record:
             raise ValueError(f"Option order event {event_id} is immutable")
         self.option_order_events[event_id] = record
+
+    def sync_option_open(
+        self,
+        position: ActiveOptionPosition,
+        event_id: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        ref_id: str,
+        broker_order_id: str,
+    ) -> None:
+        packet_state = self._option_packet_state(position.packet_id)
+        if packet_state["status"] not in {"authorized", "consumed"}:
+            raise ValueError("Option opening packet is not authorized")
+        existing_event = self.option_order_events.get(event_id)
+        expected_event = {
+            "event_id": event_id,
+            "packet_id": position.packet_id,
+            "position_id": position.position_id,
+            "ref_id": ref_id,
+            "broker_order_id": broker_order_id,
+            "event_type": "opened",
+            "occurred_at": occurred_at,
+            "payload": dict(payload),
+        }
+        if existing_event is not None and existing_event != expected_event:
+            raise ValueError(f"Option order event {event_id} is immutable")
+        self.upsert_option_position(position)
+        if packet_state["status"] == "authorized":
+            self.consume_option_packet(position.packet_id, occurred_at)
+        self.append_option_order_event(
+            event_id,
+            "opened",
+            occurred_at,
+            payload,
+            packet_id=position.packet_id,
+            position_id=position.position_id,
+            ref_id=ref_id,
+            broker_order_id=broker_order_id,
+        )
+
+    def sync_option_close(
+        self,
+        position: ActiveOptionPosition,
+        event_id: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        ref_id: str,
+        broker_order_id: str,
+        close_packet_id: str | None = None,
+    ) -> None:
+        if position.position_id not in self.option_positions_by_id:
+            raise ValueError(f"Unknown option position {position.position_id}")
+        if close_packet_id and close_packet_id != position.packet_id:
+            close_state = self._option_packet_state(close_packet_id)
+            if close_state["status"] not in {"authorized", "consumed"}:
+                raise ValueError("Option close packet is not authorized")
+        existing_event = self.option_order_events.get(event_id)
+        expected_event = {
+            "event_id": event_id,
+            "packet_id": position.packet_id,
+            "position_id": position.position_id,
+            "ref_id": ref_id,
+            "broker_order_id": broker_order_id,
+            "event_type": "closed",
+            "occurred_at": occurred_at,
+            "payload": dict(payload),
+        }
+        if existing_event is not None and existing_event != expected_event:
+            raise ValueError(f"Option order event {event_id} is immutable")
+        self.upsert_option_position(position)
+        reservation = self.option_reservations.get(position.packet_id)
+        if reservation is not None:
+            self.release_option_collateral(position.packet_id, occurred_at)
+        if (
+            close_packet_id
+            and close_packet_id != position.packet_id
+            and self._option_packet_state(close_packet_id)["status"] == "authorized"
+        ):
+            self.consume_option_packet(close_packet_id, occurred_at)
+        self.append_option_order_event(
+            event_id,
+            "closed",
+            occurred_at,
+            payload,
+            packet_id=position.packet_id,
+            position_id=position.position_id,
+            ref_id=ref_id,
+            broker_order_id=broker_order_id,
+        )
+
+    def cancel_option_packet(
+        self,
+        packet_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        occurred_at = occurred_at or datetime.now(UTC)
+        state = self._option_packet_state(packet_id)
+        if state["status"] == "revoked":
+            if state["revocation_reason"] != reason:
+                raise ValueError(f"Option packet {packet_id} was revoked for another reason")
+            return
+        if state["status"] != "authorized":
+            raise ValueError(f"Option packet {packet_id} cannot be cancelled")
+        reservation = self.option_reservations.get(packet_id)
+        if reservation is not None and reservation["status"] == "active":
+            self.release_option_collateral(packet_id, occurred_at)
+        self.revoke_option_packet(packet_id, reason, occurred_at)
 
     def _option_packet_state(self, packet_id: str) -> dict[str, Any]:
         if packet_id not in self.option_packets:
@@ -1365,6 +1516,248 @@ class PostgresLedger:
             row = cursor.fetchone()
             if row is None or tuple(row) != values:
                 raise ValueError(f"Option order event {event_id} is immutable")
+
+    def sync_option_open(
+        self,
+        position: ActiveOptionPosition,
+        event_id: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        ref_id: str,
+        broker_order_id: str,
+    ) -> None:
+        if not position.verify_hash() or position.status != "open":
+            raise ValueError("Opening position must be hash-valid and open")
+        from psycopg.types.json import Jsonb
+
+        event_values = (
+            event_id,
+            position.packet_id,
+            position.position_id,
+            ref_id,
+            broker_order_id,
+            "opened",
+            occurred_at,
+            payload,
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status FROM option_decision_packets "
+                "WHERE packet_id = %s FOR UPDATE",
+                (position.packet_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] not in {"authorized", "consumed"}:
+                raise ValueError("Option opening packet is not authorized")
+            cursor.execute(
+                """
+                INSERT INTO active_option_positions
+                    (position_id, packet_id, underlying, strategy, status, payload)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (position_id) DO UPDATE
+                SET status = EXCLUDED.status,
+                    payload = EXCLUDED.payload,
+                    updated_at = now()
+                WHERE active_option_positions.packet_id = EXCLUDED.packet_id
+                  AND active_option_positions.underlying = EXCLUDED.underlying
+                  AND active_option_positions.strategy = EXCLUDED.strategy
+                """,
+                (
+                    position.position_id,
+                    position.packet_id,
+                    position.underlying,
+                    position.strategy,
+                    position.status,
+                    Jsonb(position.to_dict()),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Option position identity mismatch")
+            if row[0] == "authorized":
+                cursor.execute(
+                    """
+                    UPDATE option_decision_packets
+                    SET status = 'consumed', consumed_at = %s
+                    WHERE packet_id = %s AND status = 'authorized'
+                    """,
+                    (occurred_at, position.packet_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("Option packet consumption raced")
+            cursor.execute(
+                """
+                INSERT INTO option_order_events
+                    (event_id, packet_id, position_id, ref_id, broker_order_id,
+                     event_type, occurred_at, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                (*event_values[:-1], Jsonb(payload)),
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    """
+                    SELECT event_id, packet_id, position_id, ref_id,
+                           broker_order_id, event_type, occurred_at, payload
+                    FROM option_order_events WHERE event_id = %s
+                    """,
+                    (event_id,),
+                )
+                existing = cursor.fetchone()
+                if existing is None or tuple(existing) != event_values:
+                    raise ValueError(f"Option order event {event_id} is immutable")
+
+    def sync_option_close(
+        self,
+        position: ActiveOptionPosition,
+        event_id: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        ref_id: str,
+        broker_order_id: str,
+        close_packet_id: str | None = None,
+    ) -> None:
+        if not position.verify_hash() or position.status != "closed":
+            raise ValueError("Closing position must be hash-valid and closed")
+        from psycopg.types.json import Jsonb
+
+        event_values = (
+            event_id,
+            position.packet_id,
+            position.position_id,
+            ref_id,
+            broker_order_id,
+            "closed",
+            occurred_at,
+            payload,
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT packet_id, underlying, strategy
+                FROM active_option_positions
+                WHERE position_id = %s
+                FOR UPDATE
+                """,
+                (position.position_id,),
+            )
+            existing_position = cursor.fetchone()
+            if existing_position is None or tuple(existing_position) != (
+                position.packet_id,
+                position.underlying,
+                position.strategy,
+            ):
+                raise ValueError("Option position identity mismatch")
+            if close_packet_id and close_packet_id != position.packet_id:
+                cursor.execute(
+                    "SELECT status FROM option_decision_packets "
+                    "WHERE packet_id = %s FOR UPDATE",
+                    (close_packet_id,),
+                )
+                close_state = cursor.fetchone()
+                if close_state is None or close_state[0] not in {
+                    "authorized",
+                    "consumed",
+                }:
+                    raise ValueError("Option close packet is not authorized")
+            cursor.execute(
+                """
+                UPDATE active_option_positions
+                SET status = %s, payload = %s, updated_at = now()
+                WHERE position_id = %s
+                """,
+                (position.status, Jsonb(position.to_dict()), position.position_id),
+            )
+            cursor.execute(
+                """
+                UPDATE option_resource_reservations
+                SET status = 'released', released_at = %s
+                WHERE packet_id = %s AND status = 'active'
+                """,
+                (occurred_at, position.packet_id),
+            )
+            if close_packet_id and close_packet_id != position.packet_id:
+                cursor.execute(
+                    """
+                    UPDATE option_decision_packets
+                    SET status = 'consumed', consumed_at = %s
+                    WHERE packet_id = %s AND status = 'authorized'
+                    """,
+                    (occurred_at, close_packet_id),
+                )
+            cursor.execute(
+                """
+                INSERT INTO option_order_events
+                    (event_id, packet_id, position_id, ref_id, broker_order_id,
+                     event_type, occurred_at, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                (*event_values[:-1], Jsonb(payload)),
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    """
+                    SELECT event_id, packet_id, position_id, ref_id,
+                           broker_order_id, event_type, occurred_at, payload
+                    FROM option_order_events WHERE event_id = %s
+                    """,
+                    (event_id,),
+                )
+                existing = cursor.fetchone()
+                if existing is None or tuple(existing) != event_values:
+                    raise ValueError(f"Option order event {event_id} is immutable")
+
+    def cancel_option_packet(
+        self,
+        packet_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        if not reason.strip():
+            raise ValueError("An option packet cancellation reason is required")
+        occurred_at = occurred_at or datetime.now(UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status, revocation_reason
+                FROM option_decision_packets
+                WHERE packet_id = %s
+                FOR UPDATE
+                """,
+                (packet_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError(f"Unknown option packet {packet_id}")
+            if row[0] == "revoked":
+                if row[1] != reason:
+                    raise ValueError(
+                        f"Option packet {packet_id} was revoked for another reason"
+                    )
+                return
+            if row[0] != "authorized":
+                raise ValueError(f"Option packet {packet_id} cannot be cancelled")
+            cursor.execute(
+                """
+                UPDATE option_resource_reservations
+                SET status = 'released', released_at = %s
+                WHERE packet_id = %s AND status = 'active'
+                """,
+                (occurred_at, packet_id),
+            )
+            cursor.execute(
+                """
+                UPDATE option_decision_packets
+                SET status = 'revoked', revoked_at = %s, revocation_reason = %s
+                WHERE packet_id = %s AND status = 'authorized'
+                """,
+                (occurred_at, reason, packet_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Option packet cancellation raced")
 
     @staticmethod
     def _option_packet_status(cursor: Any, packet_id: str) -> str:

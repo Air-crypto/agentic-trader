@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
+import pandas_market_calendars as mcal
 
 from .models import ActiveThesis
+
+NYSE = mcal.get_calendar("NYSE")
 
 
 @dataclass(frozen=True)
@@ -19,7 +22,25 @@ class InvalidationResult:
 def trading_day_expiry(entry_date: date, horizon_trading_days: int) -> date:
     if not 1 <= horizon_trading_days <= 60:
         raise ValueError("Horizon must be between 1 and 60 trading days")
-    return (pd.Timestamp(entry_date) + pd.offsets.BDay(horizon_trading_days)).date()
+    sessions = NYSE.valid_days(
+        start_date=entry_date + timedelta(days=1),
+        end_date=entry_date + timedelta(days=120),
+    )
+    if len(sessions) < horizon_trading_days:
+        raise RuntimeError("NYSE calendar did not return enough future sessions")
+    return pd.Timestamp(sessions[horizon_trading_days - 1]).date()
+
+
+def trading_days_until(start: date, end: date) -> int:
+    """Count NYSE sessions after start through end, inclusive."""
+    if end <= start:
+        return 0
+    return len(
+        NYSE.valid_days(
+            start_date=start + timedelta(days=1),
+            end_date=end,
+        )
+    )
 
 
 def evaluate_invalidation(

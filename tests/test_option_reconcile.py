@@ -189,16 +189,37 @@ def test_unknown_fill_price_is_a_breach(tmp_path):
     )
     assert "unknown_option_order_detected" in result["breaches"]
 
+    nan_price = broker_order(average_price="NaN")
+    assert "unknown_option_order_detected" in reconcile_option_orders(
+        [approval()],
+        [nan_price],
+        root=tmp_path,
+        engage_on_breach=False,
+    )["breaches"]
 
-def test_cancelled_and_queued_orders_remain_unfilled_without_breach(tmp_path):
-    for state in ("cancelled", "queued"):
-        result = reconcile_option_orders(
-            [approval()],
-            [broker_order(state=state)],
-            root=tmp_path,
-        )
-        assert result["clean"]
-        assert result["approved_but_unfilled"][0]["ref_id"] == REF_ID
+
+def test_cancelled_order_is_terminal_unfilled_and_safe_to_release(tmp_path):
+    result = reconcile_option_orders(
+        [approval()],
+        [broker_order(state="cancelled")],
+        root=tmp_path,
+    )
+    assert result["clean"]
+    assert result["complete"]
+    assert result["terminal_unfilled"][0]["ref_id"] == REF_ID
+
+
+def test_queued_order_is_incomplete_and_never_safe_to_release(tmp_path):
+    result = reconcile_option_orders(
+        [approval()],
+        [broker_order(state="queued")],
+        root=tmp_path,
+    )
+    assert not result["clean"]
+    assert not result["complete"]
+    assert result["breaches"] == []
+    assert result["pending"][0]["ref_id"] == REF_ID
+    assert not (tmp_path / KILL_SWITCH_FILENAME).exists()
 
 
 def test_fill_without_approval_is_unauthorized_and_halts(tmp_path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections import Counter
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -38,7 +39,7 @@ from .option_execution import (
 )
 from .option_reconcile import reconcile_option_orders
 from .options import OptionStructure, analyze_option_structure
-from .picker.invalidation import trading_day_expiry
+from .picker.invalidation import trading_day_expiry, trading_days_until
 from .picker.ledger import PostgresLedger, account_key
 from .picker.models import (
     ActiveThesis,
@@ -899,18 +900,6 @@ def _option_snapshot(path: str) -> tuple[dict[str, object], dict[str, object]]:
     return snapshot, snapshot["account"]
 
 
-def _business_days_until(start: date, end: date) -> int:
-    if end <= start:
-        return 0
-    cursor = start
-    count = 0
-    while cursor < end:
-        cursor += timedelta(days=1)
-        if cursor.weekday() < 5:
-            count += 1
-    return count
-
-
 def _option_equity_constraints(
     option_positions: list[ActiveOptionPosition],
     prices: dict[str, float],
@@ -973,6 +962,28 @@ def _option_premium_stop_ids(
 def _broker_option_id(raw: dict[str, object]) -> str:
     value = raw.get("option_id") or raw.get("option") or raw.get("instrument")
     return str(value or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _broker_option_position_key(
+    raw: dict[str, object],
+) -> tuple[str, str, float]:
+    option_id = _broker_option_id(raw)
+    side = str(
+        raw.get("type")
+        or raw.get("position_type")
+        or raw.get("side")
+        or ""
+    ).lower()
+    value = raw.get("quantity")
+    if isinstance(value, dict):
+        value = value.get("amount")
+    try:
+        quantity = float(value)
+    except (TypeError, ValueError):
+        quantity = -1.0
+    if not option_id or side not in {"long", "short"} or quantity <= 0:
+        raise ValueError("Broker option position is missing id, side, or quantity")
+    return option_id, side, quantity
 
 
 def _broker_equity_shares(
@@ -1150,6 +1161,7 @@ def _option_account_snapshot(
     raw: dict[str, object],
     positions: list[ActiveOptionPosition],
     planned_equity_orders: int = 0,
+    persisted_orders_today: int = 0,
 ) -> OptionAccountSnapshot:
     broker_option_orders = raw.get("broker_option_orders")
     broker_equity_orders = raw.get("broker_equity_orders")
@@ -1158,8 +1170,9 @@ def _option_account_snapshot(
     ):
         openings, _ = summarize_broker_option_orders(broker_option_orders)
         equity_order_count, _ = summarize_broker_orders(broker_equity_orders)
-        orders_today = (
-            equity_order_count + len(broker_option_orders) + planned_equity_orders
+        orders_today = max(
+            equity_order_count + len(broker_option_orders) + planned_equity_orders,
+            persisted_orders_today,
         )
         orders_source = "broker"
     else:
@@ -1174,17 +1187,26 @@ def _option_account_snapshot(
     if not isinstance(broker_positions, list):
         halt_reasons.append("broker_option_positions_missing")
     else:
-        broker_ids = {
-            _broker_option_id(item)
-            for item in broker_positions
-            if isinstance(item, dict)
-        }
-        broker_ids.discard("")
-        ledger_ids = {item.option_id for item in open_positions}
-        if broker_ids != ledger_ids:
+        try:
+            broker_position_counts = Counter(
+                _broker_option_position_key(item)
+                for item in broker_positions
+                if isinstance(item, dict)
+            )
+        except ValueError:
+            broker_position_counts = Counter()
+            halt_reasons.append("broker_option_position_shape_invalid")
+        ledger_position_counts = Counter(
+            (item.option_id, item.side, float(item.quantity))
+            for item in open_positions
+        )
+        if broker_position_counts != ledger_position_counts:
             halt_reasons.append("option_position_ledger_broker_mismatch")
         if any(
             str(item.get("state", "")).lower() in {"assigned", "exercised"}
+            or bool(item.get("pending_assignment"))
+            or bool(item.get("assignment_pending"))
+            or bool(item.get("pending_exercise"))
             for item in broker_positions
             if isinstance(item, dict)
         ):
@@ -1197,7 +1219,7 @@ def _option_account_snapshot(
     mandatory = tuple(
         item.option_id
         for item in open_positions
-        if _business_days_until(today, item.expiration_date) <= 5
+        if trading_days_until(today, item.expiration_date) <= 5
     )
     broker_equity_positions = raw.get("broker_equity_positions")
     underlying_prices = {
@@ -1270,6 +1292,16 @@ def _order_from_option_packet(
 
 
 def command_option_plan(args: argparse.Namespace) -> int:
+    """Serialize option planning with equity planning on this machine."""
+    try:
+        with session_lock(args.root):
+            return _option_plan(args)
+    except SessionLockedError as error:
+        print(json.dumps({"mode": "REFUSED", "reason": str(error)}, indent=2))
+        return 3
+
+
+def _option_plan(args: argparse.Namespace) -> int:
     """Build a broker-ready, fail-closed option plan from authorized packets."""
     now = datetime.now(UTC)
     as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
@@ -1293,10 +1325,12 @@ def command_option_plan(args: argparse.Namespace) -> int:
     if equity_plan_path.exists():
         equity_plan = json.loads(equity_plan_path.read_text())
         planned_equity_orders = len(equity_plan.get("approved_orders", []))
+    persisted_orders_today, _ = daily_consumption(args.root)
     account = _option_account_snapshot(
         account_payload,
         positions,
         planned_equity_orders=planned_equity_orders,
+        persisted_orders_today=persisted_orders_today,
     )
     packets = ledger.valid_option_packets(as_of, now)
     contracts = {
@@ -1382,6 +1416,8 @@ def command_option_plan(args: argparse.Namespace) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n")
+    if approved:
+        record_plan_consumption(len(approved), 0.0, root=args.root)
     append_audit_record({"event": "option_plan", **payload}, root=args.root)
     print(json.dumps(payload, indent=2))
     return 0 if approved else 2
@@ -1400,6 +1436,7 @@ def command_option_reconcile(args: argparse.Namespace) -> int:
     )
     if (
         not result["clean"]
+        and result["breaches"]
         and os.environ.get("DATABASE_URL")
         and os.environ.get("AGENTIC_TRADER_ACCOUNT")
     ):
@@ -1470,15 +1507,43 @@ def command_option_reserve(args: argparse.Namespace) -> int:
 def command_option_sync(args: argparse.Namespace) -> int:
     """Persist option lifecycle changes only after clean option reconciliation."""
     plan = json.loads(Path(args.plan).read_text())
-    reconciliation = json.loads(Path(args.reconciliation).read_text())
-    if not bool(reconciliation.get("clean")):
-        raise ValueError("Cannot sync option state from a non-clean reconciliation")
     executed_raw = json.loads(Path(args.executed).read_text())
     executed_orders = (
         executed_raw.get("orders", [])
         if isinstance(executed_raw, dict)
         else executed_raw
     )
+    stored_reconciliation = json.loads(Path(args.reconciliation).read_text())
+    lifecycle_at = datetime.fromisoformat(
+        str(stored_reconciliation["reconciled_at"]).replace("Z", "+00:00")
+    ).astimezone(UTC)
+    reconciliation = reconcile_option_orders(
+        plan.get("approved_orders", []),
+        executed_orders,
+        root=args.root,
+        engage_on_breach=False,
+    )
+    equity_reconciliation = json.loads(
+        Path(args.equity_reconciliation).read_text()
+    )
+    if not bool(equity_reconciliation.get("clean")):
+        raise ValueError("Cannot sync options before clean equity reconciliation")
+    bound_fields = (
+        "clean",
+        "complete",
+        "breaches",
+        "matched",
+        "pending",
+        "terminal_unfilled",
+        "approved_but_unfilled",
+    )
+    if any(
+        stored_reconciliation.get(field) != reconciliation.get(field)
+        for field in bound_fields
+    ):
+        raise ValueError("Stored option reconciliation is stale or does not match fills")
+    if not bool(reconciliation.get("clean")):
+        raise ValueError("Cannot sync option state from incomplete reconciliation")
     filled_ref_ids = {
         str(item.get("ref_id") or item.get("client_order_id") or "")
         for item in executed_orders
@@ -1499,21 +1564,41 @@ def command_option_sync(args: argparse.Namespace) -> int:
         for packet_id in packet_ids
         if packet_id and (packet := ledger.option_packet(packet_id)) is not None
     }
-    positions = {
-        item.option_id: item
-        for item in ledger.option_positions()
-        if item.status in {"pending_open", "open", "closing"}
-    }
+    positions: dict[str, ActiveOptionPosition] = {}
+    for item in sorted(
+        ledger.option_positions(),
+        key=lambda value: value.status in {"pending_open", "open", "closing"},
+    ):
+        positions[item.option_id] = item
     transitions: list[dict[str, str]] = []
     for order in plan.get("approved_orders", []):
+        packet_id = str(order.get("packet_id", ""))
+        position_effect = str(order.get("position_effect", ""))
+        option_id = str(order.get("option_id", ""))
+        packet = packets.get(packet_id)
+        if packet is not None and packet.position_effect == position_effect:
+            expected_order = _order_from_option_packet(
+                packet,
+                str(plan.get("account_number", "")),
+            )
+            bound_fields = (
+                ("option_id", expected_order.option_id),
+                ("side", expected_order.side),
+                ("position_effect", expected_order.position_effect),
+                ("quantity", expected_order.quantity),
+                ("limit_price", expected_order.limit_price),
+                ("ref_id", expected_order.ref_id),
+            )
+            if any(order.get(field) != value for field, value in bound_fields):
+                raise ValueError("Option plan order does not match its decision packet")
+        elif position_effect == "close":
+            active_position = positions.get(option_id)
+            if active_position is None or packet_id != active_position.packet_id:
+                raise ValueError("Mandatory close does not match an active option position")
         fill = matched.get(str(order.get("ref_id", "")))
         if fill is None:
-            packet_id = str(order.get("packet_id", ""))
-            packet = packets.get(packet_id)
             if packet is not None and str(order.get("position_effect")) == "open":
-                if packet.collateral_required or packet.shares_encumbered:
-                    ledger.release_option_collateral(packet.packet_id)
-                ledger.revoke_option_packet(
+                ledger.cancel_option_packet(
                     packet.packet_id,
                     "approved_option_order_not_filled",
                 )
@@ -1525,16 +1610,12 @@ def command_option_sync(args: argparse.Namespace) -> int:
                 and packet.position_effect == "close"
                 and str(order.get("position_effect")) == "close"
             ):
-                ledger.revoke_option_packet(
+                ledger.cancel_option_packet(
                     packet.packet_id,
                     "approved_option_close_not_filled",
                 )
             continue
-        packet_id = str(order.get("packet_id", ""))
-        position_effect = str(order.get("position_effect", ""))
-        option_id = str(order.get("option_id", ""))
         if position_effect == "open":
-            packet = packets.get(packet_id)
             if packet is None:
                 raise ValueError(f"Option fill references unavailable packet {packet_id}")
             position = ActiveOptionPosition(
@@ -1549,7 +1630,7 @@ def command_option_sync(args: argparse.Namespace) -> int:
                 strike=packet.contract.strike,
                 quantity=packet.quantity,
                 side=("long" if packet.side == "buy" else "short"),
-                opened_at=datetime.now(UTC),
+                opened_at=lifecycle_at,
                 average_open_price=float(fill["average_fill_price"]),
                 premium_at_risk=packet.max_risk,
                 collateral_reserved=packet.collateral_required,
@@ -1557,15 +1638,11 @@ def command_option_sync(args: argparse.Namespace) -> int:
                 status="open",
                 structure_fingerprint=packet.structure_fingerprint,
             )
-            ledger.upsert_option_position(position)
-            ledger.consume_option_packet(packet.packet_id)
-            ledger.append_option_order_event(
+            ledger.sync_option_open(
+                position,
                 content_hash(f"{packet.packet_id}|opened|{order['ref_id']}"),
-                "opened",
-                datetime.now(UTC),
+                lifecycle_at,
                 fill,
-                packet_id=packet.packet_id,
-                position_id=position.position_id,
                 ref_id=str(order["ref_id"]),
                 broker_order_id=str(fill.get("order_id") or ""),
             )
@@ -1575,21 +1652,20 @@ def command_option_sync(args: argparse.Namespace) -> int:
             if position is None:
                 raise ValueError(f"Close fill references unknown option {option_id}")
             closed = replace(position, status="closed", position_hash="")
-            ledger.upsert_option_position(closed)
-            if position.collateral_reserved or position.shares_encumbered:
-                ledger.release_option_collateral(position.packet_id)
             close_packet = packets.get(packet_id)
-            if close_packet is not None and close_packet.position_effect == "close":
-                ledger.consume_option_packet(close_packet.packet_id)
-            ledger.append_option_order_event(
+            ledger.sync_option_close(
+                closed,
                 content_hash(f"{position.position_id}|closed|{order['ref_id']}"),
-                "closed",
-                datetime.now(UTC),
+                lifecycle_at,
                 fill,
-                packet_id=position.packet_id,
-                position_id=position.position_id,
                 ref_id=str(order["ref_id"]),
                 broker_order_id=str(fill.get("order_id") or ""),
+                close_packet_id=(
+                    close_packet.packet_id
+                    if close_packet is not None
+                    and close_packet.position_effect == "close"
+                    else None
+                ),
             )
             transitions.append({"position_id": position.position_id, "status": "closed"})
 
@@ -1843,6 +1919,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reconciliation",
         default="artifacts/live/options-reconciliation.json",
     )
+    option_sync.add_argument(
+        "--equity-reconciliation",
+        default="artifacts/live/reconciliation.json",
+    )
+    option_sync.add_argument("--root", default=".")
     option_sync.add_argument("--output", default="artifacts/live/options-sync.json")
     option_sync.set_defaults(func=command_option_sync)
     return parser

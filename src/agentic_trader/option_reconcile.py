@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -22,14 +23,16 @@ KNOWN_OPTION_ORDER_STATES = {
     "voided",
     "pending_cancelled",
 }
-UNFILLED_OPTION_ORDER_STATES = {
+PENDING_OPTION_ORDER_STATES = {
     "queued",
     "confirmed",
+    "pending_cancelled",
+}
+TERMINAL_UNFILLED_OPTION_ORDER_STATES = {
     "rejected",
     "cancelled",
     "failed",
     "voided",
-    "pending_cancelled",
 }
 
 
@@ -39,9 +42,10 @@ def _number(value: Any) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if isfinite(parsed) else None
 
 
 def _option_id(value: Any) -> str:
@@ -233,6 +237,8 @@ def reconcile_option_orders(
     matched: list[dict[str, Any]] = []
     unauthorized: list[dict[str, Any]] = []
     partial: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    terminal_unfilled: list[dict[str, Any]] = []
     unknown: list[dict[str, Any]] = []
     duplicates: list[dict[str, Any]] = []
     price_breaches: list[dict[str, Any]] = []
@@ -281,11 +287,22 @@ def reconcile_option_orders(
             unknown.append(public)
             continue
         if order.state == "partially_filled":
-            partial.append(public)
+            partial_match_index = next(
+                (
+                    index
+                    for index, approval in enumerate(unconsumed)
+                    if approval["ref_id"]
+                    and order.ref_id == approval["ref_id"]
+                    and order.leg_fingerprint == approval["fingerprint"]
+                ),
+                None,
+            )
+            if partial_match_index is None:
+                unauthorized.append(public)
+            else:
+                unconsumed.pop(partial_match_index)
+                partial.append(public)
             continue
-        if order.state in UNFILLED_OPTION_ORDER_STATES:
-            continue
-
         match_index = next(
             (
                 index
@@ -304,6 +321,13 @@ def reconcile_option_orders(
             continue
 
         approval = unconsumed.pop(match_index)
+        if order.state in PENDING_OPTION_ORDER_STATES:
+            pending.append(public)
+            continue
+        if order.state in TERMINAL_UNFILLED_OPTION_ORDER_STATES:
+            terminal_unfilled.append(public)
+            continue
+
         limit_price = approval["limit_price"]
         fill_price = order.average_fill_price
         direction = approval["direction"]
@@ -340,24 +364,28 @@ def reconcile_option_orders(
     if price_breaches:
         breaches.append("option_fill_price_worse_than_limit")
 
+    approved_missing = [
+        {
+            "ref_id": approval["ref_id"],
+            "quantity": approval["quantity"],
+            "leg_fingerprint": [list(leg) for leg in approval["fingerprint"]],
+        }
+        for approval in unconsumed
+    ]
     result: dict[str, Any] = {
         "reconciled_at": datetime.now(UTC).isoformat(),
-        "clean": not breaches,
+        "clean": not breaches and not pending and not approved_missing,
+        "complete": not pending and not approved_missing,
         "breaches": breaches,
         "matched": matched,
         "unauthorized": unauthorized,
         "partial": partial,
+        "pending": pending,
+        "terminal_unfilled": terminal_unfilled,
         "unknown": unknown,
         "duplicates": duplicates,
         "price_breaches": price_breaches,
-        "approved_but_unfilled": [
-            {
-                "ref_id": approval["ref_id"],
-                "quantity": approval["quantity"],
-                "leg_fingerprint": [list(leg) for leg in approval["fingerprint"]],
-            }
-            for approval in unconsumed
-        ],
+        "approved_but_unfilled": approved_missing,
     }
     if breaches and engage_on_breach:
         engage_kill_switch("; ".join(breaches), root)

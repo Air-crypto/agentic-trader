@@ -12,6 +12,7 @@ import json
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +29,10 @@ def _number(value: Any) -> float | None:
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    return parsed if isfinite(parsed) else None
 
 
 def _option_level(value: int | str | None) -> int:
@@ -99,14 +101,32 @@ class OptionExecutionLimits:
             raise ValueError("Only one-contract option orders are supported")
         if (
             self.max_openings_per_day <= 0
+            or self.max_openings_per_day > 1
             or self.max_open_option_positions <= 0
+            or self.max_open_option_positions > 2
             or self.max_orders_per_day <= 0
+            or self.max_orders_per_day > 4
         ):
-            raise ValueError("Opening and position limits must be positive")
-        if not 0 <= self.min_entry_dte <= self.max_entry_dte:
-            raise ValueError("Entry DTE range is invalid")
-        if self.max_quote_age_seconds <= 0:
-            raise ValueError("max_quote_age_seconds must be positive")
+            raise ValueError("Opening, position, or daily-order limit relaxes hard caps")
+        if (
+            self.min_entry_dte < 21
+            or self.max_entry_dte > 60
+            or self.min_entry_dte > self.max_entry_dte
+        ):
+            raise ValueError("Entry DTE cannot relax the 21-60 day bounds")
+        if not 0 < self.max_quote_age_seconds <= 60:
+            raise ValueError("max_quote_age_seconds cannot exceed 60")
+        if not self.allowed_strategies or not set(self.allowed_strategies).issubset(
+            ALLOWED_STRATEGIES
+        ):
+            raise ValueError("allowed_strategies must be a subset of the hard allowlist")
+        max_long_debit = float(self.max_long_debit)
+        if (
+            not isfinite(max_long_debit)
+            or max_long_debit <= 0
+            or max_long_debit > 75
+        ):
+            raise ValueError("max_long_debit cannot relax the $75 hard cap")
         for name in (
             "max_spread_fraction",
             "max_long_debit_equity_weight",
@@ -116,8 +136,20 @@ class OptionExecutionLimits:
             "min_cash_reserve_weight",
         ):
             value = float(getattr(self, name))
-            if not 0 <= value <= 1:
+            if not isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must be within [0, 1]")
+        ceilings = {
+            "max_spread_fraction": 0.10,
+            "max_long_debit_equity_weight": 0.05,
+            "max_aggregate_long_debit_weight": 0.10,
+            "max_csp_collateral_weight": 0.30,
+            "max_post_assignment_weight": 0.15,
+        }
+        for name, ceiling in ceilings.items():
+            if float(getattr(self, name)) > ceiling:
+                raise ValueError(f"{name} cannot relax its hard ceiling")
+        if self.min_cash_reserve_weight < 0.10:
+            raise ValueError("min_cash_reserve_weight cannot be below 10%")
 
 
 @dataclass(frozen=True)
@@ -138,9 +170,9 @@ class OptionAccountSnapshot:
     underlying_values: dict[str, float] = field(default_factory=dict)
     covered_call_contracts: dict[str, int] = field(default_factory=dict)
     mandatory_close_option_ids: tuple[str, ...] = ()
-    orders_source: str = "broker"
-    session_is_regular: bool = True
-    agentic_allowed: bool = True
+    orders_source: str = "unknown"
+    session_is_regular: bool = False
+    agentic_allowed: bool = False
     external_halt_reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -151,23 +183,49 @@ class OptionAccountSnapshot:
             "csp_collateral",
             "pending_deposits",
         ):
-            object.__setattr__(self, name, float(getattr(self, name)))
+            value = float(getattr(self, name))
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            object.__setattr__(self, name, value)
         for name in ("open_option_positions", "option_openings_today", "orders_today"):
-            object.__setattr__(self, name, int(getattr(self, name)))
+            value = int(getattr(self, name))
+            if value < 0:
+                raise ValueError(f"{name} cannot be negative")
+            object.__setattr__(self, name, value)
+        if not str(self.account_number).strip():
+            raise ValueError("account_number is required")
+        normalized_shares = {
+            str(key).upper(): float(value)
+            for key, value in self.underlying_shares.items()
+        }
+        normalized_values = {
+            str(key).upper(): float(value)
+            for key, value in self.underlying_values.items()
+        }
+        normalized_covered = {
+            str(key).upper(): int(value)
+            for key, value in self.covered_call_contracts.items()
+        }
+        if any(not isfinite(value) or value < 0 for value in normalized_shares.values()):
+            raise ValueError("underlying_shares must be finite and non-negative")
+        if any(not isfinite(value) or value < 0 for value in normalized_values.values()):
+            raise ValueError("underlying_values must be finite and non-negative")
+        if any(value < 0 for value in normalized_covered.values()):
+            raise ValueError("covered_call_contracts cannot be negative")
         object.__setattr__(
             self,
             "underlying_shares",
-            {str(key).upper(): float(value) for key, value in self.underlying_shares.items()},
+            normalized_shares,
         )
         object.__setattr__(
             self,
             "underlying_values",
-            {str(key).upper(): float(value) for key, value in self.underlying_values.items()},
+            normalized_values,
         )
         object.__setattr__(
             self,
             "covered_call_contracts",
-            {str(key).upper(): int(value) for key, value in self.covered_call_contracts.items()},
+            normalized_covered,
         )
 
     @classmethod
@@ -266,6 +324,11 @@ class ProposedOptionOrder:
             object.__setattr__(self, "strike_price", float(self.strike_price))
         if self.days_to_expiration is not None:
             object.__setattr__(self, "days_to_expiration", int(self.days_to_expiration))
+        for name in ("limit_price", "bid_price", "ask_price"):
+            if not isfinite(float(getattr(self, name))):
+                raise ValueError(f"{name} must be finite")
+        if self.strike_price is not None and not isfinite(self.strike_price):
+            raise ValueError("strike_price must be finite")
         for name in (
             "strategy",
             "option_type",
@@ -469,9 +532,12 @@ def evaluate_option_order(
     limits = limits or OptionExecutionLimits()
     now = now or datetime.now(UTC)
     now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
-    reasons = list(account.external_halt_reasons)
+    reasons: list[str] = []
+    opening = order.position_effect == "open"
 
-    if kill_switch_engaged(root):
+    if opening:
+        reasons.extend(account.external_halt_reasons)
+    if opening and kill_switch_engaged(root):
         reasons.append("kill_switch_file_present")
     if not account.agentic_allowed:
         reasons.append("account_not_agentic_allowed")
@@ -481,7 +547,7 @@ def evaluate_option_order(
         reasons.append("option_level_2_required")
     if account.equity <= 0:
         reasons.append("non_positive_equity")
-    if account.orders_today >= limits.max_orders_per_day:
+    if opening and account.orders_today >= limits.max_orders_per_day:
         reasons.append("daily_order_count_limit_reached")
     if account.orders_source != "broker":
         reasons.append("option_order_count_not_broker_verified")
@@ -536,7 +602,6 @@ def evaluate_option_order(
         if spread > limits.max_spread_fraction + 1e-12:
             reasons.append("option_spread_exceeds_limit")
 
-    opening = order.position_effect == "open"
     if opening:
         dte = order.dte(now.date())
         if dte is None:

@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
+from math import isfinite
 from typing import Any
 
 from .models import CriticVerdict, EvidenceVersion, PickerDraft
@@ -34,6 +35,41 @@ class LiveOptionPolicy:
     max_csp_collateral_fraction: float = 0.30
     max_post_assignment_fraction: float = 0.15
     packet_ttl_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if self.quantity != 1:
+            raise ValueError("Option policy quantity must equal one")
+        if self.min_dte < 21 or self.max_dte > 60 or self.min_dte > self.max_dte:
+            raise ValueError("Option policy DTE cannot relax the 21-60 day bounds")
+        if not self.min_dte <= self.target_dte <= self.max_dte:
+            raise ValueError("target_dte must be inside the policy DTE range")
+        if not 0 < self.max_quote_age_seconds <= 60:
+            raise ValueError("Option quote age cannot exceed 60 seconds")
+        ceilings = {
+            "max_spread_pct_midpoint": (self.max_spread_pct_midpoint, 0.10),
+            "max_long_premium_dollars": (self.max_long_premium_dollars, 75.0),
+            "max_long_premium_equity_fraction": (
+                self.max_long_premium_equity_fraction,
+                0.05,
+            ),
+            "max_aggregate_long_premium_fraction": (
+                self.max_aggregate_long_premium_fraction,
+                0.10,
+            ),
+            "max_csp_collateral_fraction": (
+                self.max_csp_collateral_fraction,
+                0.30,
+            ),
+            "max_post_assignment_fraction": (
+                self.max_post_assignment_fraction,
+                0.15,
+            ),
+        }
+        for name, (value, ceiling) in ceilings.items():
+            if not isfinite(value) or value <= 0 or value > ceiling:
+                raise ValueError(f"{name} cannot relax its hard ceiling")
+        if not 0 < self.packet_ttl_seconds <= 300:
+            raise ValueError("Option packet TTL must be between 1 and 300 seconds")
 
 
 @dataclass(frozen=True)
@@ -291,13 +327,13 @@ def validate_option_draft(
         reasons.append("draft_abstained")
     if draft.created_at > now:
         reasons.append("draft_timestamp_in_future")
-    if account_equity <= 0:
+    if not isfinite(account_equity) or account_equity <= 0:
         reasons.append("account_equity_not_positive")
     if policy.quantity != 1:
         reasons.append("quantity_must_equal_one")
-    if available_cash < 0:
+    if not isfinite(available_cash) or available_cash < 0:
         reasons.append("available_cash_negative")
-    if current_underlying_value < 0:
+    if not isfinite(current_underlying_value) or current_underlying_value < 0:
         reasons.append("underlying_value_negative")
     if any(not position.verify_hash() for position in positions):
         reasons.append("active_position_hash_mismatch")
@@ -355,7 +391,7 @@ def validate_option_draft(
                 for item in positions
                 if item.strategy in {"long_call", "long_put"}
             )
-        if existing_risk < 0:
+        if not isfinite(existing_risk) or existing_risk < 0:
             reasons.append("aggregate_open_premium_negative")
         elif max_risk + existing_risk > (
             policy.max_aggregate_long_premium_fraction * account_equity

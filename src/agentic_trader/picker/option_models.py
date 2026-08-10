@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
+from math import isfinite
 from typing import Any
 
 from .models import canonical_json, content_hash, parse_date, parse_timestamp
@@ -29,7 +30,7 @@ OPTION_POSITION_STATUSES = {
 
 def _positive(name: str, value: Any, *, allow_zero: bool = False) -> float:
     parsed = float(value)
-    if parsed < 0 if allow_zero else parsed <= 0:
+    if not isfinite(parsed) or (parsed < 0 if allow_zero else parsed <= 0):
         qualifier = "non-negative" if allow_zero else "positive"
         raise ValueError(f"{name} must be {qualifier}")
     return parsed
