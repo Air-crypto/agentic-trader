@@ -47,7 +47,7 @@ a previous run's file, never estimated.
 PLAN
 9. Write artifacts/live/request.json with the values exactly as returned:
    account_number, equity, cash, pending_deposits, positions, orders_today and
-   notional_today from step 7, and orders_source set to "broker".
+   notional_today from step 8, and orders_source set to "broker".
    Set session_is_regular to true only if the current time is inside
    9:30-16:00 ET on a trading day.
    Targets are SPY 0.50, IEF 0.25, GLD 0.15. Never alter a figure to make an
