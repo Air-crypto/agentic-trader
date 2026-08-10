@@ -1,8 +1,9 @@
 # Automation Operating Prompts
 
-Stage 3 uses two Cursor Automations. Keep these files in sync with
-`AI_STOCK_PICKER.md` and `REAL_MONEY_EXECUTION.md`. Where they disagree, the
-contracts win and the run should stop and say so.
+Stages 3 and 4 use two Cursor Automations. Keep these files in sync with
+`AI_STOCK_PICKER.md`, `OPTION_EXECUTION.md`, and
+`REAL_MONEY_EXECUTION.md`. Where they disagree, the contracts win and the run
+should stop and say so.
 
 Cursor Automation cron is **UTC only** (no timezone field). Schedules below are
 chosen so the live session is inside the US cash equity regular session
@@ -32,24 +33,20 @@ No Robinhood MCP. Requires `DATABASE_URL` set to the Supabase Shared Pooler URI
 from the Connect panel (`*.pooler.supabase.com`, user `postgres.<project-ref>`).
 Direct `db.*.supabase.co` hosts fail with `Network is unreachable` (IPv6-only);
 a pooler host with user `postgres` fails password auth. Stages verified
-evidence, drafts, and critic verdicts via `picker-stage`. Never places orders.
+evidence, stock and option drafts, and critic verdicts via `picker-stage`.
+Research never chooses option contracts and never places orders.
 
 ## Execution
 
 Robinhood MCP required. Requires `AGENTIC_TRADER_ACCOUNT`,
 `AGENTIC_TRADER_NET_DEPOSITS`, and `DATABASE_URL`. Flow:
 
-1. Fresh quant snapshots from the broker
-2. `picker-authorize-batch`
-3. `picker-plan` → `live-plan`
-4. In `MODE: LIVE`, place approved orders, reconcile, then `picker-sync`
+1. Fresh equity quant plus option positions, orders, chains, instruments, and
+   quotes from the broker
+2. `picker-authorize-batch` and `option-authorize-batch`
+3. `picker-plan` → `live-plan`; `option-plan` for exact Level 2 limit orders
+4. In `MODE: LIVE`, review and place only approved equity/option orders
+5. Reconcile both asset classes; sync either lifecycle only when both are clean
 
-Change only the first `MODE:` line between `PLAN_ONLY` and `LIVE`.
-
-## One-shot E2E smoke (disposable)
-
-`automations/smoke-e2e-prompt.txt` is a temporary LIVE run that passes
-`--max-daily-notional 1000 --max-orders-per-day 8` to `live-plan` only. It does
-not change committed defaults. Create the Cursor automation from
-`automations/smoke-e2e.json`, run once during market hours, then delete the
-automation. Prefer disabling any overlapping live automation first.
+Change only the first `MODE:` line between `PLAN_ONLY` and `LIVE`. Options use
+their committed initial caps; do not create a temporary cap-bypass automation.

@@ -17,11 +17,18 @@ rejects. Live trading now uses the Stage 3 AI stock picker under
 [`AI_STOCK_PICKER.md`](AI_STOCK_PICKER.md): research stages evidence into
 Postgres; execution authorizes picks and places only guard-approved orders.
 The picker is unvalidated — same order caps and reconciliation still apply.
+Bounded Level 2 options are governed separately by
+[`OPTION_EXECUTION.md`](OPTION_EXECUTION.md). Only guard-approved long calls,
+long puts, covered calls, cash-secured puts, and closes are eligible; naked
+options, multi-leg spreads, 0DTE, and market option orders remain blocked.
 
 ```bash
 uv run agentic-trader picker-authorize-batch --quant artifacts/picker/quant.json
 uv run agentic-trader picker-plan --snapshot artifacts/picker/snapshot.json
 uv run agentic-trader live-plan --request artifacts/live/request.json --record-equity
+uv run agentic-trader option-migrate
+uv run agentic-trader option-authorize-batch --snapshot artifacts/options/snapshot.json
+uv run agentic-trader option-plan --snapshot artifacts/options/snapshot.json
 touch KILL_SWITCH   # halts all order approval immediately
 ```
 

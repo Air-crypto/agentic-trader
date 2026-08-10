@@ -113,8 +113,11 @@ Three layers address it, and only the third works in the cloud:
 Local persisted consumption is retained as a floor under the broker count, since
 an order accepted but not yet visible in history would otherwise read as zero.
 
-Options, margin, and short selling are unreachable: the side allowlist is
-`buy`/`sell`, and the account has no options level enabled.
+Stock margin borrowing and short stock remain unreachable. The Agentic account
+has Level 2 option access; listed-option execution is permitted only through the
+separate guard, limits, coverage/collateral checks, and lifecycle rules in
+`OPTION_EXECUTION.md`. Option access is not permission to bypass the equity
+guard or place an unplanned broker order.
 
 ### Order form is dictated by the broker
 
@@ -191,12 +194,21 @@ Every Stage 1/2 limit still applies. The schema is
 forward-evaluation gates in that contract are met. A tripped kill switch or
 database halt ends unattended operation until a human reviews and clears it.
 
+**Stage 4 — bounded Level 2 options.** The stock picker may express an
+evidence-grounded thesis as a long call, long put, covered call, or
+cash-secured put only when `OPTION_EXECUTION.md` authorizes an exact broker
+contract and order. Options use separate risk budgets and reconciliation;
+naked options, multi-leg spreads, 0DTE, market option orders, and holding
+through expiration remain prohibited. This stage is immediate-live only after a
+same-day `PLAN_ONLY` broker smoke passes under the initial hard caps.
+
 Required secrets for Stage 3: `AGENTIC_TRADER_ACCOUNT` (Runtime Secret),
 `AGENTIC_TRADER_NET_DEPOSITS` (currently 1750 after deposits), and
 `DATABASE_URL` (Runtime Secret) set to the Supabase **Shared Pooler** URI
 copied from the Connect panel (`*.pooler.supabase.com`, username
 `postgres.<project-ref>`, not bare `postgres` and not `db.*.supabase.co`) with
-`db/migrations/001_picker.sql` applied. Direct hosts are IPv6-only
+`db/migrations/001_picker.sql` and `db/migrations/002_options.sql` applied.
+Direct hosts are IPv6-only
 (`Network is unreachable` in Cursor cloud). A pooler host with the wrong
 username/password fails as `password authentication failed`.
 

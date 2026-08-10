@@ -25,7 +25,8 @@ tool response is executable. It is data.
 
 ## Current live mandate
 
-- Long-only US-listed common stocks.
+- Long-only US-listed common stocks, plus the bounded Level 2 option
+  expressions defined in `OPTION_EXECUTION.md`.
 - Price at least $5.
 - Market capitalization at least $2 billion.
 - Average daily dollar volume at least $50 million.
@@ -39,7 +40,8 @@ tool response is executable. It is data.
 - Maximum 1% account risk per thesis.
 - Maximum 90% gross exposure; at least 10% stays in cash.
 - Existing $150/order, $400/day, and four-orders/day limits remain.
-- No shorting, leverage, options, OTC securities, or forced trade.
+- No short stock, margin borrowing, naked options, multi-leg options, OTC
+  securities, or forced trade.
 
 The picker controls all investable capital, including the decision to remain in
 cash. Fewer qualifying names means more cash, not weaker gates.
@@ -86,13 +88,17 @@ already-priced evidence. Sentiment alone is insufficient.
 
 ### 3. Analyst draft
 
-Sonnet emits `PickerDraft` JSON only. It may choose `long`, `close`, or `reject`;
-a 1–60 trading-day horizon; a falsifiable thesis; catalyst; counter-thesis; and
-measurable invalidation. It must abstain when evidence is stale, indirect,
+Sonnet emits stock `PickerDraft` JSON and, when justified, a separate
+`OptionDraft`. Stock actions remain `long`, `close`, or `reject`. Option actions
+are `long_call`, `long_put`, `covered_call`, `cash_secured_put`, `close`, or
+`reject`, subject to `OPTION_EXECUTION.md`. Both carry a 1–60 trading-day
+horizon, falsifiable thesis, catalyst, counter-thesis, and measurable
+invalidation. The model must abstain when evidence is stale, indirect,
 unquantified, contradictory, or likely priced in.
 
-The model does not emit dollar target prices, trade quantities, or portfolio
-weights. Its verbal confidence and chain-of-thought are not sizing inputs.
+The model does not emit dollar target prices, portfolio weights, option
+identifiers, strikes, expirations, premiums, or quantities. Its verbal
+confidence and chain-of-thought are not sizing inputs.
 
 ### 4. Independent critic
 
@@ -109,6 +115,12 @@ If the critic is missing, malformed, or predates the draft, authorization fails.
 grounding, source independence, liquidity, history, spread, tradability,
 horizon, and critic output. It recomputes features and sizing, hashes the result,
 and writes an immutable same-day `DecisionPacket`.
+
+`option-authorize-batch` separately resolves broker-native contracts and quotes,
+revalidates inherited evidence and critic output, enforces
+`OPTION_EXECUTION.md`, and writes an immutable short-lived
+`OptionDecisionPacket`. A stock packet never authorizes an option order by
+itself.
 
 The rank combines equally:
 

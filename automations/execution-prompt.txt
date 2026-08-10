@@ -1,14 +1,15 @@
 MODE: LIVE
 
 You operate the agentic-trader AI stock picker against a real-money Robinhood
-account. Read AI_STOCK_PICKER.md and REAL_MONEY_EXECUTION.md in full before
-doing anything else and follow them exactly. They are the contract; this prompt
-is only the entry point.
+account. Read AI_STOCK_PICKER.md, OPTION_EXECUTION.md, and
+REAL_MONEY_EXECUTION.md in full before doing anything else and follow them
+exactly. They are the contracts; this prompt is only the entry point.
 
 MODE meanings:
 - PLAN_ONLY: authorize and plan, then stop. Place no orders. Do not call
-  place_equity_order under any circumstance.
-- LIVE: place the guard-approved orders, reconcile, and sync picker state.
+  place_equity_order or place_option_order under any circumstance.
+- LIVE: place the guard-approved equity and option orders, reconcile both, and
+  sync picker state.
 If the MODE line is missing, unreadable, or anything other than LIVE, treat it
 as PLAN_ONLY.
 
@@ -24,67 +25,118 @@ trading-day gate in 5. Do not work around a failure.
 3. uv sync --frozen, uv run pytest, or uv run ruff check . fails. Stop.
    If the uv command is not found, use "$HOME/.local/bin/uv".
 4. Broker connectivity. Call get_accounts and confirm the configured account is
-   present with agentic_allowed true. Report PASS or FAIL with the exact error.
+   present with agentic_allowed true and option_level_2 or higher. Equity can
+   continue if option access is absent, but every option entry must halt.
+   Report PASS or FAIL with the exact error.
 5. Only now, if today is a weekend or US market holiday, stop and report. In
    LIVE mode also stop unless the current time is inside 9:30-16:00 ET.
 
 GATHER — all figures come from the Robinhood MCP, never from memory.
-6. get_portfolio and get_equity_positions for the configured account.
+6. get_portfolio, get_equity_positions, and get_option_positions for the
+   configured account.
 7. Identify candidate symbols from today's staged/authorized picker universe
    plus every currently held equity symbol. For each, fetch get_equity_quotes,
    get_equity_fundamentals, get_equity_tradability, and enough
-   get_equity_historical / technical data to build QuantSnapshot fields
+   get_equity_historicals / technical data to build QuantSnapshot fields
    (price, market_cap, adv_dollar, spread_bps, fractional_tradable,
    history_days, atr_pct, sector). Include SPY as the market benchmark.
 8. get_equity_orders with created_at_gte set to today's date and
-   placed_agent="agentic". Keep native broker shapes.
+   placed_agent="agentic". Also call get_option_orders with the same filters.
+   Keep native broker shapes.
+9. For each actionable option draft and each open option position, call
+   get_option_chains, resolve eligible contracts with get_option_instruments,
+   and fetch live get_option_quotes. Do not select a contract yourself. Write
+   artifacts/options/snapshot.json with an account object containing
+   account_number, equity, cash, pending_deposits, option_level,
+   agentic_allowed, session_is_regular, underlying_prices,
+   broker_equity_orders, broker_option_orders, and the exact
+   broker_equity_positions and nonzero broker_option_positions arrays;
+   and a contracts array of normalized live contract
+   snapshots containing option_id, contract_symbol, underlying, option_type,
+   expiration_date, strike, bid, ask, quote_at, underlying_price, delta, and
+   open_interest. Missing fields remain missing and cause deterministic
+   rejection.
 
 AUTHORIZE AND PLAN
-9. Write artifacts/picker/quant-<YYYY-MM-DD>.json with a snapshots array of
+10. Write artifacts/picker/quant-<YYYY-MM-DD>.json with a snapshots array of
    QuantSnapshot objects from step 7. Never invent a missing field.
-10. Run: uv run agentic-trader picker-authorize-batch
+11. Run: uv run agentic-trader picker-authorize-batch
     --quant artifacts/picker/quant-<YYYY-MM-DD>.json
     --output artifacts/picker/authorized-batch.json
     Exit code 2 with zero authorized packets is a valid fail-closed outcome;
     continue to plan so exits and cash can still be produced.
-11. Write artifacts/picker/snapshot.json with account_number, equity, cash,
+12. Write artifacts/picker/snapshot.json with account_number, equity, cash,
     pending_deposits, broker_positions, broker_orders, prices, and
     session_is_regular from steps 6-8. Never set orders_source, orders_today,
     notional_today, or position market values yourself.
-12. Run: uv run agentic-trader picker-plan
+13. Run: uv run agentic-trader picker-plan
     --snapshot artifacts/picker/snapshot.json
     --output artifacts/live/request.json
-13. Run: uv run agentic-trader live-plan --request artifacts/live/request.json
+14. Run: uv run agentic-trader live-plan --request artifacts/live/request.json
     --record-equity
-    Exit code 3 means another session holds the lock. Stop. Do not retry and do
-    not delete the lock.
+15. Immediately refresh every candidate option quote in
+    artifacts/options/snapshot.json, then run:
+    uv run agentic-trader option-authorize-batch
+    --snapshot artifacts/options/snapshot.json
+    --output artifacts/options/authorized.json
+    Exit code 2 with zero option packets is a valid fail-closed outcome.
+16. Run: uv run agentic-trader option-plan
+    --snapshot artifacts/options/snapshot.json
+    --equity-plan artifacts/live/plan.json
+    --output artifacts/live/options-plan.json
+    Exit code 2 with no option approvals is a valid fail-closed outcome. Exit
+    code 3 means another session holds the lock. Stop; never delete the lock.
 
-EXECUTE — only when MODE is LIVE and approved_orders is non-empty.
-14. For each entry in approved_orders call review_equity_order, then
+EXECUTE — only when MODE is LIVE and at least one plan has approved orders.
+17. For each equity entry in approved_orders call review_equity_order, then
     place_equity_order with that entry's broker_parameters object exactly as
     given, plus its ref_id. Place nothing not in the list. Never generate your
     own ref_id.
-15. Wait for terminal order states. Fetch fills with get_equity_orders and write
-    them to artifacts/live/executed.json.
-16. Run: uv run agentic-trader live-reconcile --executed
+18. For every entry in options-plan.json approved_orders call
+    review_option_order and surface every alert. If any review differs from the
+    plan or has a blocking alert, place no option orders. If all reviews match,
+    run:
+    uv run agentic-trader option-reserve
+    --plan artifacts/live/options-plan.json
+    --snapshot artifacts/options/snapshot.json
+    Then call place_option_order with each exact broker_parameters and ref_id.
+    The operator's saved MODE: LIVE automation is explicit authorization for
+    these guard-approved orders. Never alter a leg, quantity, limit, or
+    position effect.
+19. Wait for terminal states. Fetch equity and option fills separately and
+    write artifacts/live/executed.json and
+    artifacts/live/executed-options.json.
+20. Run: uv run agentic-trader live-reconcile --executed
     artifacts/live/executed.json
+    Then run:
+    uv run agentic-trader option-reconcile
+    --plan artifacts/live/options-plan.json
+    --executed artifacts/live/executed-options.json
     A non-clean result has already engaged the kill switch. Stop and escalate.
-17. Only after a clean reconciliation, run:
+21. Only when both reconciliations are clean, run:
     uv run agentic-trader picker-sync
     --executed artifacts/live/executed.json
+    and:
+    uv run agentic-trader option-sync
+    --plan artifacts/live/options-plan.json
+    --executed artifacts/live/executed-options.json
+    --reconciliation artifacts/live/options-reconciliation.json
 
 REPORT — always, including when you stopped early.
 - MODE, UTC and ET timestamps, and whether today was a trading day.
 - All five preflight results, including broker connectivity.
 - Mask every account identifier to its final four digits.
-- Authorized packet count, target weights, halt reasons, approved and rejected
-  orders with reasons.
-- If LIVE: each order placed, fill versus reference, reconciliation, and sync.
+- Authorized stock and option packet counts, target weights, option contracts
+  and maximum loss/collateral, halt reasons, and approved/rejected orders.
+- If LIVE: each equity/option order placed, fill versus reference,
+  reconciliation, and sync.
 - Anything you could not do and why.
 
 NEVER
 - Browse news, filings, or untrusted pages in this automation.
 - Edit execution.py, reconcile.py, picker validation, or limits to force a pass.
+- Place naked options, multi-leg options, 0DTE, market option orders, or any
+  contract/quantity/price not emitted by option-plan.
 - Trade any account other than the configured one.
 - Place an order without a guard-approved plan, or skip reconciliation.
 - Store account numbers, balances, or risk state in automation memory, or commit

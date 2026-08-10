@@ -30,6 +30,13 @@ from .option_chain import (
     download_option_chain_snapshot,
     write_option_chain_snapshot,
 )
+from .option_execution import (
+    OptionAccountSnapshot,
+    ProposedOptionOrder,
+    evaluate_option_batch,
+    summarize_broker_option_orders,
+)
+from .option_reconcile import reconcile_option_orders
 from .options import OptionStructure, analyze_option_structure
 from .picker.invalidation import trading_day_expiry
 from .picker.ledger import PostgresLedger, account_key
@@ -42,6 +49,13 @@ from .picker.models import (
     QuantSnapshot,
     content_hash,
 )
+from .picker.option_models import (
+    ActiveOptionPosition,
+    OptionContractSnapshot,
+    OptionDecisionPacket,
+    OptionDraft,
+)
+from .picker.option_validation import validate_option_draft
 from .picker.portfolio import build_picker_portfolio
 from .picker.validation import validate_picker_draft
 from .proposal import ResearchProposal, validate_proposal
@@ -336,6 +350,7 @@ def _live_plan(args: argparse.Namespace) -> int:
     equity = float(raw_account["equity"])
     picker_halts: list[str] = []
     database_high_water_mark: float | None = None
+    option_reserved_cash = 0.0
     if bool(request.get("picker_mode", False)):
         configured_account = os.environ.get("AGENTIC_TRADER_ACCOUNT", "")
         if not configured_account or configured_account != str(raw_account["account_number"]):
@@ -357,6 +372,11 @@ def _live_plan(args: argparse.Namespace) -> int:
             if not requested_ids.issubset(valid_packets):
                 picker_halts.append("picker_authorization_packet_missing_or_expired")
             active_theses = ledger.active_theses()
+            active_option_positions = [
+                position
+                for position in ledger.option_positions()
+                if position.status in {"pending_open", "open", "closing"}
+            ]
             permitted_buys = {
                 packet.symbol
                 for packet_id, packet in valid_packets.items()
@@ -373,6 +393,13 @@ def _live_plan(args: argparse.Namespace) -> int:
                 str(symbol).upper(): float(weight)
                 for symbol, weight in request.get("targets", {}).items()
             }
+            option_reserved_cash, option_halts = _option_equity_constraints(
+                active_option_positions,
+                prices,
+                targets,
+                equity,
+            )
+            picker_halts.extend(option_halts)
             for packet_id in requested_ids:
                 packet = valid_packets.get(packet_id)
                 if (
@@ -385,7 +412,7 @@ def _live_plan(args: argparse.Namespace) -> int:
     account = AccountSnapshot(
         account_number=str(raw_account["account_number"]),
         equity=equity,
-        cash=float(raw_account["cash"]),
+        cash=max(float(raw_account["cash"]) - option_reserved_cash, 0.0),
         positions=positions,
         high_water_mark=database_high_water_mark or state.get("high_water_mark"),
         prior_close_equity=state.get("prior_close_equity"),
@@ -585,19 +612,27 @@ def command_picker_stage(args: argparse.Namespace) -> int:
     as_of = date.fromisoformat(str(payload["as_of"]))
     evidence = [EvidenceVersion.from_dict(item) for item in payload["evidence"]]
     drafts = [PickerDraft.from_dict(item) for item in payload["drafts"]]
+    option_drafts = [
+        OptionDraft.from_dict(item) for item in payload.get("option_drafts", [])
+    ]
     critics = [CriticVerdict.from_dict(item) for item in payload["critics"]]
     critic_ids = {item.draft_id for item in critics}
-    if {item.draft_id for item in drafts} != critic_ids:
+    required_critic_ids = {
+        item.source_draft_id or item.draft_id for item in option_drafts
+    } | {item.draft_id for item in drafts}
+    if required_critic_ids != critic_ids:
         raise ValueError("Every staged draft requires exactly one critic verdict")
     if any(item.created_at.date() != as_of for item in drafts):
         raise ValueError("Every draft must be created on the batch as_of date")
+    if any(item.created_at.date() != as_of for item in option_drafts):
+        raise ValueError("Every option draft must be created on the batch as_of date")
     prompt_hash = str(payload["prompt_hash"])
     if len(prompt_hash) != 64:
         raise ValueError("prompt_hash must be a SHA-256 digest")
     model_id = str(payload["model_id"])
     batch_id = str(payload["batch_id"])
     ledger = PostgresLedger.from_env()
-    run_ids = {item.run_id for item in drafts}
+    run_ids = {item.run_id for item in [*drafts, *option_drafts]}
     if len(run_ids) != 1:
         raise ValueError("A research batch must contain exactly one run_id")
     run_id = next(iter(run_ids))
@@ -614,10 +649,24 @@ def command_picker_stage(args: argparse.Namespace) -> int:
         ledger.put_evidence(item)
     for item in drafts:
         ledger.put_draft(item)
+    stock_draft_ids = {item.draft_id for item in drafts}
     for item in critics:
-        ledger.put_critic(item)
+        # The normalized critic table currently references stock drafts. Option
+        # critics remain immutable in the staged payload and inherit the stock
+        # critic when source_draft_id is set.
+        if item.draft_id in stock_draft_ids:
+            ledger.put_critic(item)
     ledger.stage_batch(batch_id, as_of, created_at, prompt_hash, model_id, payload)
-    print(json.dumps({"staged": True, "batch_id": batch_id, "drafts": len(drafts)}))
+    print(
+        json.dumps(
+            {
+                "staged": True,
+                "batch_id": batch_id,
+                "drafts": len(drafts),
+                "option_drafts": len(option_drafts),
+            }
+        )
+    )
     return 0
 
 
@@ -843,6 +892,715 @@ def command_picker_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _option_snapshot(path: str) -> tuple[dict[str, object], dict[str, object]]:
+    snapshot = json.loads(Path(path).read_text())
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("account"), dict):
+        raise ValueError("Option snapshot must contain an account object")
+    return snapshot, snapshot["account"]
+
+
+def _business_days_until(start: date, end: date) -> int:
+    if end <= start:
+        return 0
+    cursor = start
+    count = 0
+    while cursor < end:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            count += 1
+    return count
+
+
+def _option_equity_constraints(
+    option_positions: list[ActiveOptionPosition],
+    prices: dict[str, float],
+    targets: dict[str, float],
+    equity: float,
+) -> tuple[float, list[str]]:
+    active = [
+        position
+        for position in option_positions
+        if position.status in {"pending_open", "open", "closing"}
+    ]
+    reserved_cash = sum(
+        position.collateral_reserved
+        for position in active
+        if position.strategy == "cash_secured_put"
+    )
+    halts: list[str] = []
+    for position in active:
+        if position.strategy != "covered_call":
+            continue
+        encumbered_weight = (
+            position.shares_encumbered
+            * prices.get(position.underlying, 0.0)
+            / equity
+            if equity > 0
+            else 1.0
+        )
+        if targets.get(position.underlying, 0.0) + 1e-9 < encumbered_weight:
+            halts.append(
+                "covered_option_share_encumbrance_blocks_equity_sale:"
+                f"{position.underlying}"
+            )
+    return reserved_cash, halts
+
+
+def _option_premium_stop_ids(
+    positions: list[ActiveOptionPosition],
+    contracts: dict[str, OptionContractSnapshot],
+) -> set[str]:
+    mandatory: set[str] = set()
+    for position in positions:
+        if position.status not in {"pending_open", "open", "closing"}:
+            continue
+        contract = contracts.get(position.option_id)
+        if contract is None:
+            continue
+        if (
+            position.strategy in {"long_call", "long_put"}
+            and contract.midpoint <= position.average_open_price * 0.50
+        ):
+            mandatory.add(position.option_id)
+        if (
+            position.strategy in {"covered_call", "cash_secured_put"}
+            and contract.ask >= position.average_open_price * 2.0
+        ):
+            mandatory.add(position.option_id)
+    return mandatory
+
+
+def _broker_option_id(raw: dict[str, object]) -> str:
+    value = raw.get("option_id") or raw.get("option") or raw.get("instrument")
+    return str(value or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _broker_equity_shares(
+    positions: list[dict[str, object]],
+) -> dict[str, float]:
+    shares: dict[str, float] = {}
+    for position in positions:
+        symbol = str(position.get("symbol", "")).upper()
+        value = position.get("quantity")
+        if isinstance(value, dict):
+            value = value.get("amount")
+        try:
+            quantity = float(value)
+        except (TypeError, ValueError):
+            quantity = -1.0
+        if not symbol or quantity < 0:
+            raise ValueError("Broker position is missing a valid symbol or quantity")
+        shares[symbol] = shares.get(symbol, 0.0) + quantity
+    return shares
+
+
+def command_option_authorize_batch(args: argparse.Namespace) -> int:
+    """Authorize staged option drafts using fresh broker-native contract quotes."""
+    now = datetime.now(UTC)
+    as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
+    ledger = PostgresLedger.from_env()
+    batch = ledger.latest_research_batch(as_of)
+    if batch is None:
+        payload = {"authorized": [], "results": [], "reason": "no_staged_batch"}
+        print(json.dumps(payload))
+        return 2
+
+    staged = batch["payload"]
+    option_drafts = [
+        OptionDraft.from_dict(item) for item in staged.get("option_drafts", [])
+    ]
+    if not option_drafts:
+        payload = {"authorized": [], "results": [], "reason": "no_option_drafts"}
+        print(json.dumps(payload))
+        return 2
+
+    snapshot, account = _option_snapshot(args.snapshot)
+    configured_account = os.environ.get("AGENTIC_TRADER_ACCOUNT", "")
+    if not configured_account or configured_account != str(account["account_number"]):
+        raise ValueError("Option snapshot account does not match AGENTIC_TRADER_ACCOUNT")
+    if not bool(account.get("agentic_allowed")):
+        payload = {
+            "authorized": [],
+            "results": [],
+            "reason": "account_not_agentic_allowed",
+        }
+        print(json.dumps(payload))
+        return 2
+    if str(account.get("option_level", "")).lower() not in {
+        "option_level_2",
+        "option_level_3",
+        "2",
+        "3",
+    }:
+        payload = {
+            "authorized": [],
+            "results": [],
+            "reason": "option_level_2_required",
+        }
+        print(json.dumps(payload))
+        return 2
+    control = ledger.control_state(account_key(configured_account))
+    if bool(control.get("halted")):
+        payload = {
+            "authorized": [],
+            "results": [],
+            "reason": f"picker_database_halt:{control.get('halt_reason') or 'unspecified'}",
+        }
+        print(json.dumps(payload))
+        return 2
+
+    evidence = {
+        item.evidence_id: item
+        for item in (EvidenceVersion.from_dict(raw) for raw in staged["evidence"])
+    }
+    source_drafts = {
+        item.draft_id: item
+        for item in (PickerDraft.from_dict(raw) for raw in staged.get("drafts", []))
+    }
+    critics = {
+        item.draft_id: item
+        for item in (CriticVerdict.from_dict(raw) for raw in staged["critics"])
+    }
+    contracts = [
+        OptionContractSnapshot.from_dict(raw)
+        for raw in snapshot.get("contracts", [])
+    ]
+    positions = ledger.option_positions()
+    equity = float(account["equity"])
+    available_cash = float(account["cash"]) - float(account.get("pending_deposits", 0.0))
+    broker_equity_positions = account.get("broker_equity_positions")
+    underlying_prices = {
+        str(symbol).upper(): float(price)
+        for symbol, price in account.get("underlying_prices", {}).items()
+    }
+    if not isinstance(broker_equity_positions, list):
+        raise ValueError("Option snapshot requires native broker_equity_positions")
+    shares = _broker_equity_shares(broker_equity_positions)
+    values = broker_position_values(broker_equity_positions, underlying_prices)
+    encumbered: dict[str, int] = {}
+    for position in positions:
+        if (
+            position.status in {"pending_open", "open", "closing"}
+            and position.strategy == "covered_call"
+        ):
+            encumbered[position.underlying] = (
+                encumbered.get(position.underlying, 0)
+                + position.shares_encumbered
+            )
+    results: list[dict[str, object]] = []
+    authorized: list[OptionDecisionPacket] = []
+
+    for draft in option_drafts:
+        source = source_drafts.get(draft.source_draft_id or "")
+        critic = critics.get(draft.source_draft_id or draft.draft_id)
+        if critic is None:
+            results.append(
+                {
+                    "draft_id": draft.draft_id,
+                    "accepted": False,
+                    "reasons": ["missing_critic"],
+                    "packet": None,
+                }
+            )
+            continue
+        result = validate_option_draft(
+            draft,
+            evidence,
+            contracts,
+            critic,
+            prompt_hash=str(batch["prompt_hash"]),
+            model_id=str(batch["model_id"]),
+            account_equity=equity,
+            available_cash=available_cash,
+            open_positions=positions,
+            source_draft=source,
+            underlying_shares=int(shares.get(draft.underlying, 0)),
+            encumbered_shares=encumbered.get(draft.underlying, 0),
+            current_underlying_value=values.get(draft.underlying, 0.0),
+            now=now,
+        )
+        results.append({"draft_id": draft.draft_id, **result.to_dict()})
+        if result.packet is None:
+            continue
+        packet = result.packet
+        ledger.authorize_option_packet(packet)
+        authorized.append(packet)
+
+    output_payload = {
+        "batch_id": batch["batch_id"],
+        "authorized": [packet.to_dict() for packet in authorized],
+        "results": results,
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(output_payload, indent=2) + "\n")
+    print(json.dumps(output_payload, indent=2))
+    return 0 if authorized else 2
+
+
+def command_option_migrate(args: argparse.Namespace) -> int:
+    """Apply the idempotent options ledger migration."""
+    PostgresLedger.from_env().apply_migration(args.path)
+    payload = {"applied": True, "migration": str(args.path)}
+    print(json.dumps(payload))
+    return 0
+
+
+def _option_account_snapshot(
+    raw: dict[str, object],
+    positions: list[ActiveOptionPosition],
+    planned_equity_orders: int = 0,
+) -> OptionAccountSnapshot:
+    broker_option_orders = raw.get("broker_option_orders")
+    broker_equity_orders = raw.get("broker_equity_orders")
+    if isinstance(broker_option_orders, list) and isinstance(
+        broker_equity_orders, list
+    ):
+        openings, _ = summarize_broker_option_orders(broker_option_orders)
+        equity_order_count, _ = summarize_broker_orders(broker_equity_orders)
+        orders_today = (
+            equity_order_count + len(broker_option_orders) + planned_equity_orders
+        )
+        orders_source = "broker"
+    else:
+        openings = int(raw.get("option_openings_today", 0))
+        orders_today = int(raw.get("orders_today", 0))
+        orders_source = "unknown"
+    open_positions = [
+        item for item in positions if item.status in {"pending_open", "open", "closing"}
+    ]
+    halt_reasons = [str(item) for item in raw.get("halt_reasons", [])]
+    broker_positions = raw.get("broker_option_positions")
+    if not isinstance(broker_positions, list):
+        halt_reasons.append("broker_option_positions_missing")
+    else:
+        broker_ids = {
+            _broker_option_id(item)
+            for item in broker_positions
+            if isinstance(item, dict)
+        }
+        broker_ids.discard("")
+        ledger_ids = {item.option_id for item in open_positions}
+        if broker_ids != ledger_ids:
+            halt_reasons.append("option_position_ledger_broker_mismatch")
+        if any(
+            str(item.get("state", "")).lower() in {"assigned", "exercised"}
+            for item in broker_positions
+            if isinstance(item, dict)
+        ):
+            halt_reasons.append("option_assignment_or_exercise_detected")
+    covered: dict[str, int] = {}
+    for item in open_positions:
+        if item.strategy == "covered_call":
+            covered[item.underlying] = covered.get(item.underlying, 0) + item.quantity
+    today = datetime.now(UTC).date()
+    mandatory = tuple(
+        item.option_id
+        for item in open_positions
+        if _business_days_until(today, item.expiration_date) <= 5
+    )
+    broker_equity_positions = raw.get("broker_equity_positions")
+    underlying_prices = {
+        str(symbol).upper(): float(price)
+        for symbol, price in raw.get("underlying_prices", {}).items()
+    }
+    if isinstance(broker_equity_positions, list):
+        underlying_shares = _broker_equity_shares(broker_equity_positions)
+        underlying_values = broker_position_values(
+            broker_equity_positions,
+            underlying_prices,
+        )
+    else:
+        underlying_shares = {}
+        underlying_values = {}
+        halt_reasons.append("broker_equity_positions_missing")
+    return OptionAccountSnapshot(
+        account_number=str(raw["account_number"]),
+        equity=float(raw["equity"]),
+        cash=float(raw["cash"]),
+        option_level=str(raw.get("option_level", "")),
+        open_option_positions=len(open_positions),
+        option_openings_today=openings,
+        orders_today=orders_today,
+        aggregate_long_debit=sum(
+            item.premium_at_risk
+            for item in open_positions
+            if item.strategy in {"long_call", "long_put"}
+        ),
+        csp_collateral=sum(
+            item.collateral_reserved
+            for item in open_positions
+            if item.strategy == "cash_secured_put"
+        ),
+        pending_deposits=float(raw.get("pending_deposits", 0.0)),
+        underlying_shares=underlying_shares,
+        underlying_values=underlying_values,
+        covered_call_contracts=covered,
+        mandatory_close_option_ids=mandatory,
+        orders_source=orders_source,
+        session_is_regular=bool(raw.get("session_is_regular", False)),
+        agentic_allowed=bool(raw.get("agentic_allowed", False)),
+        external_halt_reasons=tuple(dict.fromkeys(halt_reasons)),
+    )
+
+
+def _order_from_option_packet(
+    packet: OptionDecisionPacket,
+    account_number: str,
+) -> ProposedOptionOrder:
+    contract = packet.contract
+    return ProposedOptionOrder(
+        account_number=account_number,
+        option_id=contract.option_id,
+        chain_symbol=packet.underlying,
+        strategy=packet.action,
+        option_type=contract.option_type,
+        side=packet.side,
+        position_effect=packet.position_effect,
+        quantity=packet.quantity,
+        limit_price=packet.limit_price,
+        bid_price=contract.bid,
+        ask_price=contract.ask,
+        quote_timestamp=contract.quote_at,
+        expiration_date=contract.expiration_date,
+        strike_price=contract.strike,
+        rationale=f"Authorized option packet {packet.packet_id}",
+        order_date=packet.valid_for_date,
+    )
+
+
+def command_option_plan(args: argparse.Namespace) -> int:
+    """Build a broker-ready, fail-closed option plan from authorized packets."""
+    now = datetime.now(UTC)
+    as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
+    snapshot, raw_account = _option_snapshot(args.snapshot)
+    configured_account = os.environ.get("AGENTIC_TRADER_ACCOUNT", "")
+    if not configured_account or configured_account != str(raw_account["account_number"]):
+        raise ValueError("Option snapshot account does not match AGENTIC_TRADER_ACCOUNT")
+
+    ledger = PostgresLedger.from_env()
+    control = ledger.control_state(account_key(configured_account))
+    positions = ledger.option_positions()
+    account_payload = dict(raw_account)
+    halt_reasons = list(account_payload.get("halt_reasons", []))
+    if bool(control.get("halted")):
+        halt_reasons.append(
+            f"picker_database_halt:{control.get('halt_reason') or 'unspecified'}"
+        )
+    account_payload["halt_reasons"] = halt_reasons
+    planned_equity_orders = 0
+    equity_plan_path = Path(args.equity_plan)
+    if equity_plan_path.exists():
+        equity_plan = json.loads(equity_plan_path.read_text())
+        planned_equity_orders = len(equity_plan.get("approved_orders", []))
+    account = _option_account_snapshot(
+        account_payload,
+        positions,
+        planned_equity_orders=planned_equity_orders,
+    )
+    packets = ledger.valid_option_packets(as_of, now)
+    contracts = {
+        item.option_id: item
+        for item in (
+            OptionContractSnapshot.from_dict(raw)
+            for raw in snapshot.get("contracts", [])
+        )
+    }
+    premium_stop_ids = _option_premium_stop_ids(positions, contracts)
+    if premium_stop_ids:
+        account = replace(
+            account,
+            mandatory_close_option_ids=tuple(
+                sorted(set(account.mandatory_close_option_ids) | premium_stop_ids)
+            ),
+        )
+
+    orders: list[ProposedOptionOrder] = []
+    order_packet_ids: dict[str, str] = {}
+    for position in positions:
+        if (
+            position.status not in {"pending_open", "open", "closing"}
+            or position.option_id not in account.mandatory_close_option_ids
+        ):
+            continue
+        contract = contracts.get(position.option_id)
+        if contract is None:
+            continue
+        side = "sell" if position.side == "long" else "buy"
+        limit_price = contract.bid if side == "sell" else contract.ask
+        order = ProposedOptionOrder(
+            account_number=configured_account,
+            option_id=position.option_id,
+            chain_symbol=position.underlying,
+            strategy="close",
+            option_type=position.option_type,
+            side=side,
+            position_effect="close",
+            quantity=1,
+            limit_price=limit_price,
+            bid_price=contract.bid,
+            ask_price=contract.ask,
+            quote_timestamp=contract.quote_at,
+            expiration_date=contract.expiration_date,
+            strike_price=contract.strike,
+            rationale="Mandatory close no later than five trading days before expiry",
+            order_date=as_of,
+        )
+        orders.append(order)
+        order_packet_ids[order.ref_id] = position.packet_id
+
+    planned_option_ids = {order.option_id for order in orders}
+    for packet in packets:
+        if packet.option_id in planned_option_ids:
+            continue
+        order = _order_from_option_packet(packet, configured_account)
+        orders.append(order)
+        planned_option_ids.add(order.option_id)
+        order_packet_ids[order.ref_id] = packet.packet_id
+
+    decisions = evaluate_option_batch(orders, account, root=args.root, now=now)
+    approved: list[dict[str, object]] = []
+    rejected: list[dict[str, object]] = []
+    for decision in decisions:
+        item = decision.to_dict()
+        item["packet_id"] = order_packet_ids.get(decision.order.ref_id, "")
+        item["broker_parameters"] = decision.order.place_parameters()
+        if decision.approved:
+            approved.append(item)
+        else:
+            rejected.append(item)
+    payload = {
+        "mode": "PLAN_ONLY_REQUIRES_HUMAN_APPROVAL",
+        "account_number": configured_account,
+        "authorization_packet_ids": sorted(
+            {str(item["packet_id"]) for item in approved if item["packet_id"]}
+        ),
+        "approved_orders": approved,
+        "rejected_orders": rejected,
+        "halts": list(account.external_halt_reasons),
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+    append_audit_record({"event": "option_plan", **payload}, root=args.root)
+    print(json.dumps(payload, indent=2))
+    return 0 if approved else 2
+
+
+def command_option_reconcile(args: argparse.Namespace) -> int:
+    """Reconcile native option fills and durably halt on any breach."""
+    plan = json.loads(Path(args.plan).read_text())
+    executed = json.loads(Path(args.executed).read_text())
+    if isinstance(executed, dict):
+        executed = executed.get("orders", [])
+    result = reconcile_option_orders(
+        plan.get("approved_orders", []),
+        executed,
+        root=args.root,
+    )
+    if (
+        not result["clean"]
+        and os.environ.get("DATABASE_URL")
+        and os.environ.get("AGENTIC_TRADER_ACCOUNT")
+    ):
+        PostgresLedger.from_env().halt(
+            account_key(os.environ["AGENTIC_TRADER_ACCOUNT"]),
+            ";".join(str(item) for item in result["breaches"]),
+        )
+        result["database_halt_engaged"] = True
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result, indent=2))
+    return 0 if result["clean"] else 2
+
+
+def command_option_reserve(args: argparse.Namespace) -> int:
+    """Durably reserve covered shares or CSP cash immediately before placement."""
+    plan = json.loads(Path(args.plan).read_text())
+    _, account = _option_snapshot(args.snapshot)
+    configured_account = os.environ.get("AGENTIC_TRADER_ACCOUNT", "")
+    if not configured_account or configured_account != str(account["account_number"]):
+        raise ValueError("Option snapshot account does not match AGENTIC_TRADER_ACCOUNT")
+    ledger = PostgresLedger.from_env()
+    packets = {
+        packet.packet_id: packet
+        for packet in ledger.valid_option_packets(datetime.now(UTC).date())
+    }
+    available_cash = float(account["cash"]) - float(
+        account.get("pending_deposits", 0.0)
+    )
+    broker_equity_positions = account.get("broker_equity_positions")
+    if not isinstance(broker_equity_positions, list):
+        raise ValueError("Option snapshot requires native broker_equity_positions")
+    available_shares = {
+        symbol: int(quantity)
+        for symbol, quantity in _broker_equity_shares(
+            broker_equity_positions
+        ).items()
+    }
+    reserved: list[str] = []
+    for order in plan.get("approved_orders", []):
+        if str(order.get("position_effect")) != "open":
+            continue
+        packet_id = str(order.get("packet_id") or "")
+        packet = packets.get(packet_id)
+        if packet is None:
+            raise ValueError(f"Option plan references unavailable packet {packet_id}")
+        if not (packet.collateral_required or packet.shares_encumbered):
+            continue
+        ledger.reserve_option_collateral(
+            packet.packet_id,
+            account_key(configured_account),
+            packet.collateral_required,
+            (
+                {packet.underlying: packet.shares_encumbered}
+                if packet.shares_encumbered
+                else {}
+            ),
+            available_cash=available_cash,
+            available_shares=available_shares,
+        )
+        reserved.append(packet.packet_id)
+    payload = {"reserved": reserved}
+    print(json.dumps(payload))
+    return 0
+
+
+def command_option_sync(args: argparse.Namespace) -> int:
+    """Persist option lifecycle changes only after clean option reconciliation."""
+    plan = json.loads(Path(args.plan).read_text())
+    reconciliation = json.loads(Path(args.reconciliation).read_text())
+    if not bool(reconciliation.get("clean")):
+        raise ValueError("Cannot sync option state from a non-clean reconciliation")
+    executed_raw = json.loads(Path(args.executed).read_text())
+    executed_orders = (
+        executed_raw.get("orders", [])
+        if isinstance(executed_raw, dict)
+        else executed_raw
+    )
+    filled_ref_ids = {
+        str(item.get("ref_id") or item.get("client_order_id") or "")
+        for item in executed_orders
+        if str(item.get("state", "")).lower() == "filled"
+    }
+    matched = {
+        str(item["ref_id"]): item for item in reconciliation.get("matched", [])
+    }
+    if not set(matched).issubset(filled_ref_ids):
+        raise ValueError("Option reconciliation does not match the executed-order file")
+    ledger = PostgresLedger.from_env()
+    packet_ids = {
+        str(item.get("packet_id") or "")
+        for item in plan.get("approved_orders", [])
+    }
+    packets = {
+        packet_id: packet
+        for packet_id in packet_ids
+        if packet_id and (packet := ledger.option_packet(packet_id)) is not None
+    }
+    positions = {
+        item.option_id: item
+        for item in ledger.option_positions()
+        if item.status in {"pending_open", "open", "closing"}
+    }
+    transitions: list[dict[str, str]] = []
+    for order in plan.get("approved_orders", []):
+        fill = matched.get(str(order.get("ref_id", "")))
+        if fill is None:
+            packet_id = str(order.get("packet_id", ""))
+            packet = packets.get(packet_id)
+            if packet is not None and str(order.get("position_effect")) == "open":
+                if packet.collateral_required or packet.shares_encumbered:
+                    ledger.release_option_collateral(packet.packet_id)
+                ledger.revoke_option_packet(
+                    packet.packet_id,
+                    "approved_option_order_not_filled",
+                )
+                transitions.append(
+                    {"position_id": packet.packet_id, "status": "cancelled"}
+                )
+            elif (
+                packet is not None
+                and packet.position_effect == "close"
+                and str(order.get("position_effect")) == "close"
+            ):
+                ledger.revoke_option_packet(
+                    packet.packet_id,
+                    "approved_option_close_not_filled",
+                )
+            continue
+        packet_id = str(order.get("packet_id", ""))
+        position_effect = str(order.get("position_effect", ""))
+        option_id = str(order.get("option_id", ""))
+        if position_effect == "open":
+            packet = packets.get(packet_id)
+            if packet is None:
+                raise ValueError(f"Option fill references unavailable packet {packet_id}")
+            position = ActiveOptionPosition(
+                position_id=packet.packet_id,
+                packet_id=packet.packet_id,
+                underlying=packet.underlying,
+                strategy=packet.action,
+                option_id=packet.option_id,
+                contract_symbol=packet.contract.contract_symbol,
+                option_type=packet.contract.option_type,
+                expiration_date=packet.contract.expiration_date,
+                strike=packet.contract.strike,
+                quantity=packet.quantity,
+                side=("long" if packet.side == "buy" else "short"),
+                opened_at=datetime.now(UTC),
+                average_open_price=float(fill["average_fill_price"]),
+                premium_at_risk=packet.max_risk,
+                collateral_reserved=packet.collateral_required,
+                shares_encumbered=packet.shares_encumbered,
+                status="open",
+                structure_fingerprint=packet.structure_fingerprint,
+            )
+            ledger.upsert_option_position(position)
+            ledger.consume_option_packet(packet.packet_id)
+            ledger.append_option_order_event(
+                content_hash(f"{packet.packet_id}|opened|{order['ref_id']}"),
+                "opened",
+                datetime.now(UTC),
+                fill,
+                packet_id=packet.packet_id,
+                position_id=position.position_id,
+                ref_id=str(order["ref_id"]),
+                broker_order_id=str(fill.get("order_id") or ""),
+            )
+            transitions.append({"position_id": position.position_id, "status": "open"})
+        elif position_effect == "close":
+            position = positions.get(option_id)
+            if position is None:
+                raise ValueError(f"Close fill references unknown option {option_id}")
+            closed = replace(position, status="closed", position_hash="")
+            ledger.upsert_option_position(closed)
+            if position.collateral_reserved or position.shares_encumbered:
+                ledger.release_option_collateral(position.packet_id)
+            close_packet = packets.get(packet_id)
+            if close_packet is not None and close_packet.position_effect == "close":
+                ledger.consume_option_packet(close_packet.packet_id)
+            ledger.append_option_order_event(
+                content_hash(f"{position.position_id}|closed|{order['ref_id']}"),
+                "closed",
+                datetime.now(UTC),
+                fill,
+                packet_id=position.packet_id,
+                position_id=position.position_id,
+                ref_id=str(order["ref_id"]),
+                broker_order_id=str(fill.get("order_id") or ""),
+            )
+            transitions.append({"position_id": position.position_id, "status": "closed"})
+
+    payload = {"synced": True, "transitions": transitions}
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentic-trader",
@@ -1021,6 +1779,72 @@ def build_parser() -> argparse.ArgumentParser:
     picker_sync.add_argument("--reconciliation", default="artifacts/live/reconciliation.json")
     picker_sync.add_argument("--output", default="artifacts/live/picker-sync.json")
     picker_sync.set_defaults(func=command_picker_sync)
+
+    option_authorize = subparsers.add_parser(
+        "option-authorize-batch",
+        help="Authorize staged Level 2 option drafts using live broker quotes",
+    )
+    option_authorize.add_argument("--snapshot", required=True)
+    option_authorize.add_argument("--as-of")
+    option_authorize.add_argument(
+        "--output", default="artifacts/options/authorized.json"
+    )
+    option_authorize.set_defaults(func=command_option_authorize_batch)
+
+    option_migrate = subparsers.add_parser(
+        "option-migrate",
+        help="Apply the idempotent Postgres migration for Level 2 options",
+    )
+    option_migrate.add_argument(
+        "--path", default="db/migrations/002_options.sql"
+    )
+    option_migrate.set_defaults(func=command_option_migrate)
+
+    option_plan = subparsers.add_parser(
+        "option-plan",
+        help="Build a broker-ready plan from authorized Level 2 option packets",
+    )
+    option_plan.add_argument("--snapshot", required=True)
+    option_plan.add_argument("--as-of")
+    option_plan.add_argument("--root", default=".")
+    option_plan.add_argument(
+        "--equity-plan", default="artifacts/live/plan.json"
+    )
+    option_plan.add_argument("--output", default="artifacts/live/options-plan.json")
+    option_plan.set_defaults(func=command_option_plan)
+
+    option_reconcile = subparsers.add_parser(
+        "option-reconcile",
+        help="Verify option fills against the approved plan and halt on breaches",
+    )
+    option_reconcile.add_argument("--plan", default="artifacts/live/options-plan.json")
+    option_reconcile.add_argument("--executed", required=True)
+    option_reconcile.add_argument("--root", default=".")
+    option_reconcile.add_argument(
+        "--output", default="artifacts/live/options-reconciliation.json"
+    )
+    option_reconcile.set_defaults(func=command_option_reconcile)
+
+    option_reserve = subparsers.add_parser(
+        "option-reserve",
+        help="Reserve covered shares or CSP cash immediately before placement",
+    )
+    option_reserve.add_argument("--plan", default="artifacts/live/options-plan.json")
+    option_reserve.add_argument("--snapshot", required=True)
+    option_reserve.set_defaults(func=command_option_reserve)
+
+    option_sync = subparsers.add_parser(
+        "option-sync",
+        help="Persist option lifecycle changes after clean reconciliation",
+    )
+    option_sync.add_argument("--plan", default="artifacts/live/options-plan.json")
+    option_sync.add_argument("--executed", required=True)
+    option_sync.add_argument(
+        "--reconciliation",
+        default="artifacts/live/options-reconciliation.json",
+    )
+    option_sync.add_argument("--output", default="artifacts/live/options-sync.json")
+    option_sync.set_defaults(func=command_option_sync)
     return parser
 
 

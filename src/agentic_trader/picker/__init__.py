@@ -8,12 +8,22 @@ from .models import (
     PickerDraft,
     QuantSnapshot,
 )
+from .option_models import (
+    ActiveOptionPosition,
+    OptionContractSnapshot,
+    OptionDecisionPacket,
+    OptionDraft,
+)
 
 __all__ = [
+    "ActiveOptionPosition",
     "ActiveThesis",
     "CriticVerdict",
     "DecisionPacket",
     "EvidenceVersion",
+    "OptionContractSnapshot",
+    "OptionDecisionPacket",
+    "OptionDraft",
     "PickerDraft",
     "QuantSnapshot",
 ]

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
 from agentic_trader.picker.ledger import InMemoryLedger
+from agentic_trader.picker.option_models import (
+    ActiveOptionPosition,
+    OptionContractSnapshot,
+    OptionDecisionPacket,
+)
 from agentic_trader.picker.validation import validate_picker_draft
 
 
@@ -65,3 +71,235 @@ def test_duplicate_symbol_action_day_is_rejected(draft, evidence, quant, critic,
     second = authorized_packet(second_draft, evidence, quant, second_critic, now)
     with pytest.raises(ValueError, match="already exists"):
         ledger.authorize_packet(second)
+
+
+def option_packet(now, packet_id="option-packet-1", strike=100.0):
+    contract = OptionContractSnapshot(
+        option_id=f"contract-{strike}",
+        contract_symbol=f"AAPL-{strike}-C",
+        underlying="AAPL",
+        option_type="call",
+        expiration_date=now.date() + timedelta(days=30),
+        strike=strike,
+        bid=1.0,
+        ask=1.05,
+        quote_at=now,
+        underlying_price=100.0,
+    )
+    return OptionDecisionPacket(
+        packet_id=packet_id,
+        run_id="run-options",
+        draft_id="draft-options",
+        created_at=now,
+        valid_for_date=now.date(),
+        expires_at=now + timedelta(minutes=5),
+        underlying="AAPL",
+        action="long_call",
+        contract=contract,
+        quantity=1,
+        side="buy",
+        position_effect="open",
+        limit_price=1.05,
+        max_risk=105.0,
+        collateral_required=0.0,
+        shares_encumbered=0,
+        evidence_ids=("evidence-1",),
+        prompt_hash="p" * 64,
+        model_id="option-model",
+        draft_hash="d" * 64,
+        horizon_trading_days=20,
+        invalidation="Close if the option thesis is invalidated.",
+    )
+
+
+def option_position(packet, now, status="open"):
+    return ActiveOptionPosition(
+        position_id="option-position-1",
+        packet_id=packet.packet_id,
+        underlying=packet.underlying,
+        strategy=packet.strategy,
+        option_id=packet.option_id,
+        contract_symbol=packet.contract.contract_symbol,
+        option_type=packet.contract.option_type,
+        expiration_date=packet.contract.expiration_date,
+        strike=packet.contract.strike,
+        quantity=1,
+        side="long",
+        opened_at=now,
+        average_open_price=packet.limit_price,
+        premium_at_risk=packet.max_risk,
+        collateral_reserved=packet.collateral_required,
+        shares_encumbered=packet.shares_encumbered,
+        status=status,
+        structure_fingerprint=packet.structure_fingerprint,
+    )
+
+
+def test_option_packet_lifecycle_filters_valid_packets(now):
+    ledger = InMemoryLedger()
+    consumed = option_packet(now)
+    revoked = option_packet(now, packet_id="option-packet-2", strike=105.0)
+    ledger.authorize_option_packet(consumed)
+    ledger.authorize_option_packet(revoked)
+
+    assert ledger.valid_option_packets(now.date(), now) == [consumed, revoked]
+    ledger.consume_option_packet(consumed.packet_id, now)
+    ledger.consume_option_packet(consumed.packet_id, now)
+    ledger.revoke_option_packet(revoked.packet_id, "risk limit changed", now)
+    ledger.revoke_option_packet(revoked.packet_id, "risk limit changed", now)
+
+    assert ledger.valid_option_packets(now.date(), now) == []
+    assert ledger.option_packet(consumed.packet_id) == consumed
+    assert ledger.option_packet("missing") is None
+    with pytest.raises(ValueError, match="after consumption"):
+        ledger.revoke_option_packet(consumed.packet_id, "too late", now)
+
+
+def test_option_packet_is_hash_checked_and_structure_unique(now):
+    ledger = InMemoryLedger()
+    packet = option_packet(now)
+    ledger.authorize_option_packet(packet)
+
+    invalid = replace(packet, packet_id="invalid-packet")
+    with pytest.raises(ValueError, match="invalid hash"):
+        ledger.authorize_option_packet(invalid)
+
+    duplicate_structure = replace(packet, packet_id="option-packet-2").with_hash()
+    with pytest.raises(ValueError, match="structure fingerprint"):
+        ledger.authorize_option_packet(duplicate_structure)
+
+
+def test_option_positions_upsert_and_filter_without_changing_identity(now):
+    ledger = InMemoryLedger()
+    packet = option_packet(now)
+    position = option_position(packet, now)
+    ledger.upsert_option_position(position)
+
+    closing = replace(position, status="closing").with_hash()
+    ledger.upsert_option_position(closing)
+    assert ledger.option_positions(status="closing", underlying="AAPL") == [closing]
+    assert ledger.option_positions(status="open") == []
+
+    changed_identity = replace(closing, underlying="MSFT").with_hash()
+    with pytest.raises(ValueError, match="immutable identity"):
+        ledger.upsert_option_position(changed_identity)
+
+
+def test_option_collateral_and_shares_are_reserved_atomically(now):
+    ledger = InMemoryLedger()
+    first = option_packet(now)
+    second = option_packet(now, packet_id="option-packet-2", strike=105.0)
+    ledger.authorize_option_packet(first)
+    ledger.authorize_option_packet(second)
+    ledger.reserve_option_collateral(
+        first.packet_id,
+        "account-hash",
+        100.0,
+        {"aapl": 100},
+        available_cash=150.0,
+        available_shares={"AAPL": 100},
+        reserved_at=now,
+    )
+    ledger.reserve_option_collateral(
+        first.packet_id,
+        "account-hash",
+        100.0,
+        {"AAPL": 100},
+        available_cash=150.0,
+        available_shares={"AAPL": 100},
+        reserved_at=now + timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="cash"):
+        ledger.reserve_option_collateral(
+            second.packet_id,
+            "account-hash",
+            51.0,
+            {"MSFT": 1},
+            available_cash=150.0,
+            available_shares={"MSFT": 1},
+            reserved_at=now,
+        )
+    assert second.packet_id not in ledger.option_reservations
+
+    ledger.release_option_collateral(first.packet_id, now)
+    ledger.release_option_collateral(first.packet_id, now)
+    ledger.reserve_option_collateral(
+        second.packet_id,
+        "account-hash",
+        51.0,
+        {"AAPL": 100},
+        available_cash=150.0,
+        available_shares={"AAPL": 100},
+        reserved_at=now,
+    )
+
+
+def test_option_share_overencumbrance_and_event_immutability(now):
+    ledger = InMemoryLedger()
+    first = option_packet(now)
+    second = option_packet(now, packet_id="option-packet-2", strike=105.0)
+    ledger.authorize_option_packet(first)
+    ledger.authorize_option_packet(second)
+    ledger.reserve_option_collateral(
+        first.packet_id,
+        "account-hash",
+        0.0,
+        {"AAPL": 100},
+        available_cash=0.0,
+        available_shares={"AAPL": 100},
+        reserved_at=now,
+    )
+    with pytest.raises(ValueError, match="shares"):
+        ledger.reserve_option_collateral(
+            second.packet_id,
+            "account-hash",
+            0.0,
+            {"AAPL": 1},
+            available_cash=0.0,
+            available_shares={"AAPL": 100},
+            reserved_at=now,
+        )
+
+    ledger.append_option_order_event(
+        "event-1",
+        "submitted",
+        now,
+        {"state": "queued"},
+        packet_id=first.packet_id,
+        ref_id="ref-1",
+    )
+    ledger.append_option_order_event(
+        "event-1",
+        "submitted",
+        now,
+        {"state": "queued"},
+        packet_id=first.packet_id,
+        ref_id="ref-1",
+    )
+    with pytest.raises(ValueError, match="immutable"):
+        ledger.append_option_order_event(
+            "event-1",
+            "filled",
+            now,
+            {"state": "filled"},
+            packet_id=first.packet_id,
+            ref_id="ref-1",
+        )
+
+
+def test_latest_research_batch_remains_available_after_stock_authorization(now):
+    ledger = InMemoryLedger()
+    payload = {"drafts": [], "option_drafts": [{"draft_id": "option-1"}]}
+    ledger.stage_batch(
+        "batch-1",
+        now.date(),
+        now,
+        "a" * 64,
+        "model",
+        payload,
+    )
+    ledger.set_batch_status("batch-1", "authorized")
+
+    assert ledger.latest_staged_batch(now.date()) is None
+    assert ledger.latest_research_batch(now.date())["batch_id"] == "batch-1"

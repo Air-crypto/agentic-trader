@@ -5,6 +5,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -16,6 +17,7 @@ from .models import (
     EvidenceVersion,
     PickerDraft,
 )
+from .option_models import ActiveOptionPosition, OptionDecisionPacket
 
 DATABASE_URL_ENV = "DATABASE_URL"
 
@@ -23,6 +25,44 @@ DATABASE_URL_ENV = "DATABASE_URL"
 def account_key(account_number: str) -> str:
     """Irreversible account identifier suitable for a shared decision ledger."""
     return hashlib.sha256(account_number.encode()).hexdigest()
+
+
+def _validate_option_reservation(
+    collateral_amount: float,
+    share_encumbrances: dict[str, int],
+    available_cash: float,
+    available_shares: dict[str, int],
+) -> dict[str, int]:
+    if (
+        not isfinite(collateral_amount)
+        or not isfinite(available_cash)
+        or collateral_amount < 0
+        or available_cash < 0
+    ):
+        raise ValueError("Option collateral and available cash cannot be negative")
+    normalized: dict[str, int] = {}
+    for raw_symbol, quantity in share_encumbrances.items():
+        symbol = raw_symbol.strip().upper()
+        if (
+            not symbol
+            or isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity <= 0
+        ):
+            raise ValueError("Share encumbrances require a symbol and positive integer quantity")
+        if symbol in normalized:
+            raise ValueError(f"Duplicate share encumbrance: {symbol}")
+        normalized[symbol] = quantity
+    if collateral_amount == 0 and not normalized:
+        raise ValueError("An option reservation must encumber cash or shares")
+    if collateral_amount > available_cash:
+        raise ValueError("Insufficient unencumbered cash for option collateral")
+    if any(
+        isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0
+        for quantity in available_shares.values()
+    ):
+        raise ValueError("Available share quantities must be non-negative integers")
+    return normalized
 
 
 class PickerLedger(Protocol):
@@ -74,7 +114,65 @@ class PickerLedger(Protocol):
 
     def latest_staged_batch(self, as_of: date) -> dict[str, Any] | None: ...
 
+    def latest_research_batch(self, as_of: date) -> dict[str, Any] | None: ...
+
     def set_batch_status(self, batch_id: str, status: str) -> None: ...
+
+    def authorize_option_packet(self, packet: OptionDecisionPacket) -> None: ...
+
+    def consume_option_packet(
+        self, packet_id: str, consumed_at: datetime | None = None
+    ) -> None: ...
+
+    def revoke_option_packet(
+        self,
+        packet_id: str,
+        reason: str,
+        revoked_at: datetime | None = None,
+    ) -> None: ...
+
+    def valid_option_packets(
+        self, valid_for: date, now: datetime | None = None
+    ) -> list[OptionDecisionPacket]: ...
+
+    def option_packet(self, packet_id: str) -> OptionDecisionPacket | None: ...
+
+    def upsert_option_position(self, position: ActiveOptionPosition) -> None: ...
+
+    def option_positions(
+        self,
+        status: str | None = None,
+        underlying: str | None = None,
+    ) -> list[ActiveOptionPosition]: ...
+
+    def reserve_option_collateral(
+        self,
+        packet_id: str,
+        account_hash: str,
+        collateral_amount: float,
+        share_encumbrances: dict[str, int],
+        *,
+        available_cash: float,
+        available_shares: dict[str, int],
+        reserved_at: datetime | None = None,
+    ) -> None: ...
+
+    def release_option_collateral(
+        self, packet_id: str, released_at: datetime | None = None
+    ) -> None: ...
+
+    def append_option_order_event(
+        self,
+        event_id: str,
+        event_type: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        packet_id: str | None = None,
+        position_id: str | None = None,
+        ref_id: str | None = None,
+        broker_order_id: str | None = None,
+    ) -> None: ...
 
 
 class InMemoryLedger:
@@ -90,6 +188,11 @@ class InMemoryLedger:
         self.controls: dict[str, dict[str, Any]] = {}
         self.outcomes: dict[tuple[str, int], OutcomeMark] = {}
         self.batches: dict[str, dict[str, Any]] = {}
+        self.option_packets: dict[str, OptionDecisionPacket] = {}
+        self.option_packet_states: dict[str, dict[str, Any]] = {}
+        self.option_positions_by_id: dict[str, ActiveOptionPosition] = {}
+        self.option_reservations: dict[str, dict[str, Any]] = {}
+        self.option_order_events: dict[str, dict[str, Any]] = {}
 
     def put_run(
         self,
@@ -258,12 +361,225 @@ class InMemoryLedger:
         ]
         return max(eligible, key=lambda item: item["created_at"]) if eligible else None
 
+    def latest_research_batch(self, as_of: date) -> dict[str, Any] | None:
+        eligible = [
+            record
+            for record in self.batches.values()
+            if record["as_of"] == as_of and record["status"] != "consumed"
+        ]
+        return max(eligible, key=lambda item: item["created_at"]) if eligible else None
+
     def set_batch_status(self, batch_id: str, status: str) -> None:
         if status not in {"staged", "authorized", "rejected", "consumed"}:
             raise ValueError(f"Unsupported batch status: {status}")
         if batch_id not in self.batches:
             raise ValueError(f"Unknown research batch {batch_id}")
         self.batches[batch_id]["status"] = status
+
+    def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
+        if not packet.verify_hash():
+            raise ValueError("Cannot authorize an option packet with an invalid hash")
+        existing = self.option_packets.get(packet.packet_id)
+        if existing is not None and existing != packet:
+            raise ValueError(f"Option packet {packet.packet_id} is immutable")
+        collision = next(
+            (
+                item
+                for item in self.option_packets.values()
+                if item.structure_fingerprint == packet.structure_fingerprint
+                and item.packet_id != packet.packet_id
+            ),
+            None,
+        )
+        if collision is not None:
+            raise ValueError("An option packet already exists for this structure fingerprint")
+        if existing is None:
+            self.option_packets[packet.packet_id] = packet
+            self.option_packet_states[packet.packet_id] = {
+                "status": "authorized",
+                "consumed_at": None,
+                "revoked_at": None,
+                "revocation_reason": None,
+            }
+
+    def consume_option_packet(self, packet_id: str, consumed_at: datetime | None = None) -> None:
+        state = self._option_packet_state(packet_id)
+        if state["status"] == "consumed":
+            return
+        if state["status"] != "authorized":
+            raise ValueError(f"Option packet {packet_id} cannot be consumed from revoked")
+        state["status"] = "consumed"
+        state["consumed_at"] = consumed_at or datetime.now(UTC)
+
+    def revoke_option_packet(
+        self,
+        packet_id: str,
+        reason: str,
+        revoked_at: datetime | None = None,
+    ) -> None:
+        if not reason.strip():
+            raise ValueError("An option packet revocation reason is required")
+        state = self._option_packet_state(packet_id)
+        if state["status"] == "revoked":
+            if state["revocation_reason"] != reason:
+                raise ValueError(f"Option packet {packet_id} was revoked for another reason")
+            return
+        if state["status"] != "authorized":
+            raise ValueError(f"Option packet {packet_id} cannot be revoked after consumption")
+        state["status"] = "revoked"
+        state["revoked_at"] = revoked_at or datetime.now(UTC)
+        state["revocation_reason"] = reason
+
+    def valid_option_packets(
+        self, valid_for: date, now: datetime | None = None
+    ) -> list[OptionDecisionPacket]:
+        now = (now or datetime.now(UTC)).astimezone(UTC)
+        return sorted(
+            [
+                packet
+                for packet_id, packet in self.option_packets.items()
+                if self.option_packet_states[packet_id]["status"] == "authorized"
+                and packet.valid_for_date == valid_for
+                and packet.expires_at > now
+                and packet.verify_hash()
+            ],
+            key=lambda item: item.packet_id,
+        )
+
+    def option_packet(self, packet_id: str) -> OptionDecisionPacket | None:
+        return self.option_packets.get(packet_id)
+
+    def upsert_option_position(self, position: ActiveOptionPosition) -> None:
+        if not position.verify_hash():
+            raise ValueError("Cannot store an option position with an invalid hash")
+        existing = self.option_positions_by_id.get(position.position_id)
+        if existing is not None and (
+            existing.underlying != position.underlying or existing.strategy != position.strategy
+        ):
+            raise ValueError(
+                f"Option position {position.position_id} has immutable identity fields"
+            )
+        self.option_positions_by_id[position.position_id] = position
+
+    def option_positions(
+        self,
+        status: str | None = None,
+        underlying: str | None = None,
+    ) -> list[ActiveOptionPosition]:
+        return sorted(
+            [
+                position
+                for position in self.option_positions_by_id.values()
+                if (status is None or position.status == status)
+                and (underlying is None or position.underlying == underlying)
+            ],
+            key=lambda item: item.position_id,
+        )
+
+    def reserve_option_collateral(
+        self,
+        packet_id: str,
+        account_hash: str,
+        collateral_amount: float,
+        share_encumbrances: dict[str, int],
+        *,
+        available_cash: float,
+        available_shares: dict[str, int],
+        reserved_at: datetime | None = None,
+    ) -> None:
+        self._option_packet_state(packet_id)
+        normalized_shares = _validate_option_reservation(
+            collateral_amount,
+            share_encumbrances,
+            available_cash,
+            available_shares,
+        )
+        record = {
+            "packet_id": packet_id,
+            "account_key": account_hash,
+            "collateral_amount": float(collateral_amount),
+            "share_encumbrances": normalized_shares,
+            "status": "active",
+            "reserved_at": reserved_at or datetime.now(UTC),
+            "released_at": None,
+        }
+        existing = self.option_reservations.get(packet_id)
+        if existing is not None:
+            comparable_fields = (
+                "account_key",
+                "collateral_amount",
+                "share_encumbrances",
+                "status",
+            )
+            if all(existing[key] == record[key] for key in comparable_fields):
+                return
+            raise ValueError(f"Option collateral for {packet_id} is already reserved")
+
+        reserved_cash = sum(
+            item["collateral_amount"]
+            for item in self.option_reservations.values()
+            if item["account_key"] == account_hash and item["status"] == "active"
+        )
+        if reserved_cash + collateral_amount > available_cash:
+            raise ValueError("Insufficient unencumbered cash for option collateral")
+        for symbol, quantity in normalized_shares.items():
+            reserved_quantity = sum(
+                item["share_encumbrances"].get(symbol, 0)
+                for item in self.option_reservations.values()
+                if item["account_key"] == account_hash and item["status"] == "active"
+            )
+            if reserved_quantity + quantity > available_shares.get(symbol, 0):
+                raise ValueError(
+                    f"Insufficient unencumbered shares for option collateral: {symbol}"
+                )
+        self.option_reservations[packet_id] = record
+
+    def release_option_collateral(
+        self, packet_id: str, released_at: datetime | None = None
+    ) -> None:
+        record = self.option_reservations.get(packet_id)
+        if record is None:
+            raise ValueError(f"No option collateral is reserved for {packet_id}")
+        if record["status"] == "released":
+            return
+        record["status"] = "released"
+        record["released_at"] = released_at or datetime.now(UTC)
+
+    def append_option_order_event(
+        self,
+        event_id: str,
+        event_type: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        packet_id: str | None = None,
+        position_id: str | None = None,
+        ref_id: str | None = None,
+        broker_order_id: str | None = None,
+    ) -> None:
+        if packet_id is not None and packet_id not in self.option_packets:
+            raise ValueError(f"Unknown option packet {packet_id}")
+        if position_id is not None and position_id not in self.option_positions_by_id:
+            raise ValueError(f"Unknown option position {position_id}")
+        record = {
+            "event_id": event_id,
+            "packet_id": packet_id,
+            "position_id": position_id,
+            "ref_id": ref_id,
+            "broker_order_id": broker_order_id,
+            "event_type": event_type,
+            "occurred_at": occurred_at,
+            "payload": dict(payload),
+        }
+        existing = self.option_order_events.get(event_id)
+        if existing is not None and existing != record:
+            raise ValueError(f"Option order event {event_id} is immutable")
+        self.option_order_events[event_id] = record
+
+    def _option_packet_state(self, packet_id: str) -> dict[str, Any]:
+        if packet_id not in self.option_packets:
+            raise ValueError(f"Unknown option packet {packet_id}")
+        return self.option_packet_states[packet_id]
 
 
 class PostgresLedger:
@@ -637,6 +953,31 @@ class PostgresLedger:
                 "payload": row[6],
             }
 
+    def latest_research_batch(self, as_of: date) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT batch_id, as_of, created_at, prompt_hash, model_id, status, payload
+                FROM picker_research_batches
+                WHERE as_of = %s AND status <> 'consumed'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (as_of,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "batch_id": row[0],
+                "as_of": row[1],
+                "created_at": row[2],
+                "prompt_hash": row[3],
+                "model_id": row[4],
+                "status": row[5],
+                "payload": row[6],
+            }
+
     def set_batch_status(self, batch_id: str, status: str) -> None:
         if status not in {"staged", "authorized", "rejected", "consumed"}:
             raise ValueError(f"Unsupported batch status: {status}")
@@ -651,3 +992,387 @@ class PostgresLedger:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown research batch {batch_id}")
+
+    def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
+        if not packet.verify_hash():
+            raise ValueError("Cannot authorize an option packet with an invalid hash")
+        from psycopg.types.json import Jsonb
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO option_decision_packets
+                    (packet_id, valid_for_date, expires_at, packet_hash,
+                     structure_fingerprint, payload)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    packet.packet_id,
+                    packet.valid_for_date,
+                    packet.expires_at,
+                    packet.packet_hash,
+                    packet.structure_fingerprint,
+                    Jsonb(packet.to_dict()),
+                ),
+            )
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    "SELECT payload FROM option_decision_packets WHERE packet_id = %s",
+                    (packet.packet_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("An option packet already exists for this hash or structure")
+                if OptionDecisionPacket.from_dict(row[0]) != packet:
+                    raise ValueError(f"Option packet {packet.packet_id} is immutable")
+
+    def consume_option_packet(self, packet_id: str, consumed_at: datetime | None = None) -> None:
+        consumed_at = consumed_at or datetime.now(UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE option_decision_packets
+                SET status = 'consumed', consumed_at = %s
+                WHERE packet_id = %s AND status = 'authorized'
+                """,
+                (consumed_at, packet_id),
+            )
+            if cursor.rowcount == 1:
+                return
+            status = self._option_packet_status(cursor, packet_id)
+            if status != "consumed":
+                raise ValueError(f"Option packet {packet_id} cannot be consumed from {status}")
+
+    def revoke_option_packet(
+        self,
+        packet_id: str,
+        reason: str,
+        revoked_at: datetime | None = None,
+    ) -> None:
+        if not reason.strip():
+            raise ValueError("An option packet revocation reason is required")
+        revoked_at = revoked_at or datetime.now(UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE option_decision_packets
+                SET status = 'revoked', revoked_at = %s, revocation_reason = %s
+                WHERE packet_id = %s AND status = 'authorized'
+                """,
+                (revoked_at, reason, packet_id),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT status, revocation_reason
+                FROM option_decision_packets
+                WHERE packet_id = %s
+                """,
+                (packet_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError(f"Unknown option packet {packet_id}")
+            if row[0] != "revoked":
+                raise ValueError(f"Option packet {packet_id} cannot be revoked from {row[0]}")
+            if row[1] != reason:
+                raise ValueError(f"Option packet {packet_id} was revoked for another reason")
+
+    def valid_option_packets(
+        self, valid_for: date, now: datetime | None = None
+    ) -> list[OptionDecisionPacket]:
+        now = (now or datetime.now(UTC)).astimezone(UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM option_decision_packets
+                WHERE valid_for_date = %s
+                  AND expires_at > %s
+                  AND status = 'authorized'
+                ORDER BY packet_id
+                """,
+                (valid_for, now),
+            )
+            packets = [OptionDecisionPacket.from_dict(row[0]) for row in cursor.fetchall()]
+        return [packet for packet in packets if packet.verify_hash()]
+
+    def option_packet(self, packet_id: str) -> OptionDecisionPacket | None:
+        from .option_models import OptionDecisionPacket
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT payload FROM option_decision_packets WHERE packet_id = %s",
+                (packet_id,),
+            )
+            row = cursor.fetchone()
+        return OptionDecisionPacket.from_dict(row[0]) if row is not None else None
+
+    def upsert_option_position(self, position: ActiveOptionPosition) -> None:
+        if not position.verify_hash():
+            raise ValueError("Cannot store an option position with an invalid hash")
+        from psycopg.types.json import Jsonb
+
+        payload = position.to_dict()
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO active_option_positions
+                    (position_id, packet_id, underlying, strategy, status, payload)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (position_id) DO UPDATE
+                SET status = EXCLUDED.status,
+                    payload = EXCLUDED.payload,
+                    updated_at = now()
+                WHERE active_option_positions.packet_id
+                        IS NOT DISTINCT FROM EXCLUDED.packet_id
+                  AND active_option_positions.underlying = EXCLUDED.underlying
+                  AND active_option_positions.strategy = EXCLUDED.strategy
+                """,
+                (
+                    position.position_id,
+                    payload.get("packet_id"),
+                    position.underlying,
+                    position.strategy,
+                    position.status,
+                    Jsonb(payload),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"Option position {position.position_id} has immutable identity fields"
+                )
+
+    def option_positions(
+        self,
+        status: str | None = None,
+        underlying: str | None = None,
+    ) -> list[ActiveOptionPosition]:
+        filters: list[str] = []
+        parameters: list[Any] = []
+        if status is not None:
+            filters.append("status = %s")
+            parameters.append(status)
+        if underlying is not None:
+            filters.append("underlying = %s")
+            parameters.append(underlying)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT payload
+                FROM active_option_positions
+                {where}
+                ORDER BY position_id
+                """,
+                parameters,
+            )
+            return [ActiveOptionPosition.from_dict(row[0]) for row in cursor.fetchall()]
+
+    def reserve_option_collateral(
+        self,
+        packet_id: str,
+        account_hash: str,
+        collateral_amount: float,
+        share_encumbrances: dict[str, int],
+        *,
+        available_cash: float,
+        available_shares: dict[str, int],
+        reserved_at: datetime | None = None,
+    ) -> None:
+        normalized_shares = _validate_option_reservation(
+            collateral_amount,
+            share_encumbrances,
+            available_cash,
+            available_shares,
+        )
+        reserved_at = reserved_at or datetime.now(UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (account_hash,),
+            )
+            cursor.execute(
+                "SELECT status FROM option_decision_packets WHERE packet_id = %s",
+                (packet_id,),
+            )
+            packet_row = cursor.fetchone()
+            if packet_row is None:
+                raise ValueError(f"Unknown option packet {packet_id}")
+            if packet_row[0] != "authorized":
+                raise ValueError(
+                    f"Option packet {packet_id} cannot reserve collateral from {packet_row[0]}"
+                )
+
+            cursor.execute(
+                """
+                SELECT account_key, collateral_amount, status
+                FROM option_resource_reservations
+                WHERE packet_id = %s
+                """,
+                (packet_id,),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                cursor.execute(
+                    """
+                    SELECT symbol, quantity
+                    FROM option_share_encumbrances
+                    WHERE packet_id = %s
+                    ORDER BY symbol
+                    """,
+                    (packet_id,),
+                )
+                existing_shares = dict(cursor.fetchall())
+                if (
+                    existing[0] == account_hash
+                    and float(existing[1]) == float(collateral_amount)
+                    and existing[2] == "active"
+                    and existing_shares == normalized_shares
+                ):
+                    return
+                raise ValueError(f"Option collateral for {packet_id} is already reserved")
+
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(collateral_amount), 0)
+                FROM option_resource_reservations
+                WHERE account_key = %s AND status = 'active'
+                """,
+                (account_hash,),
+            )
+            reserved_cash = float(cursor.fetchone()[0])
+            if reserved_cash + collateral_amount > available_cash:
+                raise ValueError("Insufficient unencumbered cash for option collateral")
+
+            if normalized_shares:
+                cursor.execute(
+                    """
+                    SELECT shares.symbol, SUM(shares.quantity)
+                    FROM option_share_encumbrances AS shares
+                    JOIN option_resource_reservations AS reservations
+                      ON reservations.packet_id = shares.packet_id
+                    WHERE reservations.account_key = %s
+                      AND reservations.status = 'active'
+                      AND shares.symbol = ANY(%s)
+                    GROUP BY shares.symbol
+                    """,
+                    (account_hash, list(normalized_shares)),
+                )
+                already_reserved = dict(cursor.fetchall())
+                for symbol, quantity in normalized_shares.items():
+                    if int(already_reserved.get(symbol, 0)) + quantity > available_shares.get(
+                        symbol, 0
+                    ):
+                        raise ValueError(
+                            f"Insufficient unencumbered shares for option collateral: {symbol}"
+                        )
+
+            cursor.execute(
+                """
+                INSERT INTO option_resource_reservations
+                    (packet_id, account_key, collateral_amount, reserved_at)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (packet_id, account_hash, collateral_amount, reserved_at),
+            )
+            if normalized_shares:
+                cursor.executemany(
+                    """
+                    INSERT INTO option_share_encumbrances
+                        (packet_id, symbol, quantity)
+                    VALUES (%s, %s, %s)
+                    """,
+                    [
+                        (packet_id, symbol, quantity)
+                        for symbol, quantity in normalized_shares.items()
+                    ],
+                )
+
+    def release_option_collateral(
+        self, packet_id: str, released_at: datetime | None = None
+    ) -> None:
+        released_at = released_at or datetime.now(UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE option_resource_reservations
+                SET status = 'released', released_at = %s
+                WHERE packet_id = %s AND status = 'active'
+                """,
+                (released_at, packet_id),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                "SELECT status FROM option_resource_reservations WHERE packet_id = %s",
+                (packet_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError(f"No option collateral is reserved for {packet_id}")
+            if row[0] != "released":
+                raise ValueError(f"Unsupported option collateral status: {row[0]}")
+
+    def append_option_order_event(
+        self,
+        event_id: str,
+        event_type: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        packet_id: str | None = None,
+        position_id: str | None = None,
+        ref_id: str | None = None,
+        broker_order_id: str | None = None,
+    ) -> None:
+        from psycopg.types.json import Jsonb
+
+        values = (
+            event_id,
+            packet_id,
+            position_id,
+            ref_id,
+            broker_order_id,
+            event_type,
+            occurred_at,
+            payload,
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO option_order_events
+                    (event_id, packet_id, position_id, ref_id, broker_order_id,
+                     event_type, occurred_at, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (event_id) DO NOTHING
+                """,
+                (*values[:-1], Jsonb(payload)),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT event_id, packet_id, position_id, ref_id, broker_order_id,
+                       event_type, occurred_at, payload
+                FROM option_order_events
+                WHERE event_id = %s
+                """,
+                (event_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != values:
+                raise ValueError(f"Option order event {event_id} is immutable")
+
+    @staticmethod
+    def _option_packet_status(cursor: Any, packet_id: str) -> str:
+        cursor.execute(
+            "SELECT status FROM option_decision_packets WHERE packet_id = %s",
+            (packet_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Unknown option packet {packet_id}")
+        return str(row[0])
