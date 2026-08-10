@@ -4,6 +4,7 @@ import pytest
 
 from agentic_trader.execution import (
     ACCOUNT_ENV_VAR,
+    NET_DEPOSITS_ENV_VAR,
     AccountSnapshot,
     ExecutionLimits,
     ProposedOrder,
@@ -20,6 +21,8 @@ TEST_ACCOUNT = "111111111"
 @pytest.fixture(autouse=True)
 def configured_account(monkeypatch):
     monkeypatch.setenv(ACCOUNT_ENV_VAR, TEST_ACCOUNT)
+    # Cleared so a value in the developer's shell cannot change test outcomes.
+    monkeypatch.delenv(NET_DEPOSITS_ENV_VAR, raising=False)
 
 
 def make_account(**overrides) -> AccountSnapshot:
@@ -33,6 +36,7 @@ def make_account(**overrides) -> AccountSnapshot:
         "orders_today": 0,
         "notional_today": 0.0,
         "pending_deposits": 0.0,
+        "orders_source": "broker",
     }
     defaults.update(overrides)
     return AccountSnapshot(**defaults)
@@ -162,6 +166,76 @@ def test_daily_loss_halt_blocks_trading():
     account = make_account(equity=720.0, prior_close_equity=750.0, high_water_mark=750.0)
     decision = evaluate_order(make_order(), account)
     assert "daily_loss_halt" in decision.reasons
+
+
+def test_unverified_order_count_is_rejected():
+    """A duplicate run must not be able to claim it has placed nothing today."""
+    decision = evaluate_order(make_order(), make_account(orders_source="unknown"))
+    assert "daily_order_count_not_broker_verified" in decision.reasons
+
+
+def test_locally_sourced_order_count_is_rejected():
+    decision = evaluate_order(make_order(), make_account(orders_source="local_state"))
+    assert "daily_order_count_not_broker_verified" in decision.reasons
+
+
+def test_capital_floor_halts_without_any_persisted_state():
+    account = make_account(
+        equity=600.0, net_deposits=750.0, high_water_mark=None, prior_close_equity=None
+    )
+    decision = evaluate_order(make_order(), account)
+    assert "capital_floor_breached" in decision.reasons
+
+
+def test_refuses_to_trade_with_no_loss_limit_at_all():
+    """A fresh cloud checkout has no persisted peak; unprotected trading is worse
+    than not trading."""
+    account = make_account(high_water_mark=None, prior_close_equity=None, net_deposits=None)
+    decision = evaluate_order(make_order(), account)
+    assert "no_drawdown_protection_available" in decision.reasons
+
+
+def test_configured_net_deposits_restores_protection(monkeypatch):
+    monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "750")
+    account = make_account(
+        equity=700.0, cash=700.0, high_water_mark=None, prior_close_equity=None, net_deposits=None
+    )
+    decision = evaluate_order(make_order(), account)
+    assert "no_drawdown_protection_available" not in decision.reasons
+    assert decision.approved
+
+
+def test_configured_net_deposits_also_enforces_the_floor(monkeypatch):
+    monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "750")
+    account = make_account(
+        equity=600.0, cash=600.0, high_water_mark=None, prior_close_equity=None, net_deposits=None
+    )
+    assert "capital_floor_breached" in evaluate_order(make_order(), account).reasons
+
+
+def test_malformed_net_deposits_does_not_silently_disable_protection(monkeypatch):
+    monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "not-a-number")
+    account = make_account(high_water_mark=None, prior_close_equity=None, net_deposits=None)
+    assert "no_drawdown_protection_available" in evaluate_order(make_order(), account).reasons
+
+
+def test_capital_floor_allows_trading_above_the_floor():
+    account = make_account(
+        equity=700.0, cash=700.0, net_deposits=750.0, high_water_mark=None, prior_close_equity=None
+    )
+    assert evaluate_order(make_order(), account).approved
+
+
+def test_capital_floor_tracks_additional_deposits():
+    account = make_account(
+        equity=900.0,
+        cash=900.0,
+        net_deposits=1_500.0,
+        high_water_mark=None,
+        prior_close_equity=None,
+    )
+    decision = evaluate_order(make_order(), account)
+    assert "capital_floor_breached" in decision.reasons
 
 
 def test_daily_order_count_limit():

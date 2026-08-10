@@ -50,17 +50,36 @@ An agent may propose; only the guard may approve.
 | Max notional/day | $400 | Bounds a runaway loop in dollars |
 | Daily loss halt | −3% | Stops trading into a bad session |
 | Drawdown halt | −10% from high-water mark | Matches the original mandate |
+| Capital floor | −10% of `AGENTIC_TRADER_NET_DEPOSITS` | Stateless; works with no persistence |
+| No loss limit available | Rejects every order | Unprotected trading is worse than none |
 | Unsettled deposits | Excluded from buying power | Cannot spend uncleared money |
+| Order count source | Must be `broker` | A local count is not trustworthy |
 | Session lock | `artifacts/live/session.lock` | One live session at a time |
-| Daily budget | Persisted in `artifacts/live/state.json` | A duplicate run cannot re-spend it |
+| Daily budget | Broker history, floored by local state | A duplicate run cannot re-spend it |
 | Kill switch | `KILL_SWITCH` file at repo root | Blocks every order unconditionally |
 
-Duplicate triggers are a demonstrated failure mode, not a hypothetical: an
-automation run on 2026-08-09 observed a concurrent near-identical run writing to
-shared memory. Without the lock and the persisted daily budget, two runs would
-each read zero orders placed today and each submit the full plan, doubling the
-position. The budget is persisted rather than read from the request because a
-concurrent run's fills may not appear in broker order history yet.
+### Required environment
+
+| Variable | Effect if unset |
+| --- | --- |
+| `AGENTIC_TRADER_ACCOUNT` | Every order rejected (`agentic_account_not_configured`) |
+| `AGENTIC_TRADER_NET_DEPOSITS` | Capital floor disabled; without a persisted peak, every order rejected |
+
+### Duplicate triggers
+
+This is a demonstrated failure mode, not a hypothetical: an automation run on
+2026-08-09 observed a concurrent near-identical run writing to shared memory.
+Two such runs would each read zero orders placed today and each submit the full
+plan, doubling the position.
+
+`orders_today` must therefore come from the broker, via `get_equity_orders` with
+`created_at_gte` set to today and `placed_agent="agentic"`. The broker sees a
+concurrent run's orders before either run has written anything locally, which
+local state cannot. The guard rejects any snapshot whose `orders_source` is not
+`broker`, so omitting the query fails closed rather than silently trading.
+
+Local persisted consumption is retained as a floor under the broker count, since
+an order accepted but not yet visible in history would otherwise read as zero.
 
 Options, margin, and short selling are unreachable: the side allowlist is
 `buy`/`sell`, and the account has no options level enabled.
@@ -104,18 +123,35 @@ until a human reviews and clears it.
 holdout gates. Nothing currently qualifies, and Stage 3 does not open on a
 schedule; it opens on evidence. Wanting to skip to Stage 3 is not evidence.
 
-## 5. Why this stays local
+## 5. Running without local persistence
 
-The drawdown halt reads the high-water mark from `artifacts/live/state.json`. A
-cloud automation runs from a fresh checkout, so that file is absent and the halt
-silently cannot fire. Until state is externalized, the scheduled cloud automation
-stays research-only and must not be granted order-placing tools.
+A cloud run starts from a fresh checkout, so `artifacts/live/state.json` is
+absent and the high-water-mark drawdown halt cannot fire. The response is not to
+externalize that file but to remove the dependency on it, because state stored
+outside the broker can go stale, be lost, or be written by the wrong run.
+
+Both critical protections are now derived rather than stored:
+
+- **Daily budget** comes from broker order history, which is authoritative and
+  already shared between concurrent runs.
+- **Loss limit** comes from the capital floor, computed from
+  `AGENTIC_TRADER_NET_DEPOSITS`, which is a constant rather than state.
+
+The high-water-mark halt remains an additional check wherever the file exists,
+and its absence degrades to the capital floor instead of to nothing. If neither
+is available the guard rejects every order, so a misconfigured cloud run places
+nothing rather than trading unprotected.
+
+Update `AGENTIC_TRADER_NET_DEPOSITS` whenever capital is added or withdrawn. A
+stale value silently moves the floor.
 
 ## 6. Session procedure
 
 1. Stop immediately if `KILL_SWITCH` exists. Do not delete it.
 2. Trade only on a regular session day. Skip weekends and market holidays.
-3. Fetch account, positions, and quotes via the Robinhood MCP.
+3. Fetch account, positions, and quotes via the Robinhood MCP. Also call
+   `get_equity_orders` with `created_at_gte` set to today and
+   `placed_agent="agentic"`, and set `orders_source` to `broker`.
 4. Write them to `artifacts/live/request.json` verbatim. Never edit a value to
    make an order pass; the high-water mark is read from disk precisely so a
    rewritten request cannot clear a halt.

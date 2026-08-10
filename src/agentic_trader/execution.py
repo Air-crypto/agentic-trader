@@ -23,10 +23,25 @@ from typing import Any
 # closed instead of falling back to a default.
 ACCOUNT_ENV_VAR = "AGENTIC_TRADER_ACCOUNT"
 
+# Total capital contributed to the account. Configuring this gives a loss limit
+# that needs no persistence, so the guard stays protected in a fresh checkout.
+NET_DEPOSITS_ENV_VAR = "AGENTIC_TRADER_NET_DEPOSITS"
+
 
 def agentic_account_number() -> str | None:
     value = os.environ.get(ACCOUNT_ENV_VAR, "").strip()
     return value or None
+
+
+def configured_net_deposits() -> float | None:
+    value = os.environ.get(NET_DEPOSITS_ENV_VAR, "").strip()
+    if not value:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
 
 
 # Restricted to the instruments the tournament actually measured. Anything the
@@ -105,8 +120,10 @@ class ExecutionLimits:
     max_daily_notional: float = 400.0
     max_daily_loss_weight: float = 0.03
     max_drawdown_weight: float = 0.10
+    max_loss_from_deposits_weight: float = 0.10
     min_order_notional: float = 25.0
     allow_fractional: bool = True
+    require_broker_order_counts: bool = True
     symbol_allowlist: tuple[str, ...] = DEFAULT_SYMBOL_ALLOWLIST
 
     def position_cap_for(self, symbol: str) -> float:
@@ -143,6 +160,11 @@ class AccountSnapshot:
     orders_today: int = 0
     notional_today: float = 0.0
     pending_deposits: float = 0.0
+    net_deposits: float | None = None
+    # Where orders_today came from. Only "broker" is trustworthy under a
+    # duplicate trigger, because a concurrent run's orders exist at the broker
+    # before either run has written anything locally.
+    orders_source: str = "unknown"
 
     @property
     def settled_equity(self) -> float:
@@ -211,12 +233,30 @@ def check_account_halts(
         reasons.append("daily_order_count_limit_reached")
     if account.notional_today >= limits.max_daily_notional:
         reasons.append("daily_notional_limit_reached")
+    if limits.require_broker_order_counts and account.orders_source != "broker":
+        reasons.append("daily_order_count_not_broker_verified")
+
+    # Stateless and therefore the one drawdown protection that still works in an
+    # environment with no persistence, such as a fresh cloud checkout.
+    net_deposits = account.net_deposits
+    if net_deposits is None:
+        net_deposits = configured_net_deposits()
+    if net_deposits is not None and net_deposits > 0:
+        floor = net_deposits * (1.0 - limits.max_loss_from_deposits_weight)
+        if account.equity < floor:
+            reasons.append("capital_floor_breached")
 
     high_water_mark = account.high_water_mark
     if high_water_mark is not None and high_water_mark > 0:
         drawdown = 1.0 - (account.equity / high_water_mark)
         if drawdown >= limits.max_drawdown_weight:
             reasons.append("max_drawdown_halt")
+
+    # With neither a persisted peak nor a known deposit base there is no loss
+    # limit of any kind, which is the exact situation a fresh cloud checkout
+    # produces. Refuse rather than trade unprotected.
+    if high_water_mark is None and not net_deposits:
+        reasons.append("no_drawdown_protection_available")
 
     prior_close = account.prior_close_equity
     if prior_close is not None and prior_close > 0:

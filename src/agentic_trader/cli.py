@@ -298,11 +298,18 @@ def _live_plan(args: argparse.Namespace) -> int:
         positions={str(k).upper(): float(v) for k, v in raw_account.get("positions", {}).items()},
         high_water_mark=state.get("high_water_mark"),
         prior_close_equity=state.get("prior_close_equity"),
-        # Take the larger of what the caller reports and what this repo already
-        # approved today, so a duplicate run cannot re-spend the daily budget.
+        # Take the larger of the broker's count and what this repo approved
+        # today, so a duplicate run cannot re-spend the daily budget whether or
+        # not the other run's orders have reached the broker yet.
         orders_today=max(int(raw_account.get("orders_today", 0)), persisted_orders),
         notional_today=max(float(raw_account.get("notional_today", 0.0)), persisted_notional),
         pending_deposits=float(raw_account.get("pending_deposits", 0.0)),
+        net_deposits=(
+            float(raw_account["net_deposits"])
+            if raw_account.get("net_deposits") is not None
+            else None
+        ),
+        orders_source=str(raw_account.get("orders_source", "unknown")),
     )
     limits = ExecutionLimits(
         max_order_notional=args.max_order_notional,
