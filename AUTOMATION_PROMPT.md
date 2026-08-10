@@ -35,3 +35,11 @@ Robinhood MCP required. Requires `AGENTIC_TRADER_ACCOUNT`,
 4. In `MODE: LIVE`, place approved orders, reconcile, then `picker-sync`
 
 Change only the first `MODE:` line between `PLAN_ONLY` and `LIVE`.
+
+## One-shot E2E smoke (disposable)
+
+`automations/smoke-e2e-prompt.txt` is a temporary LIVE run that passes
+`--max-daily-notional 1000 --max-orders-per-day 8` to `live-plan` only. It does
+not change committed defaults. Create the Cursor automation from
+`automations/smoke-e2e.json`, run once during market hours, then delete the
+automation. Prefer disabling any overlapping live automation first.
