@@ -32,6 +32,16 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def _parse_acceptance_datetime(raw: str) -> datetime:
+    """Parse SEC's acceptanceDateTime, which has appeared in two formats:
+    the legacy compact "%Y%m%d%H%M%S" and current ISO-8601 with a "Z" suffix.
+    """
+    try:
+        return datetime.strptime(raw, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
+
+
 class SECClient:
     """Small SEC EDGAR client that preserves point-in-time accession metadata."""
 
@@ -120,7 +130,7 @@ class SECClient:
             accepted_raw = str(recent.get("acceptanceDateTime", [""] * len(recent["form"]))[index])
             accepted_at = None
             if accepted_raw:
-                accepted_at = datetime.strptime(accepted_raw, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+                accepted_at = _parse_acceptance_datetime(accepted_raw)
             primary = str(recent["primaryDocument"][index])
             accession_compact = str(accession).replace("-", "")
             cik_compact = str(int(padded))
