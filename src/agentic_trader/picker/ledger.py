@@ -283,7 +283,18 @@ class PostgresLedger:
             ImportError
         ) as error:  # pragma: no cover - exercised only without optional dependency
             raise RuntimeError("Install psycopg[binary] to use PostgresLedger") from error
-        return psycopg.connect(self.database_url)
+        try:
+            return psycopg.connect(self.database_url)
+        except Exception as error:  # pragma: no cover - depends on live network
+            message = str(error).lower()
+            if "network is unreachable" in message or "no route to host" in message:
+                raise RuntimeError(
+                    "Postgres connection failed with an unreachable-network error. "
+                    "Cursor cloud sandboxes are IPv4-only; use the Supabase Shared "
+                    "Pooler URI (host *.pooler.supabase.com, session mode :5432 or "
+                    "transaction mode :6543), not the direct db.*.supabase.co host."
+                ) from error
+            raise
 
     def apply_migration(self, path: str | Path) -> None:
         sql = Path(path).read_text()

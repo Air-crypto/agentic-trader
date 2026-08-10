@@ -193,8 +193,11 @@ database halt ends unattended operation until a human reviews and clears it.
 
 Required secrets for Stage 3: `AGENTIC_TRADER_ACCOUNT` (Runtime Secret),
 `AGENTIC_TRADER_NET_DEPOSITS` (currently 1750 after deposits), and
-`DATABASE_URL` (Runtime Secret) pointing at Postgres/Supabase with
-`db/migrations/001_picker.sql` applied.
+`DATABASE_URL` (Runtime Secret) set to the Supabase **Shared Pooler** URI
+(`*.pooler.supabase.com`, not `db.*.supabase.co`) with
+`db/migrations/001_picker.sql` applied. The direct DB host is IPv6-only; Cursor
+cloud runs are IPv4-only and will fail to stage with `Network is unreachable`
+unless the pooler string is used.
 
 ## 5. Running without local persistence
 

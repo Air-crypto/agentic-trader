@@ -18,7 +18,9 @@ sessions do not compete for the daily $400 / 4-order budget.
 
 ## Research
 
-No Robinhood MCP. Requires `DATABASE_URL`. Stages verified evidence, drafts, and
+No Robinhood MCP. Requires `DATABASE_URL` set to the Supabase Shared Pooler URI
+(`*.pooler.supabase.com`). Direct `db.*.supabase.co` hosts fail in Cursor cloud
+with `Network is unreachable` (IPv6-only). Stages verified evidence, drafts, and
 critic verdicts via `picker-stage`. Never places orders.
 
 ## Execution
