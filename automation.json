@@ -1,6 +1,6 @@
 {
-  "name": "Agentic Trader \u2014 AI Picker Live Session",
-  "description": "Market-hours execution automation for the AI stock picker: authorizes staged picks with fresh Robinhood quant, builds guarded targets, places approved orders, reconciles, and syncs picker state.",
+  "name": "Agentic Trader \u2014 Stock + Level 2 Options Live",
+  "description": "Market-hours stock and Level 2 options execution: authorizes staged drafts with fresh Robinhood data, places only guard-approved orders, reconciles both asset classes, and syncs durable lifecycle state.",
   "triggers": [
     {
       "cron": {
