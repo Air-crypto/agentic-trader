@@ -22,6 +22,18 @@ NOTIONAL_TOLERANCE = 0.05
 PRICE_DEVIATION_LIMIT = 0.005
 
 
+def _first_number(raw: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 @dataclass(frozen=True)
 class ExecutedOrder:
     symbol: str
@@ -30,16 +42,30 @@ class ExecutedOrder:
     average_price: float
     order_id: str
     state: str = "filled"
+    ref_id: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> ExecutedOrder:
+        """Accept Robinhood's own order shape as well as a normalized one.
+
+        The broker returns `id`, `dollar_based_amount`, and `cumulative_quantity`
+        rather than `order_id` and `notional`, and returns numbers as strings.
+        Requiring a hand transformation would put a translation step between the
+        plan and the check meant to verify it.
+        """
+        average_price = _first_number(raw, "average_price", "price") or 0.0
+        notional = _first_number(raw, "notional", "dollar_based_amount")
+        if notional is None:
+            filled = _first_number(raw, "cumulative_quantity", "quantity")
+            notional = (filled or 0.0) * average_price
         return cls(
             symbol=str(raw["symbol"]).upper(),
             side=str(raw["side"]).lower(),
-            notional=float(raw["notional"]),
-            average_price=float(raw.get("average_price") or 0.0),
-            order_id=str(raw.get("order_id", "")),
+            notional=notional,
+            average_price=average_price,
+            order_id=str(raw.get("order_id") or raw.get("id") or ""),
             state=str(raw.get("state", "filled")).lower(),
+            ref_id=str(raw.get("ref_id") or ""),
         )
 
 
@@ -69,20 +95,32 @@ def reconcile(
 
     for order in filled:
         match_index = None
-        for index, approval in enumerate(unconsumed):
-            same_instrument = (
-                str(approval["symbol"]).upper() == order.symbol
-                and str(approval["side"]).lower() == order.side
+        # An exact ref_id match is unambiguous, so prefer it over inferring the
+        # pairing from symbol, side, and size.
+        if order.ref_id:
+            match_index = next(
+                (
+                    index
+                    for index, approval in enumerate(unconsumed)
+                    if approval.get("ref_id") == order.ref_id
+                ),
+                None,
             )
-            if not same_instrument:
-                continue
-            approved_notional = float(approval["notional"])
-            within_size = abs(order.notional - approved_notional) <= max(
-                approved_notional * NOTIONAL_TOLERANCE, 1.0
-            )
-            if within_size:
-                match_index = index
-                break
+        if match_index is None:
+            for index, approval in enumerate(unconsumed):
+                same_instrument = (
+                    str(approval["symbol"]).upper() == order.symbol
+                    and str(approval["side"]).lower() == order.side
+                )
+                if not same_instrument:
+                    continue
+                approved_notional = float(approval["notional"])
+                within_size = abs(order.notional - approved_notional) <= max(
+                    approved_notional * NOTIONAL_TOLERANCE, 1.0
+                )
+                if within_size:
+                    match_index = index
+                    break
 
         if match_index is None:
             unauthorized.append(

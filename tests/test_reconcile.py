@@ -82,6 +82,49 @@ def test_unfilled_approval_is_reported_without_halting(tmp_path):
     assert not (tmp_path / KILL_SWITCH_FILENAME).exists()
 
 
+def test_accepts_robinhood_native_order_shape(tmp_path):
+    """The broker returns id and dollar_based_amount as strings, not our names."""
+    broker_order = {
+        "id": "8f1c-native",
+        "symbol": "SPY",
+        "side": "buy",
+        "state": "filled",
+        "dollar_based_amount": "150.00",
+        "average_price": "773.90",
+        "quantity": "0.193953",
+    }
+    result = reconcile([approval()], [broker_order], root=tmp_path)
+    assert result["clean"]
+    assert result["matched"][0]["order_id"] == "8f1c-native"
+
+
+def test_notional_is_derived_when_the_broker_reports_only_shares(tmp_path):
+    share_order = {
+        "id": "limit-1",
+        "symbol": "IEF",
+        "side": "buy",
+        "state": "filled",
+        "cumulative_quantity": "1",
+        "average_price": "93.30",
+    }
+    approved = approval(symbol="IEF", notional=93.17, limit_price=93.36)
+    assert reconcile([approved], [share_order], root=tmp_path)["clean"]
+
+
+def test_ref_id_matches_exactly_even_when_size_drifts(tmp_path):
+    approved = {**approval(), "ref_id": "abc-123"}
+    executed = fill(notional=142.0, order_id="x", ref_id="abc-123")
+    result = reconcile([approved], [executed], root=tmp_path)
+    assert result["clean"]
+
+
+def test_wrong_ref_id_does_not_match_a_different_approval(tmp_path):
+    approved = {**approval(), "ref_id": "abc-123"}
+    executed = fill(notional=999.0, order_id="x", ref_id="totally-different")
+    result = reconcile([approved], [executed], root=tmp_path)
+    assert "unauthorized_fill_detected" in result["breaches"]
+
+
 def test_fill_with_no_plan_at_all_is_unauthorized(tmp_path):
     result = reconcile([], [fill()], root=tmp_path)
     assert not result["clean"]

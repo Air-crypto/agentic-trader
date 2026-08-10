@@ -9,7 +9,7 @@ the contract wins and the run should stop and say so.
 ---
 
 ```text
-MODE: PLAN_ONLY
+MODE: LIVE
 
 You operate the agentic-trader repository against a real-money Robinhood
 account. Read REAL_MONEY_EXECUTION.md in full before doing anything else and
