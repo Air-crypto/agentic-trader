@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from agentic_trader.execution import (
@@ -8,6 +10,7 @@ from agentic_trader.execution import (
     AccountSnapshot,
     ExecutionLimits,
     ProposedOrder,
+    deterministic_ref_id,
     evaluate_batch,
     evaluate_order,
     marketable_limit_price,
@@ -288,6 +291,29 @@ def test_planner_rejects_symbol_with_no_quote():
     account = make_account(equity=750.0, cash=750.0)
     decisions = plan_orders_from_targets({"SPY": 0.2}, account, prices={})
     assert "limit_order_requires_positive_limit_price" in decisions[0].reasons
+
+
+def test_duplicate_runs_derive_the_same_ref_id():
+    """Two concurrent runs cannot share a lock, so the broker must deduplicate."""
+    from datetime import date
+
+    day = date(2026, 8, 10)
+    first = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, day)
+    second = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, day)
+    assert first == second
+    assert uuid.UUID(first).version == 5
+
+
+def test_ref_id_differs_by_symbol_side_sequence_day_and_account():
+    from datetime import date
+
+    day = date(2026, 8, 10)
+    base = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, day)
+    assert base != deterministic_ref_id(TEST_ACCOUNT, "IEF", "buy", 0, day)
+    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "sell", 0, day)
+    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 1, day)
+    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, date(2026, 8, 11))
+    assert base != deterministic_ref_id("999999999", "SPY", "buy", 0, day)
 
 
 def test_marketable_limit_crosses_spread_in_the_right_direction():

@@ -15,6 +15,7 @@ from .execution import (
     append_audit_record,
     check_account_halts,
     daily_consumption,
+    deterministic_ref_id,
     load_live_state,
     plan_orders_from_targets,
     record_live_state,
@@ -326,6 +327,16 @@ def _live_plan(args: argparse.Namespace) -> int:
         root=args.root,
     )
     approved = [decision.to_dict() for decision in decisions if decision.approved]
+    # Sequence continues from orders already placed today, so a duplicate run
+    # that sees the same broker state derives the same keys and the broker
+    # collapses the pair, while a legitimate later run derives fresh ones.
+    for offset, order in enumerate(approved):
+        order["ref_id"] = deterministic_ref_id(
+            account.account_number,
+            order["symbol"],
+            order["side"],
+            account.orders_today + offset,
+        )
     payload = {
         "mode": "PLAN_ONLY_REQUIRES_HUMAN_APPROVAL",
         "account_number": account.account_number,

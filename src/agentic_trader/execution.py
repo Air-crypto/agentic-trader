@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -345,6 +346,33 @@ def evaluate_batch(
                 notional_today=running.notional_today + order.notional,
             )
     return decisions
+
+
+# Fixed namespace so the same logical order maps to the same ref_id on any
+# machine, in any process, on any run.
+REF_ID_NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+
+
+def deterministic_ref_id(
+    account_number: str,
+    symbol: str,
+    side: str,
+    sequence: int,
+    day: date | None = None,
+) -> str:
+    """Derive Robinhood's idempotency key from the order's logical identity.
+
+    Two concurrent runs on separate machines cannot share a lock file, and both
+    can read the same broker order count before either places anything. Because
+    the broker deduplicates on ref_id, deriving it from identity rather than
+    randomness turns that race into a single order instead of two.
+
+    The notional is deliberately excluded: concurrent runs may price a snapshot
+    cents apart, and a key that differs by a cent would not deduplicate.
+    """
+    stamp = (day or datetime.now(UTC).date()).isoformat()
+    key = f"{account_number}|{stamp}|{symbol.upper()}|{side.lower()}|{sequence}"
+    return str(uuid.uuid5(REF_ID_NAMESPACE, key))
 
 
 def marketable_limit_price(last_price: float, side: str, slippage_bps: float = 20.0) -> float:
