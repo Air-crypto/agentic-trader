@@ -13,6 +13,17 @@ from .scoring import score_bundle
 
 STUDY_HORIZONS = (1, 5, 20, 60)
 
+SUMMARY_COLUMNS = (
+    "horizon_days",
+    "events",
+    "mean_net_abnormal_return",
+    "median_net_abnormal_return",
+    "positive_rate",
+    "t_statistic",
+    "bootstrap_95_low",
+    "bootstrap_95_high",
+)
+
 
 @dataclass
 class EventStudyResult:
@@ -54,6 +65,10 @@ def _summarize(observations: pd.DataFrame) -> pd.DataFrame:
                 "bootstrap_95_high": high,
             }
         )
+    # An empty study is a valid outcome, not an error, so the frame keeps its
+    # columns and downstream gate checks stay uniform.
+    if not rows:
+        return pd.DataFrame(columns=list(SUMMARY_COLUMNS))
     return pd.DataFrame(rows).sort_values("horizon_days").reset_index(drop=True)
 
 
@@ -118,7 +133,7 @@ def run_event_study(
         "net_abnormal_return",
     ]
     observation_frame = pd.DataFrame(observations, columns=columns)
-    summary = _summarize(observation_frame) if not observation_frame.empty else pd.DataFrame()
+    summary = _summarize(observation_frame)
 
     eligible_events = {row["event_id"] for row in observations}
     tickers = {row["ticker"] for row in observations}

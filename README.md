@@ -1,7 +1,25 @@
 # Agentic Trader
 
 A reproducible research and paper-trading harness for a conservative, monthly
-momentum strategy. It does not place brokerage orders.
+momentum strategy.
+
+## Real-money execution
+
+One small account is enabled for live trading under
+[`REAL_MONEY_EXECUTION.md`](REAL_MONEY_EXECUTION.md). The account is identified
+by the `AGENTIC_TRADER_ACCOUNT` environment variable and is never committed;
+with it unset the guard rejects every order. Orders must pass the
+deterministic guard in `src/agentic_trader/execution.py`, which enforces an
+account allowlist, a symbol allowlist, per-order and per-day notional caps,
+concentration limits, daily-loss and drawdown halts, and a `KILL_SWITCH` file.
+The guard has no network access and cannot place an order; it only approves or
+rejects. Live trading currently runs a static diversified allocation under human
+approval, because no signal strategy below has passed its gates.
+
+```bash
+uv run agentic-trader live-plan --request artifacts/live/request.json --record-equity
+touch KILL_SWITCH   # halts all order approval immediately
+```
 
 ## Current result
 

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agentic_trader.research.event_study import run_event_study
+from agentic_trader.research.event_study import run_event_study, write_event_study
 from agentic_trader.research.models import ResearchBundle
 from agentic_trader.research.scoring import score_bundle
 
@@ -72,6 +72,57 @@ def test_primary_quantified_event_passes_scoring_gate() -> None:
 
     assert score.eligible_for_event_study
     assert score.score >= 65
+
+
+def _ineligible_bundle() -> dict[str, object]:
+    raw = _bundle()
+    raw["evidence"][0]["primary"] = False
+    raw["evidence"][0]["source_type"] = "reputable_news"
+    raw["dependencies"][0]["materiality_score"] = 0.05
+    raw["dependencies"][0]["directness"] = 0.2
+    raw["events"][0].update(
+        quantified=False,
+        magnitude_score=0.05,
+        novelty_score=0.05,
+        timing_score=0.1,
+        speculation_score=0.9,
+    )
+    return raw
+
+
+def test_event_study_returns_a_clean_report_when_no_event_is_eligible() -> None:
+    """A fully ineligible bundle is a valid outcome and must not raise."""
+    bundle = ResearchBundle.from_dict(_ineligible_bundle())
+    assert not score_bundle(bundle)[0].eligible_for_event_study
+
+    index = pd.bdate_range("2024-01-02", periods=100)
+    prices = pd.DataFrame(
+        {
+            "EXM": 100 * np.cumprod(np.full(len(index), 1.002)),
+            "SPY": 100 * np.cumprod(np.full(len(index), 1.001)),
+        },
+        index=index,
+    )
+
+    result = run_event_study(bundle, prices)
+
+    assert result.observations.empty
+    assert result.summary.empty
+    assert "horizon_days" in result.summary.columns
+    assert result.status == "insufficient_evidence"
+    assert result.diagnostics["eligible_events"] == 0
+
+
+def test_event_study_report_writes_when_no_event_is_eligible(tmp_path) -> None:
+    bundle = ResearchBundle.from_dict(_ineligible_bundle())
+    index = pd.bdate_range("2024-01-02", periods=100)
+    prices = pd.DataFrame(
+        {"EXM": np.full(len(index), 100.0), "SPY": np.full(len(index), 100.0)},
+        index=index,
+    )
+    report = write_event_study(run_event_study(bundle, prices), tmp_path)
+    assert report["status"] == "insufficient_evidence"
+    assert (tmp_path / "event-study.json").exists()
 
 
 def test_event_study_enters_strictly_after_publication_date() -> None:

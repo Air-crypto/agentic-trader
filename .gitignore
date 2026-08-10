@@ -5,3 +5,6 @@
 __pycache__/
 *.py[cod]
 artifacts/
+KILL_SWITCH
+.env
+.env.*

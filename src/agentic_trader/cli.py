@@ -8,12 +8,26 @@ from pathlib import Path
 from .analyzer import analyze_universe, write_analysis
 from .config import StrategyConfig
 from .data import download_adjusted_close
+from .execution import (
+    AccountSnapshot,
+    ExecutionLimits,
+    SessionLockedError,
+    append_audit_record,
+    check_account_halts,
+    daily_consumption,
+    load_live_state,
+    plan_orders_from_targets,
+    record_live_state,
+    record_plan_consumption,
+    session_lock,
+)
 from .option_chain import (
     download_option_chain_snapshot,
     write_option_chain_snapshot,
 )
 from .options import OptionStructure, analyze_option_structure
 from .proposal import ResearchProposal, validate_proposal
+from .reconcile import reconcile
 from .research.event_study import run_event_study, write_event_study
 from .research.models import ResearchBundle
 from .research.scoring import score_bundle
@@ -258,6 +272,91 @@ def command_proposal_validate(args: argparse.Namespace) -> int:
     return 0 if payload["accepted_for_shadow_research"] else 2
 
 
+def command_live_plan(args: argparse.Namespace) -> int:
+    """Produce a guarded real-money order plan. Never places an order itself."""
+    try:
+        with session_lock(args.root):
+            return _live_plan(args)
+    except SessionLockedError as error:
+        print(json.dumps({"mode": "REFUSED", "reason": str(error)}, indent=2))
+        return 3
+
+
+def _live_plan(args: argparse.Namespace) -> int:
+    request = json.loads(Path(args.request).read_text())
+    raw_account = request["account"]
+
+    # The drawdown and daily-loss halts read from persisted state rather than
+    # the request so a caller cannot clear a halt by rewriting its own input.
+    state = load_live_state(args.root)
+    persisted_orders, persisted_notional = daily_consumption(args.root)
+    equity = float(raw_account["equity"])
+    account = AccountSnapshot(
+        account_number=str(raw_account["account_number"]),
+        equity=equity,
+        cash=float(raw_account["cash"]),
+        positions={str(k).upper(): float(v) for k, v in raw_account.get("positions", {}).items()},
+        high_water_mark=state.get("high_water_mark"),
+        prior_close_equity=state.get("prior_close_equity"),
+        # Take the larger of what the caller reports and what this repo already
+        # approved today, so a duplicate run cannot re-spend the daily budget.
+        orders_today=max(int(raw_account.get("orders_today", 0)), persisted_orders),
+        notional_today=max(float(raw_account.get("notional_today", 0.0)), persisted_notional),
+        pending_deposits=float(raw_account.get("pending_deposits", 0.0)),
+    )
+    limits = ExecutionLimits(
+        max_order_notional=args.max_order_notional,
+        max_position_weight=args.max_position_weight,
+        max_orders_per_day=args.max_orders_per_day,
+        max_daily_notional=args.max_daily_notional,
+    )
+    decisions = plan_orders_from_targets(
+        {str(k).upper(): float(v) for k, v in request["targets"].items()},
+        account,
+        prices={str(k).upper(): float(v) for k, v in request["prices"].items()},
+        limits=limits,
+        rebalance_threshold=args.rebalance_threshold,
+        root=args.root,
+    )
+    approved = [decision.to_dict() for decision in decisions if decision.approved]
+    payload = {
+        "mode": "PLAN_ONLY_REQUIRES_HUMAN_APPROVAL",
+        "account_number": account.account_number,
+        "equity": equity,
+        "orders_already_used_today": account.orders_today,
+        "notional_already_used_today": account.notional_today,
+        "halts": list(check_account_halts(account, limits, args.root)),
+        "approved_orders": approved,
+        "rejected_orders": [d.to_dict() for d in decisions if not d.approved],
+        "note": "Approval means the order is within risk limits, not that it is profitable.",
+    }
+    if approved:
+        record_plan_consumption(
+            len(approved),
+            sum(order["notional"] for order in approved),
+            root=args.root,
+        )
+    if args.record_equity:
+        record_live_state(equity, root=args.root)
+    append_audit_record({"event": "live_plan", **payload}, root=args.root)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+    print(json.dumps(payload, indent=2))
+    return 0 if approved else 2
+
+
+def command_live_reconcile(args: argparse.Namespace) -> int:
+    """Compare executed fills to the approved plan; halt on anything unaccounted."""
+    plan = json.loads(Path(args.plan).read_text())
+    executed = json.loads(Path(args.executed).read_text())
+    if isinstance(executed, dict):
+        executed = executed.get("orders", [])
+    result = reconcile(plan.get("approved_orders", []), executed, root=args.root)
+    print(json.dumps(result, indent=2))
+    return 0 if result["clean"] else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentic-trader",
@@ -352,6 +451,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", default="artifacts/research/proposal-validation.json"
     )
     proposal_validate.set_defaults(func=command_proposal_validate)
+
+    live_plan = subparsers.add_parser(
+        "live-plan", help="Produce a risk-checked real-money order plan (does not place orders)"
+    )
+    live_plan.add_argument("--request", required=True, help="JSON with account, targets, prices")
+    live_plan.add_argument("--root", default=".")
+    live_plan.add_argument("--max-order-notional", type=float, default=150.0)
+    live_plan.add_argument("--max-position-weight", type=float, default=0.25)
+    live_plan.add_argument("--max-orders-per-day", type=int, default=4)
+    live_plan.add_argument("--max-daily-notional", type=float, default=400.0)
+    live_plan.add_argument("--rebalance-threshold", type=float, default=0.05)
+    live_plan.add_argument("--record-equity", action="store_true")
+    live_plan.add_argument("--output", default="artifacts/live/plan.json")
+    live_plan.set_defaults(func=command_live_plan)
+
+    live_reconcile = subparsers.add_parser(
+        "live-reconcile", help="Verify fills against the approved plan and halt on breaches"
+    )
+    live_reconcile.add_argument("--plan", default="artifacts/live/plan.json")
+    live_reconcile.add_argument("--executed", required=True, help="JSON list of executed orders")
+    live_reconcile.add_argument("--root", default=".")
+    live_reconcile.set_defaults(func=command_live_reconcile)
     return parser
 
 
