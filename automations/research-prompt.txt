@@ -11,9 +11,10 @@ CLI. Automation memory is not authoritative state.
 PREFLIGHT — run in order and report every result. Do not work around a failure.
 1. KILL_SWITCH exists at the repository root. Stop. Never delete it.
 2. DATABASE_URL is unset. Stop. It must be a Supabase Shared Pooler URI
-   (host *.pooler.supabase.com). A direct db.*.supabase.co host is IPv6-only
-   and fails in this environment with Network is unreachable — stop and report
-   that misconfiguration rather than retrying.
+   (host *.pooler.supabase.com, username postgres.<project-ref>). A direct
+   db.*.supabase.co host is IPv6-only (Network is unreachable). A pooler host
+   with username postgres alone fails password authentication. Stop and report
+   either misconfiguration rather than retrying.
 3. uv sync --frozen, uv run pytest, or uv run ruff check . fails. Stop.
    If the uv command is not found, use "$HOME/.local/bin/uv".
 4. If today is a weekend or US market holiday, stop and report.

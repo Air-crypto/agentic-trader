@@ -144,15 +144,18 @@ before stock entries, subject to the existing daily caps.
 ## Durable state and concurrency
 
 `DATABASE_URL` is a Cursor Runtime Secret pointing to Postgres/Supabase. Use the
-Supabase **Shared Pooler** connection string (`*.pooler.supabase.com`), not the
-direct `db.*.supabase.co` host. Direct connections are IPv6-only by default, and
-Cursor cloud sandboxes have no IPv6 egress, which surfaces as
-`Network is unreachable` during `picker-stage`. Prefer session mode on port
-`5432` for ordinary CLI use; transaction mode on port `6543` is also IPv4 and
-acceptable for short-lived automation runs. Append `?sslmode=require` when the
-dashboard URI does not already include it. Apply `db/migrations/001_picker.sql`
-once before the first stage. The ledger stores no full account number; it uses a
-one-way account hash.
+Supabase **Shared Pooler** connection string from the dashboard Connect panel
+(`*.pooler.supabase.com`), not the direct `db.*.supabase.co` host. Direct
+connections are IPv6-only by default, and Cursor cloud sandboxes have no IPv6
+egress, which surfaces as `Network is unreachable` during `picker-stage`.
+
+Pooler URIs use username `postgres.<project-ref>`, not bare `postgres`. A
+pooler host with username `postgres` fails as
+`password authentication failed for user "postgres"`. Prefer session mode on
+port `5432`; transaction mode on port `6543` is also IPv4. URL-encode special
+characters in the database password and append `?sslmode=require` when missing.
+Apply `db/migrations/001_picker.sql` once before the first stage. The ledger
+stores no full account number; it uses a one-way account hash.
 
 Postgres advisory locks serialize logical picker runs across cloud VMs.
 Robinhood `ref_id` remains the final broker idempotency control. Pick entry,

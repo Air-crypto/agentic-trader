@@ -294,6 +294,15 @@ class PostgresLedger:
                     "Pooler URI (host *.pooler.supabase.com, session mode :5432 or "
                     "transaction mode :6543), not the direct db.*.supabase.co host."
                 ) from error
+            if "password authentication failed" in message:
+                raise RuntimeError(
+                    "Postgres rejected DATABASE_URL credentials. For the Supabase "
+                    "Shared Pooler the username must be postgres.<project-ref>, not "
+                    "postgres alone; copy the Session pooler URI from the dashboard "
+                    "Connect panel, URL-encode special characters in the password, "
+                    "and confirm it is the database password (reset it there if "
+                    "needed)."
+                ) from error
             raise
 
     def apply_migration(self, path: str | Path) -> None:
