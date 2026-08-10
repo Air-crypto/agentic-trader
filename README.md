@@ -13,10 +13,14 @@ deterministic guard in `src/agentic_trader/execution.py`, which enforces an
 account allowlist, a symbol allowlist, per-order and per-day notional caps,
 concentration limits, daily-loss and drawdown halts, and a `KILL_SWITCH` file.
 The guard has no network access and cannot place an order; it only approves or
-rejects. Live trading currently runs a static diversified allocation under human
-approval, because no signal strategy below has passed its gates.
+rejects. Live trading now uses the Stage 3 AI stock picker under
+[`AI_STOCK_PICKER.md`](AI_STOCK_PICKER.md): research stages evidence into
+Postgres; execution authorizes picks and places only guard-approved orders.
+The picker is unvalidated — same order caps and reconciliation still apply.
 
 ```bash
+uv run agentic-trader picker-authorize-batch --quant artifacts/picker/quant.json
+uv run agentic-trader picker-plan --snapshot artifacts/picker/snapshot.json
 uv run agentic-trader live-plan --request artifacts/live/request.json --record-equity
 touch KILL_SWITCH   # halts all order approval immediately
 ```

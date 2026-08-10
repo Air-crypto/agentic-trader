@@ -28,9 +28,11 @@ trading is therefore **not** the deployment of a validated edge. It buys three
 things: real fills, real slippage, and a working execution path. Size it as
 tuition, not as an investment thesis.
 
-The initial live allocation is a static 50/25/15 SPY/IEF/GLD split with 10% cash.
-It is deliberately *not* one of the tested signal strategies, because none earned
-the right to trade. It is a plain diversified portfolio that makes no alpha claim.
+The original live allocation was a static 50/25/15 SPY/IEF/GLD split with 10%
+cash. That path remains available as a rollback. Live mandate now follows
+`AI_STOCK_PICKER.md`: evidence-grounded AI stock picks control investable
+capital, still under the same order caps and reconciliation rules. The picker is
+unvalidated; it is not evidence of alpha.
 
 ## 2. Enforcement is code, not instruction
 
@@ -175,15 +177,24 @@ enforcement itself.
 
 **Stage 1 — human approves every order.** The agent plans; a human places.
 
-**Stage 2 — agent places guard-approved rebalances unattended (current stage).**
-Permitted only for orders the guard approved from the written static allocation
-in section 1. Every Stage 1 limit still applies, and reconciliation must run in
-the same session as placement. A tripped kill switch ends unattended operation
-until a human reviews and clears it.
+**Stage 2 — agent places guard-approved static rebalances unattended.**
+Permitted only for orders the guard approved from the written static allocation.
+Every Stage 1 limit still applies, and reconciliation must run in the same
+session as placement. Kept as rollback if the picker is disabled.
 
-**Stage 3 — signal-driven trading.** Blocked. Requires a strategy that passes its
-holdout gates. Nothing currently qualifies, and Stage 3 does not open on a
-schedule; it opens on evidence. Wanting to skip to Stage 3 is not evidence.
+**Stage 3 — AI stock picker (current stage).** Research and execution run as
+separate automations under `AI_STOCK_PICKER.md`. Research stages evidence into
+Postgres with no trading tools. Execution authorizes with fresh broker quant,
+builds targets via `picker-plan`, and may place only `live-plan` approvals.
+Every Stage 1/2 limit still applies. The schema is
+`ai_picker_v1_unvalidated`; do not describe picks as validated alpha until the
+forward-evaluation gates in that contract are met. A tripped kill switch or
+database halt ends unattended operation until a human reviews and clears it.
+
+Required secrets for Stage 3: `AGENTIC_TRADER_ACCOUNT` (Runtime Secret),
+`AGENTIC_TRADER_NET_DEPOSITS` (currently 1750 after deposits), and
+`DATABASE_URL` (Runtime Secret) pointing at Postgres/Supabase with
+`db/migrations/001_picker.sql` applied.
 
 ## 5. Running without local persistence
 

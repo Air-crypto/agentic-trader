@@ -1,0 +1,378 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, date, datetime
+from typing import Any
+
+PICK_ACTIONS = {"long", "reject", "close"}
+CRITIC_VERDICTS = {"pass", "veto"}
+PACKET_ACTIONS = {"buy", "close"}
+THESIS_STATUSES = {"pending_entry", "active", "expired", "invalidated", "closed", "cancelled"}
+
+
+def parse_timestamp(value: str | datetime) -> datetime:
+    parsed = (
+        value
+        if isinstance(value, datetime)
+        else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    )
+    if parsed.tzinfo is None:
+        raise ValueError("Timestamp must include a timezone")
+    return parsed.astimezone(UTC)
+
+
+def parse_date(value: str | date) -> date:
+    return value if isinstance(value, date) else date.fromisoformat(str(value))
+
+
+def unit_interval(name: str, value: Any) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return parsed
+
+
+def positive(name: str, value: Any) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive")
+    return parsed
+
+
+def canonical_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def content_hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class EvidenceVersion:
+    evidence_id: str
+    source_type: str
+    title: str
+    publisher: str
+    url: str
+    published_at: datetime
+    first_seen_at: datetime
+    retrieved_at: datetime
+    quote: str
+    document_hash: str
+    primary: bool
+    independence_group: str
+    quote_verified: bool
+    valid_at: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> EvidenceVersion:
+        published_at = parse_timestamp(raw["published_at"])
+        first_seen_at = parse_timestamp(raw["first_seen_at"])
+        retrieved_at = parse_timestamp(raw["retrieved_at"])
+        valid_at = parse_timestamp(raw["valid_at"]) if raw.get("valid_at") else None
+        url = str(raw["url"])
+        quote = str(raw["quote"]).strip()
+        if not url.startswith("https://"):
+            raise ValueError("Evidence URLs must use HTTPS")
+        if len(quote) < 20:
+            raise ValueError("Evidence quote must contain at least 20 characters")
+        if first_seen_at < published_at:
+            raise ValueError("first_seen_at cannot precede published_at")
+        if retrieved_at < first_seen_at:
+            raise ValueError("retrieved_at cannot precede first_seen_at")
+        document_hash = str(raw["document_hash"])
+        if len(document_hash) != 64:
+            raise ValueError("document_hash must be a SHA-256 hex digest")
+        return cls(
+            evidence_id=str(raw["evidence_id"]),
+            source_type=str(raw["source_type"]),
+            title=str(raw["title"]),
+            publisher=str(raw["publisher"]),
+            url=url,
+            published_at=published_at,
+            first_seen_at=first_seen_at,
+            retrieved_at=retrieved_at,
+            quote=quote,
+            document_hash=document_hash,
+            primary=bool(raw["primary"]),
+            independence_group=str(raw["independence_group"]),
+            quote_verified=bool(raw["quote_verified"]),
+            valid_at=valid_at,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        for key in ("published_at", "first_seen_at", "retrieved_at", "valid_at"):
+            if payload[key] is not None:
+                payload[key] = payload[key].isoformat()
+        return payload
+
+
+@dataclass(frozen=True)
+class QuantSnapshot:
+    symbol: str
+    as_of: datetime
+    last_price: float
+    market_cap: float
+    average_dollar_volume: float
+    spread_bps: float
+    sector: str
+    fractional_tradable: bool
+    sufficient_history: bool
+    momentum_rank: float
+    quality_rank: float
+    revisions_rank: float
+    volatility_63d: float
+    beta_252d: float
+    atr_pct: float
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> QuantSnapshot:
+        return cls(
+            symbol=str(raw["symbol"]).upper(),
+            as_of=parse_timestamp(raw["as_of"]),
+            last_price=positive("last_price", raw["last_price"]),
+            market_cap=positive("market_cap", raw["market_cap"]),
+            average_dollar_volume=positive("average_dollar_volume", raw["average_dollar_volume"]),
+            spread_bps=max(0.0, float(raw["spread_bps"])),
+            sector=str(raw["sector"]).strip() or "Unknown",
+            fractional_tradable=bool(raw["fractional_tradable"]),
+            sufficient_history=bool(raw["sufficient_history"]),
+            momentum_rank=unit_interval("momentum_rank", raw["momentum_rank"]),
+            quality_rank=unit_interval("quality_rank", raw["quality_rank"]),
+            revisions_rank=unit_interval("revisions_rank", raw["revisions_rank"]),
+            volatility_63d=max(0.0, float(raw["volatility_63d"])),
+            beta_252d=float(raw["beta_252d"]),
+            atr_pct=positive("atr_pct", raw["atr_pct"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "as_of": self.as_of.isoformat()}
+
+
+@dataclass(frozen=True)
+class PickerDraft:
+    draft_id: str
+    run_id: str
+    created_at: datetime
+    symbol: str
+    action: str
+    horizon_trading_days: int
+    thesis: str
+    catalyst: str
+    materiality_basis: str
+    novelty_basis: str
+    priced_in_analysis: str
+    counter_thesis: str
+    invalidation: str
+    evidence_ids: tuple[str, ...]
+    event_quality: float
+    materiality: float
+    novelty: float
+    timing: float
+    speculation: float
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> PickerDraft:
+        action = str(raw["action"]).lower()
+        if action not in PICK_ACTIONS:
+            raise ValueError(f"Unsupported picker action: {action}")
+        horizon = int(raw["horizon_trading_days"])
+        if not 1 <= horizon <= 60:
+            raise ValueError("Picker horizon must be between 1 and 60 trading days")
+        evidence_ids = tuple(str(item) for item in raw.get("evidence_ids", ()))
+        if action != "reject" and not evidence_ids:
+            raise ValueError("Actionable drafts require evidence")
+        thesis = str(raw["thesis"]).strip()
+        if len(thesis) < 20:
+            raise ValueError("Picker thesis is too short to be falsifiable")
+        return cls(
+            draft_id=str(raw["draft_id"]),
+            run_id=str(raw["run_id"]),
+            created_at=parse_timestamp(raw["created_at"]),
+            symbol=str(raw["symbol"]).upper(),
+            action=action,
+            horizon_trading_days=horizon,
+            thesis=thesis,
+            catalyst=str(raw["catalyst"]),
+            materiality_basis=str(raw["materiality_basis"]),
+            novelty_basis=str(raw["novelty_basis"]),
+            priced_in_analysis=str(raw["priced_in_analysis"]),
+            counter_thesis=str(raw["counter_thesis"]),
+            invalidation=str(raw["invalidation"]),
+            evidence_ids=evidence_ids,
+            event_quality=unit_interval("event_quality", raw["event_quality"]),
+            materiality=unit_interval("materiality", raw["materiality"]),
+            novelty=unit_interval("novelty", raw["novelty"]),
+            timing=unit_interval("timing", raw["timing"]),
+            speculation=unit_interval("speculation", raw["speculation"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "created_at": self.created_at.isoformat(),
+            "evidence_ids": list(self.evidence_ids),
+        }
+
+
+@dataclass(frozen=True)
+class CriticVerdict:
+    draft_id: str
+    model_id: str
+    created_at: datetime
+    verdict: str
+    reasons: tuple[str, ...]
+    contradicted_evidence_ids: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> CriticVerdict:
+        verdict = str(raw["verdict"]).lower()
+        if verdict not in CRITIC_VERDICTS:
+            raise ValueError(f"Unsupported critic verdict: {verdict}")
+        reasons = tuple(str(item) for item in raw.get("reasons", ()))
+        if verdict == "veto" and not reasons:
+            raise ValueError("A critic veto requires at least one reason")
+        return cls(
+            draft_id=str(raw["draft_id"]),
+            model_id=str(raw["model_id"]),
+            created_at=parse_timestamp(raw["created_at"]),
+            verdict=verdict,
+            reasons=reasons,
+            contradicted_evidence_ids=tuple(
+                str(item) for item in raw.get("contradicted_evidence_ids", ())
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "created_at": self.created_at.isoformat(),
+            "reasons": list(self.reasons),
+            "contradicted_evidence_ids": list(self.contradicted_evidence_ids),
+        }
+
+
+@dataclass(frozen=True)
+class DecisionPacket:
+    packet_id: str
+    run_id: str
+    draft_id: str
+    created_at: datetime
+    valid_for_date: date
+    expires_at: datetime
+    symbol: str
+    action: str
+    horizon_trading_days: int
+    target_weight: float
+    stop_loss_pct: float
+    sector_relative_stop_pct: float
+    sector: str
+    rank_score: float
+    thesis_hash: str
+    evidence_ids: tuple[str, ...]
+    prompt_hash: str
+    model_id: str
+    packet_hash: str = ""
+
+    def unsigned_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["valid_for_date"] = self.valid_for_date.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat()
+        payload["evidence_ids"] = list(self.evidence_ids)
+        payload.pop("packet_hash", None)
+        return payload
+
+    def with_hash(self) -> DecisionPacket:
+        return replace(self, packet_hash=content_hash(canonical_json(self.unsigned_dict())))
+
+    def verify_hash(self) -> bool:
+        return self.packet_hash == content_hash(canonical_json(self.unsigned_dict()))
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any], verify_hash: bool = True) -> DecisionPacket:
+        action = str(raw["action"]).lower()
+        if action not in PACKET_ACTIONS:
+            raise ValueError(f"Unsupported packet action: {action}")
+        target_weight = unit_interval("target_weight", raw["target_weight"])
+        packet = cls(
+            packet_id=str(raw["packet_id"]),
+            run_id=str(raw["run_id"]),
+            draft_id=str(raw["draft_id"]),
+            created_at=parse_timestamp(raw["created_at"]),
+            valid_for_date=parse_date(raw["valid_for_date"]),
+            expires_at=parse_timestamp(raw["expires_at"]),
+            symbol=str(raw["symbol"]).upper(),
+            action=action,
+            horizon_trading_days=int(raw["horizon_trading_days"]),
+            target_weight=target_weight,
+            stop_loss_pct=unit_interval("stop_loss_pct", raw["stop_loss_pct"]),
+            sector_relative_stop_pct=unit_interval(
+                "sector_relative_stop_pct", raw["sector_relative_stop_pct"]
+            ),
+            sector=str(raw["sector"]).strip() or "Unknown",
+            rank_score=unit_interval("rank_score", raw["rank_score"]),
+            thesis_hash=str(raw["thesis_hash"]),
+            evidence_ids=tuple(str(item) for item in raw["evidence_ids"]),
+            prompt_hash=str(raw["prompt_hash"]),
+            model_id=str(raw["model_id"]),
+            packet_hash=str(raw.get("packet_hash", "")),
+        )
+        if not 1 <= packet.horizon_trading_days <= 60:
+            raise ValueError("Packet horizon must be between 1 and 60 trading days")
+        if packet.expires_at <= packet.created_at:
+            raise ValueError("Packet expires_at must follow created_at")
+        if verify_hash and not packet.verify_hash():
+            raise ValueError("Decision packet hash mismatch")
+        return packet
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.unsigned_dict(), "packet_hash": self.packet_hash}
+
+
+@dataclass(frozen=True)
+class ActiveThesis:
+    pick_id: str
+    packet_id: str
+    symbol: str
+    sector: str
+    status: str
+    entry_date: date
+    expiry_date: date
+    entry_price: float
+    entry_spy_price: float
+    target_weight: float
+    stop_loss_pct: float
+    sector_relative_stop_pct: float
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> ActiveThesis:
+        status = str(raw["status"])
+        if status not in THESIS_STATUSES:
+            raise ValueError(f"Unsupported thesis status: {status}")
+        return cls(
+            pick_id=str(raw["pick_id"]),
+            packet_id=str(raw["packet_id"]),
+            symbol=str(raw["symbol"]).upper(),
+            sector=str(raw["sector"]),
+            status=status,
+            entry_date=parse_date(raw["entry_date"]),
+            expiry_date=parse_date(raw["expiry_date"]),
+            entry_price=positive("entry_price", raw["entry_price"]),
+            entry_spy_price=positive("entry_spy_price", raw["entry_spy_price"]),
+            target_weight=unit_interval("target_weight", raw["target_weight"]),
+            stop_loss_pct=unit_interval("stop_loss_pct", raw["stop_loss_pct"]),
+            sector_relative_stop_pct=unit_interval(
+                "sector_relative_stop_pct", raw["sector_relative_stop_pct"]
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "entry_date": self.entry_date.isoformat(),
+            "expiry_date": self.expiry_date.isoformat(),
+        }

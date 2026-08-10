@@ -89,6 +89,24 @@ def test_rejects_symbol_off_allowlist():
     assert "symbol_not_on_allowlist" in decision.reasons
 
 
+def test_dynamic_picker_allowlist_is_side_specific():
+    limits = ExecutionLimits(
+        symbol_allowlist=(),
+        buy_symbol_allowlist=("NEW",),
+        sell_symbol_allowlist=("OLD",),
+    )
+    assert evaluate_order(make_order(symbol="NEW"), make_account(), limits).approved
+    denied_buy = evaluate_order(make_order(symbol="OLD"), make_account(), limits)
+    assert "symbol_not_on_allowlist" in denied_buy.reasons
+    account = make_account(positions={"OLD": 100.0})
+    allowed_sell = evaluate_order(
+        make_order(symbol="OLD", side="sell", notional=50.0),
+        account,
+        limits,
+    )
+    assert allowed_sell.approved
+
+
 def test_rejects_oversized_order():
     decision = evaluate_order(make_order(notional=400.0), make_account())
     assert "order_notional_exceeds_cap" in decision.reasons
@@ -387,6 +405,50 @@ def test_ref_id_differs_by_symbol_side_day_and_account():
     assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "sell", day)
     assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", date(2026, 8, 11))
     assert base != deterministic_ref_id("999999999", "SPY", "buy", day)
+
+
+def test_pick_entry_and_exit_have_distinct_broker_idempotency_keys():
+    from datetime import date
+
+    day = date(2026, 8, 10)
+    entry = deterministic_ref_id(TEST_ACCOUNT, "EXM", "buy", day, pick_id="pick-1", intent="entry")
+    exit_id = deterministic_ref_id(
+        TEST_ACCOUNT, "EXM", "sell", day, pick_id="pick-1", intent="exit"
+    )
+    assert entry != exit_id
+    assert entry == deterministic_ref_id(
+        TEST_ACCOUNT, "EXM", "buy", day, pick_id="pick-1", intent="entry"
+    )
+
+
+def test_mandatory_exit_is_planned_before_new_entry():
+    account = make_account(cash=600.0, positions={"OLD": 150.0})
+    limits = ExecutionLimits(
+        symbol_allowlist=(),
+        buy_symbol_allowlist=("NEW",),
+        sell_symbol_allowlist=("OLD",),
+    )
+    decisions = plan_orders_from_targets(
+        {"NEW": 0.2, "OLD": 0.0},
+        account,
+        prices={"NEW": 100.0, "OLD": 100.0},
+        limits=limits,
+        metadata_by_symbol={
+            "OLD": {
+                "pick_id": "old-pick",
+                "intent_class": "mandatory_exit",
+                "exit_reason": "horizon_expired",
+            },
+            "NEW": {
+                "pick_id": "new-pick",
+                "intent_class": "entry",
+                "exit_reason": None,
+            },
+        },
+    )
+    assert decisions[0].order.symbol == "OLD"
+    assert decisions[0].order.intent_class == "mandatory_exit"
+    assert decisions[1].order.symbol == "NEW"
 
 
 def test_broker_positions_are_valued_from_quantities_and_current_prices():

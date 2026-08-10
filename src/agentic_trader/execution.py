@@ -126,6 +126,8 @@ class ExecutionLimits:
     allow_fractional: bool = True
     require_broker_order_counts: bool = True
     symbol_allowlist: tuple[str, ...] = DEFAULT_SYMBOL_ALLOWLIST
+    buy_symbol_allowlist: tuple[str, ...] | None = None
+    sell_symbol_allowlist: tuple[str, ...] | None = None
 
     def position_cap_for(self, symbol: str) -> float:
         symbol = symbol.upper()
@@ -134,6 +136,16 @@ class ExecutionLimits:
         if symbol in BROAD_MARKET_FUNDS:
             return self.max_broad_market_weight
         return self.max_position_weight
+
+    def symbol_allowed(self, symbol: str, side: str) -> bool:
+        allowed = (
+            self.buy_symbol_allowlist
+            if side == "buy"
+            else self.sell_symbol_allowlist
+            if side == "sell"
+            else None
+        )
+        return symbol in (allowed if allowed is not None else self.symbol_allowlist)
 
     def __post_init__(self) -> None:
         if self.max_order_notional <= 0:
@@ -169,6 +181,7 @@ class AccountSnapshot:
     # Fractional and dollar-based orders are rejected by the broker outside
     # 9:30-16:00 ET, so planning them then produces orders that cannot be filled.
     session_is_regular: bool = False
+    external_halt_reasons: tuple[str, ...] = ()
 
     @property
     def settled_equity(self) -> float:
@@ -260,6 +273,9 @@ class ProposedOrder:
     # price reconciliation will measure the fill against.
     reference_price: float | None = None
     rationale: str = ""
+    pick_id: str = ""
+    intent_class: str = "rebalance"
+    exit_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", self.symbol.upper())
@@ -303,6 +319,9 @@ class Decision:
             "limit_price": self.order.limit_price,
             "quantity": self.order.quantity,
             "reference_price": self.order.reference_price,
+            "pick_id": self.order.pick_id,
+            "intent_class": self.order.intent_class,
+            "exit_reason": self.order.exit_reason,
             "approved": self.approved,
             "reasons": list(self.reasons),
         }
@@ -322,6 +341,7 @@ def check_account_halts(
 ) -> tuple[str, ...]:
     """Account-level conditions that block every order, not just one."""
     reasons: list[str] = []
+    reasons.extend(account.external_halt_reasons)
 
     if kill_switch_engaged(root):
         reasons.append("kill_switch_file_present")
@@ -396,7 +416,7 @@ def evaluate_order(
     if order.reference_price is None or order.reference_price <= 0:
         # Without it, reconciliation has nothing to measure the fill against.
         reasons.append("missing_reference_price")
-    if order.symbol not in limits.symbol_allowlist:
+    if not limits.symbol_allowed(order.symbol, order.side):
         reasons.append("symbol_not_on_allowlist")
     if not order.rationale.strip():
         reasons.append("missing_rationale")
@@ -470,6 +490,8 @@ def deterministic_ref_id(
     symbol: str,
     side: str,
     day: date | None = None,
+    pick_id: str = "",
+    intent: str = "rebalance",
 ) -> str:
     """Derive Robinhood's idempotency key from the order's logical identity.
 
@@ -484,7 +506,7 @@ def deterministic_ref_id(
     this remains unique for every logical order it can create.
     """
     stamp = (day or datetime.now(UTC).date()).isoformat()
-    key = f"{account_number}|{stamp}|{symbol.upper()}|{side.lower()}"
+    key = f"{account_number}|{stamp}|{symbol.upper()}|{side.lower()}|{pick_id}|{intent.lower()}"
     return str(uuid.uuid5(REF_ID_NAMESPACE, key))
 
 
@@ -502,6 +524,7 @@ def plan_orders_from_targets(
     prices: dict[str, float],
     limits: ExecutionLimits | None = None,
     rebalance_threshold: float = 0.05,
+    metadata_by_symbol: dict[str, dict[str, str | None]] | None = None,
     root: str | Path = ".",
 ) -> list[Decision]:
     """Translate strategy target weights into guarded, capped, priced orders.
@@ -517,6 +540,9 @@ def plan_orders_from_targets(
         raise ValueError("Target weights sum above 100%")
 
     prices = {symbol.upper(): float(price) for symbol, price in prices.items()}
+    metadata_by_symbol = {
+        symbol.upper(): metadata for symbol, metadata in (metadata_by_symbol or {}).items()
+    }
     symbols = sorted(set(target_weights) | set(account.positions))
     drifts: list[tuple[float, ProposedOrder]] = []
     for symbol in symbols:
@@ -531,11 +557,27 @@ def plan_orders_from_targets(
         last_price = prices.get(symbol)
         target_weight = float(target_weights.get(symbol, 0.0))
         rationale = f"rebalance toward target weight {target_weight:.3f}"
+        metadata = metadata_by_symbol.get(symbol, {})
+        pick_id = str(metadata.get("pick_id") or "")
+        intent_class = str(metadata.get("intent_class") or ("entry" if side == "buy" else "sell"))
+        exit_reason = metadata.get("exit_reason")
         if not last_price:
             # A missing quote produces an order the guard rejects, rather than
             # one priced by guesswork.
             drifts.append(
-                (drift, ProposedOrder(symbol, side, notional, "limit", rationale=rationale))
+                (
+                    drift,
+                    ProposedOrder(
+                        symbol,
+                        side,
+                        notional,
+                        "limit",
+                        rationale=rationale,
+                        pick_id=pick_id,
+                        intent_class=intent_class,
+                        exit_reason=str(exit_reason) if exit_reason else None,
+                    ),
+                )
             )
             continue
 
@@ -555,6 +597,9 @@ def plan_orders_from_targets(
                         quantity=float(whole_shares),
                         reference_price=last_price,
                         rationale=rationale,
+                        pick_id=pick_id,
+                        intent_class=intent_class,
+                        exit_reason=str(exit_reason) if exit_reason else None,
                     ),
                 )
             )
@@ -571,13 +616,21 @@ def plan_orders_from_targets(
                         order_type="market",
                         reference_price=last_price,
                         rationale=rationale,
+                        pick_id=pick_id,
+                        intent_class=intent_class,
+                        exit_reason=str(exit_reason) if exit_reason else None,
                     ),
                 )
             )
 
-    # Largest drift first so the limited daily order budget is spent where the
-    # portfolio is furthest from target. Sells lead to free up cash for buys.
-    drifts.sort(key=lambda item: (item[1].side != "sell", -item[0]))
+    priority = {"mandatory_exit": 0, "sell": 1, "rebalance": 2, "entry": 3}
+    drifts.sort(
+        key=lambda item: (
+            priority.get(item[1].intent_class, 4),
+            item[1].side != "sell",
+            -item[0],
+        )
+    )
     ordered = [order for _, order in drifts][: limits.max_orders_per_day]
     return evaluate_batch(ordered, account, limits, root)
 
