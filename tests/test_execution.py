@@ -10,12 +10,14 @@ from agentic_trader.execution import (
     AccountSnapshot,
     ExecutionLimits,
     ProposedOrder,
+    broker_position_values,
     deterministic_ref_id,
     evaluate_batch,
     evaluate_order,
     marketable_limit_price,
     plan_orders_from_targets,
     record_live_state,
+    summarize_broker_orders,
 )
 
 TEST_ACCOUNT = "111111111"
@@ -360,22 +362,60 @@ def test_duplicate_runs_derive_the_same_ref_id():
     from datetime import date
 
     day = date(2026, 8, 10)
-    first = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, day)
-    second = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, day)
+    first = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day)
+    second = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day)
     assert first == second
     assert uuid.UUID(first).version == 5
 
 
-def test_ref_id_differs_by_symbol_side_sequence_day_and_account():
+def test_ref_id_does_not_depend_on_observed_daily_order_count():
+    """Runs that query before and after another order must still deduplicate."""
     from datetime import date
 
     day = date(2026, 8, 10)
-    base = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, day)
-    assert base != deterministic_ref_id(TEST_ACCOUNT, "IEF", "buy", 0, day)
-    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "sell", 0, day)
-    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 1, day)
-    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", 0, date(2026, 8, 11))
-    assert base != deterministic_ref_id("999999999", "SPY", "buy", 0, day)
+    before_other_order = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day)
+    after_other_order = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day)
+    assert before_other_order == after_other_order
+
+
+def test_ref_id_differs_by_symbol_side_day_and_account():
+    from datetime import date
+
+    day = date(2026, 8, 10)
+    base = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day)
+    assert base != deterministic_ref_id(TEST_ACCOUNT, "IEF", "buy", day)
+    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "sell", day)
+    assert base != deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", date(2026, 8, 11))
+    assert base != deterministic_ref_id("999999999", "SPY", "buy", day)
+
+
+def test_broker_positions_are_valued_from_quantities_and_current_prices():
+    positions = [
+        {"symbol": "SPY", "quantity": "0.2"},
+        {"symbol": "IEF", "quantity": "1"},
+    ]
+    assert broker_position_values(positions, {"SPY": 500.0, "IEF": 95.0}) == {
+        "SPY": 100.0,
+        "IEF": 95.0,
+    }
+
+
+def test_broker_position_without_a_quote_fails_closed():
+    with pytest.raises(ValueError, match="Missing a positive current price"):
+        broker_position_values([{"symbol": "SPY", "quantity": "0.2"}], {})
+
+
+def test_broker_order_summary_accepts_dollars_and_share_limit_orders():
+    orders = [
+        {"symbol": "SPY", "dollar_based_amount": "150.00"},
+        {"symbol": "IEF", "quantity": "1", "price": "93.36"},
+    ]
+    assert summarize_broker_orders(orders) == (2, 243.36)
+
+
+def test_broker_order_summary_fails_closed_when_notional_is_unknown():
+    with pytest.raises(ValueError, match="Cannot determine broker-order notional"):
+        summarize_broker_orders([{"symbol": "SPY", "state": "filled"}])
 
 
 def test_marketable_limit_crosses_spread_in_the_right_direction():

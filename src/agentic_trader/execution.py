@@ -179,6 +179,67 @@ class AccountSnapshot:
         return float(self.positions.get(symbol.upper(), 0.0))
 
 
+def _broker_number(value: Any) -> float | None:
+    """Parse a numeric broker field without guessing missing values."""
+    if isinstance(value, dict):
+        value = value.get("amount")
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def broker_position_values(
+    positions: list[dict[str, Any]],
+    prices: dict[str, float],
+) -> dict[str, float]:
+    """Convert Robinhood position quantities to current market values.
+
+    The broker returns quantities while the planner reasons in dollars. Keeping
+    this conversion in deterministic code avoids asking the automation to invent
+    a request shape after the first live orders create non-empty positions.
+    """
+    normalized_prices = {symbol.upper(): float(price) for symbol, price in prices.items()}
+    values: dict[str, float] = {}
+    for position in positions:
+        symbol = str(position.get("symbol", "")).upper()
+        quantity = _broker_number(position.get("quantity"))
+        price = normalized_prices.get(symbol)
+        if not symbol or quantity is None or quantity < 0:
+            raise ValueError("Broker position is missing a valid symbol or quantity")
+        if price is None or price <= 0:
+            raise ValueError(f"Missing a positive current price for position {symbol}")
+        values[symbol] = values.get(symbol, 0.0) + quantity * price
+    return values
+
+
+def summarize_broker_orders(orders: list[dict[str, Any]]) -> tuple[int, float]:
+    """Count broker orders and conservatively recover their submitted notional."""
+    total = 0.0
+    for order in orders:
+        notional = _broker_number(order.get("dollar_based_amount"))
+        if notional is None:
+            quantity = _broker_number(order.get("quantity"))
+            if quantity is None:
+                quantity = _broker_number(order.get("cumulative_quantity"))
+            price = _broker_number(order.get("price"))
+            if price is None:
+                price = _broker_number(order.get("limit_price"))
+            if price is None:
+                price = _broker_number(order.get("average_price"))
+            if quantity is None or price is None:
+                raise ValueError(
+                    "Cannot determine broker-order notional; refusing to undercount daily usage"
+                )
+            notional = quantity * price
+        if notional < 0:
+            raise ValueError("Broker-order notional cannot be negative")
+        total += notional
+    return len(orders), total
+
+
 @dataclass(frozen=True)
 class ProposedOrder:
     """A broker-ready order.
@@ -408,7 +469,6 @@ def deterministic_ref_id(
     account_number: str,
     symbol: str,
     side: str,
-    sequence: int,
     day: date | None = None,
 ) -> str:
     """Derive Robinhood's idempotency key from the order's logical identity.
@@ -418,11 +478,13 @@ def deterministic_ref_id(
     the broker deduplicates on ref_id, deriving it from identity rather than
     randomness turns that race into a single order instead of two.
 
-    The notional is deliberately excluded: concurrent runs may price a snapshot
-    cents apart, and a key that differs by a cent would not deduplicate.
+    The notional and observed order count are deliberately excluded: concurrent
+    runs may price snapshots cents apart or observe different stages of the same
+    session. The planner emits at most one order per symbol and side each day, so
+    this remains unique for every logical order it can create.
     """
     stamp = (day or datetime.now(UTC).date()).isoformat()
-    key = f"{account_number}|{stamp}|{symbol.upper()}|{side.lower()}|{sequence}"
+    key = f"{account_number}|{stamp}|{symbol.upper()}|{side.lower()}"
     return str(uuid.uuid5(REF_ID_NAMESPACE, key))
 
 

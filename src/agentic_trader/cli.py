@@ -13,6 +13,7 @@ from .execution import (
     ExecutionLimits,
     SessionLockedError,
     append_audit_record,
+    broker_position_values,
     check_account_halts,
     daily_consumption,
     deterministic_ref_id,
@@ -21,6 +22,7 @@ from .execution import (
     record_live_state,
     record_plan_consumption,
     session_lock,
+    summarize_broker_orders,
 )
 from .option_chain import (
     download_option_chain_snapshot,
@@ -286,31 +288,55 @@ def command_live_plan(args: argparse.Namespace) -> int:
 def _live_plan(args: argparse.Namespace) -> int:
     request = json.loads(Path(args.request).read_text())
     raw_account = request["account"]
+    prices = {str(k).upper(): float(v) for k, v in request["prices"].items()}
 
     # The drawdown and daily-loss halts read from persisted state rather than
     # the request so a caller cannot clear a halt by rewriting its own input.
     state = load_live_state(args.root)
     persisted_orders, persisted_notional = daily_consumption(args.root)
+    raw_positions = raw_account.get("broker_positions")
+    if raw_positions is not None:
+        positions = broker_position_values(raw_positions, prices)
+    else:
+        legacy_positions = raw_account.get("positions", {})
+        if not isinstance(legacy_positions, dict):
+            raise ValueError(
+                "positions must be a symbol-to-value mapping; use broker_positions "
+                "for the native Robinhood response"
+            )
+        positions = {str(k).upper(): float(v) for k, v in legacy_positions.items()}
+
+    raw_orders = raw_account.get("broker_orders")
+    if raw_orders is not None:
+        broker_orders, broker_notional = summarize_broker_orders(raw_orders)
+        orders_source = "broker"
+    else:
+        broker_orders = int(raw_account.get("orders_today", 0))
+        broker_notional = float(raw_account.get("notional_today", 0.0))
+        # A caller-provided label is not proof that the count came from the
+        # broker. Only the raw response parsed above earns broker verification.
+        orders_source = "unknown"
+
     equity = float(raw_account["equity"])
     account = AccountSnapshot(
         account_number=str(raw_account["account_number"]),
         equity=equity,
         cash=float(raw_account["cash"]),
-        positions={str(k).upper(): float(v) for k, v in raw_account.get("positions", {}).items()},
+        positions=positions,
         high_water_mark=state.get("high_water_mark"),
         prior_close_equity=state.get("prior_close_equity"),
         # Take the larger of the broker's count and what this repo approved
         # today, so a duplicate run cannot re-spend the daily budget whether or
         # not the other run's orders have reached the broker yet.
-        orders_today=max(int(raw_account.get("orders_today", 0)), persisted_orders),
-        notional_today=max(float(raw_account.get("notional_today", 0.0)), persisted_notional),
+        orders_today=max(broker_orders, persisted_orders),
+        notional_today=max(broker_notional, persisted_notional),
         pending_deposits=float(raw_account.get("pending_deposits", 0.0)),
         net_deposits=(
             float(raw_account["net_deposits"])
             if raw_account.get("net_deposits") is not None
             else None
         ),
-        orders_source=str(raw_account.get("orders_source", "unknown")),
+        orders_source=orders_source,
         session_is_regular=bool(raw_account.get("session_is_regular", False)),
     )
     limits = ExecutionLimits(
@@ -322,21 +348,19 @@ def _live_plan(args: argparse.Namespace) -> int:
     decisions = plan_orders_from_targets(
         {str(k).upper(): float(v) for k, v in request["targets"].items()},
         account,
-        prices={str(k).upper(): float(v) for k, v in request["prices"].items()},
+        prices=prices,
         limits=limits,
         rebalance_threshold=args.rebalance_threshold,
         root=args.root,
     )
     approved = [decision.to_dict() for decision in decisions if decision.approved]
-    # Sequence continues from orders already placed today, so a duplicate run
-    # that sees the same broker state derives the same keys and the broker
-    # collapses the pair, while a legitimate later run derives fresh ones.
-    for offset, order in enumerate(approved):
+    # Identity does not depend on the observed order count, so duplicate runs
+    # derive the same key even when they queried at different session stages.
+    for order in approved:
         order["ref_id"] = deterministic_ref_id(
             account.account_number,
             order["symbol"],
             order["side"],
-            account.orders_today + offset,
         )
     payload = {
         "mode": "PLAN_ONLY_REQUIRES_HUMAN_APPROVAL",

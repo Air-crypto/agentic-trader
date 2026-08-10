@@ -96,14 +96,17 @@ Three layers address it, and only the third works in the cloud:
 2. **Broker order count** via `get_equity_orders` with `created_at_gte` set to
    today and `placed_agent="agentic"`. The broker sees a concurrent run's orders
    before either has written anything locally. This narrows the race to the
-   window between query and placement but does not eliminate it. The guard
-   rejects any snapshot whose `orders_source` is not `broker`.
+   window between query and placement but does not eliminate it. The raw broker
+   orders are passed to `live-plan`, which derives count and notional itself and
+   rejects a request that only claims its count is broker-sourced.
 3. **Deterministic `ref_id`**, which closes the window. Robinhood deduplicates on
    this key, so deriving it from the order's logical identity rather than from
-   randomness means two runs computing the same plan submit the same key and the
-   broker collapses them into one order. Every order in `approved_orders`
-   carries its `ref_id` and it must be passed through to `place_equity_order`
-   verbatim. Generating a fresh UUID instead reintroduces the double trade.
+   randomness or observed order count means two runs computing the same symbol,
+   side, and day submit the same key even when they queried at different points
+   in the session. The broker collapses them into one order. Every order in
+   `approved_orders` carries its `ref_id` and it must be passed through to
+   `place_equity_order` verbatim. Generating a fresh UUID instead reintroduces
+   the double trade.
 
 Local persisted consumption is retained as a floor under the broker count, since
 an order accepted but not yet visible in history would otherwise read as zero.
@@ -210,10 +213,12 @@ stale value silently moves the floor.
 2. Trade only on a regular session day. Skip weekends and market holidays.
 3. Fetch account, positions, and quotes via the Robinhood MCP. Also call
    `get_equity_orders` with `created_at_gte` set to today and
-   `placed_agent="agentic"`, and set `orders_source` to `broker`.
-4. Write them to `artifacts/live/request.json` verbatim. Never edit a value to
-   make an order pass; the high-water mark is read from disk precisely so a
-   rewritten request cannot clear a halt.
+   `placed_agent="agentic"`.
+4. Write the native position and order arrays to `broker_positions` and
+   `broker_orders` in `artifacts/live/request.json`. Do not calculate position
+   values, order counts, daily notional, or `orders_source`; deterministic code
+   does that and fails closed when a required price or broker field is missing.
+   Never edit a value to make an order pass.
 5. Run `uv run agentic-trader live-plan --request artifacts/live/request.json --record-equity`.
 6. Place **only** the orders in `approved_orders`, using each order's stated
    `limit_price`, notional, and `ref_id`. Never place an order the plan does not
@@ -237,10 +242,11 @@ consecutive sessions where the audit log fails to reconcile.
 
 Editing limits to make a rejected order pass. Trading any account other than the
 configured one. Generating a `ref_id` instead of using the plan's. Storing risk
-state in automation memory. Committing the account number, balances, or live
-state to this public repository. Placing orders directly through the MCP without a guard-approved
-plan. Placing orders without reconciling in the same session. Deleting or
-clearing `KILL_SWITCH` without human review. Options, margin, shorting, or any
-symbol off the allowlist. Deleting or rewriting `artifacts/live/audit.jsonl`.
-Treating a guard approval as a prediction of profit — it certifies bounded risk
-and nothing else.
+state in automation memory. Printing an unmasked account identifier in a report.
+Committing the account number, balances, or live state to this public repository.
+Placing orders directly through the MCP without a guard-approved plan. Placing
+orders without reconciling in the same session. Deleting or clearing
+`KILL_SWITCH` without human review. Options, margin, shorting, or any symbol off
+the allowlist. Deleting or rewriting `artifacts/live/audit.jsonl`. Treating a
+guard approval as a prediction of profit — it certifies bounded risk and nothing
+else.
