@@ -1,0 +1,151 @@
+{
+  "evidence": [
+    {
+      "id": "linde-2020-space-capacity",
+      "source_type": "issuer_release",
+      "title": "Linde Starts Up New Plant to Deliver Increased Capacity to Space Launch Sector",
+      "publisher": "Linde",
+      "url": "https://www.linde.com/news-and-media/2020/linde-starts-up-new-plant-to-deliver-increased-capacity-to-space-launch-sector",
+      "published_at": "2020-02-05T12:00:00Z",
+      "retrieved_at": "2026-08-09T17:00:00Z",
+      "quote": "The new Air Separation Unit effectively doubles production capacity at Mims to more than 500 tons per day in response to growing contracted space-launch demand.",
+      "primary": true,
+      "independence_group": "linde"
+    },
+    {
+      "id": "linde-2021-space-expansion",
+      "source_type": "issuer_release",
+      "title": "Linde to Expand Production Capacity in Florida to Meet Growing Demand",
+      "publisher": "Linde",
+      "url": "https://www.linde.com/news-and-media/2021/linde-to-expand-production-capacity-in-florida-to-meet-growing-demand",
+      "published_at": "2021-09-13T12:00:00Z",
+      "retrieved_at": "2026-08-09T17:00:00Z",
+      "quote": "Linde said it would increase Mims capacity by almost 50 percent and cited growing demand for space-launch propellant and the broader regional economy.",
+      "primary": true,
+      "independence_group": "linde"
+    },
+    {
+      "id": "linde-2022-space-agreement",
+      "source_type": "issuer_release",
+      "title": "Linde Signs New Supply Agreement with Major Space Launch Company",
+      "publisher": "Linde",
+      "url": "https://www.linde.com/news-and-media/2022/linde-signs-new-supply-agreement-with-major-space-launch-company",
+      "published_at": "2022-04-20T12:00:00Z",
+      "retrieved_at": "2026-08-09T17:00:00Z",
+      "quote": "Linde announced another long-term agreement to supply liquid oxygen and nitrogen and said its Mims expansion would increase capacity by up to 50 percent.",
+      "primary": true,
+      "independence_group": "linde"
+    },
+    {
+      "id": "linde-2025-space-investments",
+      "source_type": "issuer_release",
+      "title": "Linde Announces Major U.S. Investments to Support Commercial Space Sector",
+      "publisher": "Linde",
+      "url": "https://www.linde.com/news-and-media/2025/linde-announces-major-u,-d-,s,-d-,-investments-to-support-commercial-space-sector",
+      "published_at": "2025-07-21T12:00:00Z",
+      "retrieved_at": "2026-08-09T17:00:00Z",
+      "quote": "Linde announced two long-term bulk-gas agreements, a Mims expansion, and a new Brownsville air-separation unit for commercial space operations.",
+      "primary": true,
+      "independence_group": "linde"
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "commercial-launches-to-linde",
+      "driver_entity": "U.S. commercial space-launch activity",
+      "public_company": "Linde plc",
+      "ticker": "LIN",
+      "relationship": "Supplies liquid oxygen, nitrogen, argon, and related industrial-gas infrastructure to commercial space-launch customers.",
+      "products": [
+        "liquid oxygen",
+        "liquid nitrogen",
+        "argon",
+        "air-separation capacity"
+      ],
+      "evidence_ids": [
+        "linde-2020-space-capacity",
+        "linde-2021-space-expansion",
+        "linde-2022-space-agreement",
+        "linde-2025-space-investments"
+      ],
+      "directness": 0.9,
+      "relationship_confidence": 0.9,
+      "materiality_score": 0.25,
+      "materiality_basis": "The issuer repeatedly committed dedicated capacity, but it does not separately disclose space revenue; current external estimates describe space as a low-single-digit share of company revenue."
+    }
+  ],
+  "events": [
+    {
+      "id": "lin-2020-capacity-startup",
+      "dependency_id": "commercial-launches-to-linde",
+      "ticker": "LIN",
+      "event_type": "capacity_startup",
+      "summary": "Linde started a Mims air-separation unit that doubled production to more than 500 tons per day, citing contracted launch demand.",
+      "published_at": "2020-02-05T12:00:00Z",
+      "direction": 1,
+      "horizon_days": 60,
+      "evidence_ids": [
+        "linde-2020-space-capacity"
+      ],
+      "quantified": true,
+      "magnitude_score": 0.8,
+      "novelty_score": 0.8,
+      "timing_score": 0.9,
+      "speculation_score": 0.1
+    },
+    {
+      "id": "lin-2021-capacity-plan",
+      "dependency_id": "commercial-launches-to-linde",
+      "ticker": "LIN",
+      "event_type": "capacity_expansion",
+      "summary": "Linde announced another nearly 50 percent Mims expansion for contracted customers including the aerospace end market.",
+      "published_at": "2021-09-13T12:00:00Z",
+      "direction": 1,
+      "horizon_days": 60,
+      "evidence_ids": [
+        "linde-2021-space-expansion"
+      ],
+      "quantified": true,
+      "magnitude_score": 0.65,
+      "novelty_score": 0.6,
+      "timing_score": 0.8,
+      "speculation_score": 0.1
+    },
+    {
+      "id": "lin-2022-supply-agreement",
+      "dependency_id": "commercial-launches-to-linde",
+      "ticker": "LIN",
+      "event_type": "supply_agreement",
+      "summary": "Linde disclosed another long-term industrial-gas agreement with a major Florida launch company alongside a capacity increase of up to 50 percent.",
+      "published_at": "2022-04-20T12:00:00Z",
+      "direction": 1,
+      "horizon_days": 60,
+      "evidence_ids": [
+        "linde-2022-space-agreement"
+      ],
+      "quantified": true,
+      "magnitude_score": 0.65,
+      "novelty_score": 0.65,
+      "timing_score": 0.8,
+      "speculation_score": 0.1
+    },
+    {
+      "id": "lin-2025-two-space-agreements",
+      "dependency_id": "commercial-launches-to-linde",
+      "ticker": "LIN",
+      "event_type": "supply_agreement_and_capacity_expansion",
+      "summary": "Linde disclosed two long-term agreements plus new and expanded plants supporting U.S. commercial launch demand.",
+      "published_at": "2025-07-21T12:00:00Z",
+      "direction": 1,
+      "horizon_days": 60,
+      "evidence_ids": [
+        "linde-2025-space-investments"
+      ],
+      "quantified": true,
+      "magnitude_score": 0.7,
+      "novelty_score": 0.75,
+      "timing_score": 0.85,
+      "speculation_score": 0.15
+    }
+  ]
+}

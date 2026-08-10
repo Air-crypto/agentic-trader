@@ -1,0 +1,35 @@
+[project]
+name = "agentic-trader"
+version = "0.1.0"
+description = "Cost-aware research and paper-trading harness for a guarded momentum strategy"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "pyarrow>=25.0.0",
+    "yfinance>=1.5.2",
+]
+
+[project.scripts]
+agentic-trader = "agentic_trader.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
