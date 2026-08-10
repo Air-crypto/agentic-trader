@@ -311,6 +311,7 @@ def _live_plan(args: argparse.Namespace) -> int:
             else None
         ),
         orders_source=str(raw_account.get("orders_source", "unknown")),
+        session_is_regular=bool(raw_account.get("session_is_regular", False)),
     )
     limits = ExecutionLimits(
         max_order_notional=args.max_order_notional,

@@ -26,6 +26,8 @@ PREFLIGHT — stop and report if any of these fail. Do not work around them.
 1. KILL_SWITCH exists at the repository root. Stop. Never delete it.
 2. AGENTIC_TRADER_ACCOUNT or AGENTIC_TRADER_NET_DEPOSITS is unset. Stop.
 3. Today is a weekend or US market holiday. Stop; there is nothing to do.
+   In LIVE mode also stop unless the current time is inside 9:30-16:00 ET, since
+   the broker rejects fractional orders outside it.
 4. uv sync --frozen, uv run pytest, or uv run ruff check . fails. Stop.
 
 GATHER — all figures come from the Robinhood MCP, never from memory, never from
@@ -39,6 +41,8 @@ PLAN
 8. Write artifacts/live/request.json with the values exactly as returned:
    account_number, equity, cash, pending_deposits, positions, orders_today and
    notional_today from step 7, and orders_source set to "broker".
+   Set session_is_regular to true only if the current time is inside
+   9:30-16:00 ET on a trading day.
    Targets are SPY 0.50, IEF 0.25, GLD 0.15. Never alter a figure to make an
    order pass. If a number looks wrong, stop and report it.
 9. Run: uv run agentic-trader live-plan --request artifacts/live/request.json
@@ -48,9 +52,12 @@ PLAN
 
 EXECUTE — only when MODE is LIVE and approved_orders is non-empty.
 10. For each entry in approved_orders call place_equity_order with that entry's
-    exact symbol, side, limit_price, notional, and ref_id. The ref_id is what
-    stops a duplicate run from double-trading; never generate your own and never
-    reuse one across different orders. Place nothing that is not in the list.
+    broker_parameters object exactly as given, plus its ref_id. Do not convert a
+    market order to a limit or a dollar amount to a share count; the form was
+    chosen because it is the one the broker accepts at this size. The ref_id is
+    what stops a duplicate run from double-trading; never generate your own and
+    never reuse one across different orders. Place nothing not in the list.
+    Call review_equity_order first for each order and report its alerts.
 11. Wait for terminal order states. Fetch fills with get_equity_orders and write
     them to artifacts/live/executed.json.
 12. Run: uv run agentic-trader live-reconcile --executed

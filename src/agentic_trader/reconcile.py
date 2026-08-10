@@ -96,19 +96,22 @@ def reconcile(
             continue
 
         approval = unconsumed.pop(match_index)
-        limit_price = approval.get("limit_price")
+        # A market order has no limit, so its fill is measured against the price
+        # the plan was built from. This is the only price check a fractional
+        # order gets, since the broker will not accept a limit on one.
+        benchmark = approval.get("limit_price") or approval.get("reference_price")
         deviation = None
-        if limit_price and order.average_price > 0:
-            deviation = (order.average_price - float(limit_price)) / float(limit_price)
-            # Only fills worse than the limit are a problem; buying below the
-            # limit or selling above it is price improvement.
+        if benchmark and order.average_price > 0:
+            deviation = (order.average_price - float(benchmark)) / float(benchmark)
+            # Only fills worse than the benchmark are a problem; buying below it
+            # or selling above it is price improvement.
             adverse = deviation if order.side == "buy" else -deviation
             if adverse > PRICE_DEVIATION_LIMIT:
                 price_breaches.append(
                     {
                         "symbol": order.symbol,
                         "order_id": order.order_id,
-                        "limit_price": float(limit_price),
+                        "benchmark_price": float(benchmark),
                         "average_price": order.average_price,
                         "adverse_deviation": round(adverse, 5),
                     }

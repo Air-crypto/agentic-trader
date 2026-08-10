@@ -166,6 +166,9 @@ class AccountSnapshot:
     # duplicate trigger, because a concurrent run's orders exist at the broker
     # before either run has written anything locally.
     orders_source: str = "unknown"
+    # Fractional and dollar-based orders are rejected by the broker outside
+    # 9:30-16:00 ET, so planning them then produces orders that cannot be filled.
+    session_is_regular: bool = False
 
     @property
     def settled_equity(self) -> float:
@@ -178,17 +181,50 @@ class AccountSnapshot:
 
 @dataclass(frozen=True)
 class ProposedOrder:
+    """A broker-ready order.
+
+    Robinhood only accepts a dollar notional as a market order, and only accepts
+    fractional quantities as a market order during regular hours. An account too
+    small to buy one whole share therefore cannot use a limit order at all, so
+    the form is chosen by what the broker will accept rather than by preference.
+    """
+
     symbol: str
     side: str
     notional: float
     order_type: str = "limit"
     limit_price: float | None = None
+    quantity: float | None = None
+    # For a market order this is not an instruction to the broker; it is the
+    # price reconciliation will measure the fill against.
+    reference_price: float | None = None
     rationale: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", self.symbol.upper())
         object.__setattr__(self, "side", self.side.lower())
         object.__setattr__(self, "order_type", self.order_type.lower())
+
+    @property
+    def is_fractional(self) -> bool:
+        return self.order_type == "market"
+
+    def broker_parameters(self) -> dict[str, Any]:
+        """Exactly the arguments place_equity_order should receive."""
+        common = {
+            "symbol": self.symbol,
+            "side": self.side,
+            "market_hours": "regular_hours",
+            "time_in_force": "gfd",
+        }
+        if self.order_type == "market":
+            return {**common, "type": "market", "dollar_amount": f"{self.notional:.2f}"}
+        return {
+            **common,
+            "type": "limit",
+            "quantity": f"{self.quantity:g}",
+            "limit_price": f"{self.limit_price:.2f}",
+        }
 
 
 @dataclass(frozen=True)
@@ -198,15 +234,20 @@ class Decision:
     reasons: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "symbol": self.order.symbol,
             "side": self.order.side,
             "notional": round(self.order.notional, 2),
             "order_type": self.order.order_type,
             "limit_price": self.order.limit_price,
+            "quantity": self.order.quantity,
+            "reference_price": self.order.reference_price,
             "approved": self.approved,
             "reasons": list(self.reasons),
         }
+        if self.approved:
+            payload["broker_parameters"] = self.order.broker_parameters()
+        return payload
 
 
 def kill_switch_engaged(root: str | Path = ".") -> bool:
@@ -236,6 +277,8 @@ def check_account_halts(
         reasons.append("daily_notional_limit_reached")
     if limits.require_broker_order_counts and account.orders_source != "broker":
         reasons.append("daily_order_count_not_broker_verified")
+    if not account.session_is_regular:
+        reasons.append("outside_regular_trading_session")
 
     # Stateless and therefore the one drawdown protection that still works in an
     # environment with no persistence, such as a fresh cloud checkout.
@@ -282,8 +325,16 @@ def evaluate_order(
         reasons.append("unsupported_side")
     if order.order_type not in {"limit", "market"}:
         reasons.append("unsupported_order_type")
-    if order.order_type == "limit" and (order.limit_price is None or order.limit_price <= 0):
-        reasons.append("limit_order_requires_positive_limit_price")
+    if order.order_type == "limit":
+        if order.limit_price is None or order.limit_price <= 0:
+            reasons.append("limit_order_requires_positive_limit_price")
+        # The broker rejects fractional limit orders, so a limit order must be a
+        # whole number of shares.
+        if order.quantity is None or order.quantity < 1 or order.quantity % 1 != 0:
+            reasons.append("limit_order_requires_whole_share_quantity")
+    if order.reference_price is None or order.reference_price <= 0:
+        # Without it, reconciliation has nothing to measure the fill against.
+        reasons.append("missing_reference_price")
     if order.symbol not in limits.symbol_allowlist:
         reasons.append("symbol_not_on_allowlist")
     if not order.rationale.strip():
@@ -417,21 +468,50 @@ def plan_orders_from_targets(
         side = "buy" if delta > 0 else "sell"
         last_price = prices.get(symbol)
         target_weight = float(target_weights.get(symbol, 0.0))
-        drifts.append(
-            (
-                drift,
-                ProposedOrder(
-                    symbol=symbol,
-                    side=side,
-                    notional=notional,
-                    order_type="limit",
-                    # A missing quote leaves limit_price None, which the guard
-                    # rejects rather than silently converting to a market order.
-                    limit_price=(marketable_limit_price(last_price, side) if last_price else None),
-                    rationale=f"rebalance toward target weight {target_weight:.3f}",
-                ),
+        rationale = f"rebalance toward target weight {target_weight:.3f}"
+        if not last_price:
+            # A missing quote produces an order the guard rejects, rather than
+            # one priced by guesswork.
+            drifts.append(
+                (drift, ProposedOrder(symbol, side, notional, "limit", rationale=rationale))
             )
-        )
+            continue
+
+        whole_shares = int(notional // last_price)
+        if whole_shares >= 1:
+            # A limit order is only available at whole-share size, so prefer it
+            # there for the price protection it gives.
+            drifts.append(
+                (
+                    drift,
+                    ProposedOrder(
+                        symbol=symbol,
+                        side=side,
+                        notional=whole_shares * last_price,
+                        order_type="limit",
+                        limit_price=marketable_limit_price(last_price, side),
+                        quantity=float(whole_shares),
+                        reference_price=last_price,
+                        rationale=rationale,
+                    ),
+                )
+            )
+        else:
+            # Below one share the broker accepts only a dollar-denominated
+            # market order, so price protection moves to reconciliation.
+            drifts.append(
+                (
+                    drift,
+                    ProposedOrder(
+                        symbol=symbol,
+                        side=side,
+                        notional=notional,
+                        order_type="market",
+                        reference_price=last_price,
+                        rationale=rationale,
+                    ),
+                )
+            )
 
     # Largest drift first so the limited daily order budget is spent where the
     # portfolio is furthest from target. Sells lead to free up cash for buys.

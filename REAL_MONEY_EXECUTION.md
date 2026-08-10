@@ -111,6 +111,27 @@ an order accepted but not yet visible in history would otherwise read as zero.
 Options, margin, and short selling are unreachable: the side allowlist is
 `buy`/`sell`, and the account has no options level enabled.
 
+### Order form is dictated by the broker
+
+Robinhood accepts a dollar notional only as a market order, and accepts
+fractional quantities only as a market order during regular hours. An account
+this size cannot buy one whole share of most of the allowlist, so most orders
+must be dollar-denominated market orders whether or not that is preferable.
+
+The planner therefore picks the form the broker will accept: a whole-share limit
+order when the notional covers at least one share, and a dollar market order
+below that. Each approved order carries a `broker_parameters` object that is
+exactly what `place_equity_order` should receive. Pass it through unchanged.
+
+Because a market order has no limit, its price protection is post-trade only:
+reconciliation measures the fill against `reference_price` and engages the kill
+switch beyond 0.5% adverse. This is weaker than a limit and is accepted only
+because the broker offers no alternative at this size, and only for instruments
+liquid enough that regular-hours slippage is a rounding error.
+
+Planning is refused outside 9:30–16:00 ET, since a fractional order placed then
+is rejected by the broker and a market order queues unpriced to the next open.
+
 The guard fails closed. A missing quote, a blank rationale, or an unknown state
 produces a rejection rather than a market order.
 

@@ -40,6 +40,7 @@ def make_account(**overrides) -> AccountSnapshot:
         "notional_today": 0.0,
         "pending_deposits": 0.0,
         "orders_source": "broker",
+        "session_is_regular": True,
     }
     defaults.update(overrides)
     return AccountSnapshot(**defaults)
@@ -50,8 +51,8 @@ def make_order(**overrides) -> ProposedOrder:
         "symbol": "SPY",
         "side": "buy",
         "notional": 100.0,
-        "order_type": "limit",
-        "limit_price": 500.0,
+        "order_type": "market",
+        "reference_price": 500.0,
         "rationale": "trend model target",
     }
     defaults.update(overrides)
@@ -113,8 +114,51 @@ def test_rejects_sell_larger_than_position():
 
 
 def test_rejects_limit_order_without_price():
-    decision = evaluate_order(make_order(limit_price=None), make_account())
-    assert "limit_order_requires_positive_limit_price" in decision.reasons
+    order = make_order(order_type="limit", limit_price=None, quantity=1.0)
+    assert (
+        "limit_order_requires_positive_limit_price" in evaluate_order(order, make_account()).reasons
+    )
+
+
+def test_rejects_fractional_limit_order():
+    """The broker accepts a limit order only at whole-share size."""
+    order = make_order(order_type="limit", limit_price=500.0, quantity=0.2)
+    assert (
+        "limit_order_requires_whole_share_quantity" in evaluate_order(order, make_account()).reasons
+    )
+
+
+def test_rejects_order_without_a_reference_price():
+    decision = evaluate_order(make_order(reference_price=None), make_account())
+    assert "missing_reference_price" in decision.reasons
+
+
+def test_whole_share_limit_order_is_approved():
+    order = make_order(order_type="limit", limit_price=95.0, quantity=1.0, notional=93.0)
+    assert evaluate_order(order, make_account()).approved
+
+
+def test_refuses_to_plan_outside_regular_hours():
+    """A fractional order placed outside 9:30-16:00 ET is rejected by the broker."""
+    decision = evaluate_order(make_order(), make_account(session_is_regular=False))
+    assert "outside_regular_trading_session" in decision.reasons
+
+
+def test_market_order_broker_parameters_are_dollar_denominated():
+    params = make_order(notional=150.0).broker_parameters()
+    assert params["type"] == "market"
+    assert params["dollar_amount"] == "150.00"
+    assert params["market_hours"] == "regular_hours"
+    assert "limit_price" not in params
+
+
+def test_limit_order_broker_parameters_are_share_denominated():
+    order = make_order(order_type="limit", limit_price=93.36, quantity=1.0)
+    params = order.broker_parameters()
+    assert params["type"] == "limit"
+    assert params["quantity"] == "1"
+    assert params["limit_price"] == "93.36"
+    assert "dollar_amount" not in params
 
 
 def test_rejects_missing_rationale():
@@ -285,6 +329,24 @@ def test_planner_emits_capped_orders_from_targets():
     assert [decision.order.symbol for decision in decisions] == ["IEF", "SPY"]
     assert all(decision.approved for decision in decisions)
     assert all(decision.order.notional <= 150.0 for decision in decisions)
+
+
+def test_planner_uses_a_limit_order_when_a_whole_share_fits():
+    account = make_account(equity=750.0, cash=750.0)
+    decision = plan_orders_from_targets({"IEF": 0.2}, account, prices={"IEF": 95.0})[0]
+    assert decision.order.order_type == "limit"
+    assert decision.order.quantity == 1.0
+    assert decision.approved
+
+
+def test_planner_falls_back_to_a_dollar_market_order_below_one_share():
+    """A $750 account cannot buy a whole share of a $773 fund."""
+    account = make_account(equity=750.0, cash=750.0)
+    decision = plan_orders_from_targets({"SPY": 0.2}, account, prices={"SPY": 773.2})[0]
+    assert decision.order.order_type == "market"
+    assert decision.order.quantity is None
+    assert decision.approved
+    assert decision.order.broker_parameters()["dollar_amount"] == "150.00"
 
 
 def test_planner_rejects_symbol_with_no_quote():
