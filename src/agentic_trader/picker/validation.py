@@ -81,6 +81,8 @@ def validate_picker_draft(
         reasons.append("critic_draft_mismatch")
     if critic.created_at < draft.created_at:
         reasons.append("critic_predates_draft")
+    if "grok" not in critic.model_id.lower() or critic.model_id == model_id:
+        reasons.append("critic_model_not_independent")
     if critic.verdict != "pass":
         reasons.append("critic_veto")
     if critic.contradicted_evidence_ids:

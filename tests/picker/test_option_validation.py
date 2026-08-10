@@ -306,6 +306,22 @@ def test_critic_veto_blocks_option_authorization(now, evidence, critic, draft):
     assert "critic_veto" in result.reasons
 
 
+def test_option_authorization_requires_independent_grok_critic(
+    now, evidence, critic, draft
+):
+    same_model = replace(critic, model_id="option-model")
+    result = authorize(
+        option_draft(now),
+        [snapshot(now)],
+        evidence,
+        same_model,
+        draft,
+        now,
+    )
+    assert not result.accepted
+    assert "critic_model_not_independent" in result.reasons
+
+
 def test_close_uses_existing_contract_and_bypasses_entry_dte(
     now, evidence, critic
 ):

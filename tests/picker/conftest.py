@@ -102,7 +102,7 @@ def draft(now: datetime) -> PickerDraft:
 def critic(now: datetime) -> CriticVerdict:
     return CriticVerdict(
         draft_id="draft-1",
-        model_id="critic-model",
+        model_id="grok-4.5-critic",
         created_at=now - timedelta(minutes=5),
         verdict="pass",
         reasons=(),

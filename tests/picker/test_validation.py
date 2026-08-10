@@ -39,6 +39,20 @@ def test_critic_veto_fails_closed(draft, evidence, quant, critic, now):
     assert "critic_veto" in result.reasons
 
 
+def test_same_model_or_non_grok_critic_cannot_authorize(
+    draft, evidence, quant, critic, now
+):
+    result = validate(
+        draft,
+        evidence,
+        quant,
+        replace(critic, model_id="analyst-model"),
+        now,
+    )
+    assert not result.accepted
+    assert "critic_model_not_independent" in result.reasons
+
+
 def test_unverified_quote_cannot_reach_live_packet(draft, evidence, quant, critic, now):
     evidence[0] = replace(evidence[0], quote_verified=False)
     result = validate(draft, evidence, quant, critic, now)

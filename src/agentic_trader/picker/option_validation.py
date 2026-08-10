@@ -339,6 +339,8 @@ def validate_option_draft(
         reasons.append("active_position_hash_mismatch")
 
     _append_inheritance_reasons(reasons, draft, critic, source_draft)
+    if "grok" not in critic.model_id.lower() or critic.model_id == model_id:
+        reasons.append("critic_model_not_independent")
     _append_evidence_reasons(reasons, draft, evidence_by_id, now)
 
     matching_position: ActiveOptionPosition | None = None
