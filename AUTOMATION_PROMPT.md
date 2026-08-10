@@ -4,14 +4,24 @@ Stage 3 uses two Cursor Automations. Keep these files in sync with
 `AI_STOCK_PICKER.md` and `REAL_MONEY_EXECUTION.md`. Where they disagree, the
 contracts win and the run should stop and say so.
 
-| Automation | Schedule (UTC) | Local intent | Prompt source |
+Cursor Automation cron is **UTC only** (no timezone field). Schedules below are
+chosen so the live session is inside the US cash equity regular session
+(09:30–16:00 America/New_York) in both EDT and EST.
+
+| Automation | Cron (UTC) | Eastern time | Prompt source |
 | --- | --- | --- | --- |
-| AI Picker Research | `0 12 * * 1-5` | Weekdays 5:00 AM PDT / 8:00 AM EDT | `automations/research-prompt.txt` |
-| AI Picker Live Session | `0 16 * * 1-5` | Weekdays 9:00 AM PDT / 12:00 PM EDT | `automations/execution-prompt.txt` |
+| AI Picker Research | `0 12 * * 1-5` | 08:00 EDT / 07:00 EST (pre-open) | `automations/research-prompt.txt` |
+| AI Picker Live Session | `0 15 * * 1-5` | 11:00 EDT / 10:00 EST (RTH) | `automations/execution-prompt.txt` |
+
+`15:00` UTC is always at least 30 minutes after the open and well before the
+close year-round. Do not use a UTC hour that falls before 09:30 ET in winter
+(for example `14:00` UTC is 09:00 EST — too early for fractional LIVE orders).
 
 Wire JSON for Cursor is in `automations/research.json` and
 `automations/execution.json`. Root `automation.json` / `automation-prompt.txt`
-mirror the execution automation.
+mirror the execution automation. After changing these files, update the cron
+fields on the existing Cursor Automations to match — repo JSON does not push
+schedules into the product UI by itself.
 
 Disable the old static SPY/IEF/GLD automation in the Cursor UI so two live
 sessions do not compete for the daily $400 / 4-order budget.
