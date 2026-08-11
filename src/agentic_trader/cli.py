@@ -1168,9 +1168,21 @@ def command_picker_plan(args: argparse.Namespace) -> int:
     for symbol in plan.authorized_buy_symbols:
         packet = packet_by_symbol.get(symbol)
         thesis = thesis_by_symbol.get(symbol)
+        existing_active = thesis is not None and thesis.status in {
+            "pending_entry",
+            "active",
+        }
         metadata[symbol] = {
-            "pick_id": packet.packet_id if packet is not None else thesis.pick_id if thesis else "",
-            "intent_class": "entry" if packet is not None else "rebalance",
+            "pick_id": (
+                thesis.pick_id
+                if existing_active
+                else packet.packet_id
+                if packet is not None
+                else thesis.pick_id
+                if thesis
+                else ""
+            ),
+            "intent_class": "rebalance" if existing_active else "entry",
             "exit_reason": None,
         }
     for exit_intent in plan.exits:
