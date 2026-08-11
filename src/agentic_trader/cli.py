@@ -41,6 +41,7 @@ from .option_execution import (
 )
 from .option_reconcile import reconcile_option_orders
 from .options import OptionStructure, analyze_option_structure
+from .picker.critic_policy import ALLOWED_CRITIC_MODELS
 from .picker.invalidation import trading_day_expiry, trading_days_until
 from .picker.ledger import PostgresLedger, account_key
 from .picker.models import (
@@ -955,8 +956,12 @@ def command_picker_finalize_pending(args: argparse.Namespace) -> int:
     if critic_ids != required_ids:
         raise ValueError("Independent critics must cover every required draft exactly")
     analyst_model_id = str(pending["analyst_model_id"])
+    allowed_critic_models = {
+        item.casefold() for item in ALLOWED_CRITIC_MODELS
+    }
     if any(
-        "grok" not in item.model_id.lower() or item.model_id == analyst_model_id
+        item.model_id.casefold() not in allowed_critic_models
+        or item.model_id.casefold() == analyst_model_id.casefold()
         for item in critics
     ):
         raise ValueError("Every critic must record an independent Grok model ID")

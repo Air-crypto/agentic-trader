@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import datetime
 
 from .models import CRITIC_SOFT_DIMENSIONS, CriticVerdict
 
-_GROK_MODEL_ID = re.compile(
-    r"^(?:(?:cursor-)?grok|xai/grok)[-_.][a-z0-9]",
-    re.IGNORECASE,
-)
+ALLOWED_CRITIC_MODELS = frozenset({"cursor-grok-4.5-high-fast"})
 
 
 @dataclass(frozen=True)
@@ -53,7 +49,8 @@ def evaluate_critic_policy(
 
     critic_model = critic.model_id.strip()
     if (
-        _GROK_MODEL_ID.match(critic_model) is None
+        critic_model.casefold()
+        not in {item.casefold() for item in ALLOWED_CRITIC_MODELS}
         or critic_model.casefold() == analyst_model_id.strip().casefold()
     ):
         hard_vetoes.append("critic_model_not_independent")

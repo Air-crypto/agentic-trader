@@ -150,6 +150,14 @@ def test_grok_substring_does_not_spoof_critic_identity(
     )
     assert not result.accepted
     assert "critic_model_not_independent" in result.reasons
+    fake_prefix = validate(
+        draft,
+        evidence,
+        quant,
+        replace(critic, model_id="grok-fake"),
+        now,
+    )
+    assert "critic_model_not_independent" in fake_prefix.reasons
 
 
 def test_unverified_quote_cannot_reach_live_packet(draft, evidence, quant, critic, now):
