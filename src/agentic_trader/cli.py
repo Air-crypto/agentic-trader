@@ -837,6 +837,20 @@ def command_picker_authorize_batch(args: argparse.Namespace) -> int:
     as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.now(UTC).date()
     ledger = PostgresLedger.from_env()
     batch = ledger.latest_staged_batch(as_of)
+    pending = ledger.latest_pending_batch(as_of)
+    if pending is not None and (
+        batch is None or pending["created_at"] >= batch["created_at"]
+    ):
+        print(
+            json.dumps(
+                {
+                    "authorized": [],
+                    "reason": "newer_pending_batch_not_finalized",
+                    "pending_batch_id": pending["batch_id"],
+                }
+            )
+        )
+        return 2
     if batch is None:
         print(json.dumps({"authorized": [], "reason": "no_staged_batch"}))
         return 2
@@ -1141,6 +1155,18 @@ def command_option_authorize_batch(args: argparse.Namespace) -> int:
     as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
     ledger = PostgresLedger.from_env()
     batch = ledger.latest_research_batch(as_of)
+    pending = ledger.latest_pending_batch(as_of)
+    if pending is not None and (
+        batch is None or pending["created_at"] >= batch["created_at"]
+    ):
+        payload = {
+            "authorized": [],
+            "results": [],
+            "reason": "newer_pending_batch_not_finalized",
+            "pending_batch_id": pending["batch_id"],
+        }
+        print(json.dumps(payload))
+        return 2
     if batch is None:
         payload = {"authorized": [], "results": [], "reason": "no_staged_batch"}
         print(json.dumps(payload))

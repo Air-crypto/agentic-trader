@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from argparse import Namespace
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
@@ -93,3 +94,48 @@ def test_pending_batch_rejects_same_model_critic(
                 as_of=now.date().isoformat(),
             )
         )
+
+
+def test_newer_pending_batch_blocks_fallback_to_older_finalized_batch(
+    monkeypatch,
+    now,
+):
+    ledger = InMemoryLedger()
+    monkeypatch.setattr(
+        cli.PostgresLedger,
+        "from_env",
+        classmethod(lambda cls: ledger),
+    )
+    ledger.stage_batch(
+        "older-finalized",
+        now.date(),
+        now - timedelta(hours=1),
+        "a" * 64,
+        "claude-sonnet-5",
+        {"drafts": [], "option_drafts": [], "critics": []},
+    )
+    ledger.stage_pending_batch(
+        "newer-pending",
+        now.date(),
+        now,
+        "b" * 64,
+        "claude-sonnet-5",
+        {"drafts": [], "option_drafts": []},
+    )
+
+    picker_result = cli.command_picker_authorize_batch(
+        Namespace(
+            as_of=now.date().isoformat(),
+            quant="not-read.json",
+            output="not-written.json",
+        )
+    )
+    option_result = cli.command_option_authorize_batch(
+        Namespace(
+            as_of=now.date().isoformat(),
+            snapshot="not-read.json",
+            output="not-written.json",
+        )
+    )
+    assert picker_result == 2
+    assert option_result == 2
