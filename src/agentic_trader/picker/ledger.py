@@ -118,6 +118,25 @@ class PickerLedger(Protocol):
 
     def set_batch_status(self, batch_id: str, status: str) -> None: ...
 
+    def stage_pending_batch(
+        self,
+        batch_id: str,
+        as_of: date,
+        created_at: datetime,
+        prompt_hash: str,
+        analyst_model_id: str,
+        payload: dict[str, Any],
+    ) -> None: ...
+
+    def latest_pending_batch(self, as_of: date) -> dict[str, Any] | None: ...
+
+    def finalize_pending_batch(
+        self,
+        batch_id: str,
+        status: str,
+        finalized_at: datetime | None = None,
+    ) -> None: ...
+
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None: ...
 
     def consume_option_packet(
@@ -218,6 +237,7 @@ class InMemoryLedger:
         self.controls: dict[str, dict[str, Any]] = {}
         self.outcomes: dict[tuple[str, int], OutcomeMark] = {}
         self.batches: dict[str, dict[str, Any]] = {}
+        self.pending_batches: dict[str, dict[str, Any]] = {}
         self.option_packets: dict[str, OptionDecisionPacket] = {}
         self.option_packet_states: dict[str, dict[str, Any]] = {}
         self.option_positions_by_id: dict[str, ActiveOptionPosition] = {}
@@ -405,6 +425,59 @@ class InMemoryLedger:
         if batch_id not in self.batches:
             raise ValueError(f"Unknown research batch {batch_id}")
         self.batches[batch_id]["status"] = status
+
+    def stage_pending_batch(
+        self,
+        batch_id: str,
+        as_of: date,
+        created_at: datetime,
+        prompt_hash: str,
+        analyst_model_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        record = {
+            "batch_id": batch_id,
+            "as_of": as_of,
+            "created_at": created_at,
+            "prompt_hash": prompt_hash,
+            "analyst_model_id": analyst_model_id,
+            "status": "pending",
+            "payload": payload,
+            "finalized_at": None,
+        }
+        existing = self.pending_batches.get(batch_id)
+        if existing is not None:
+            comparable = {**existing, "status": "pending", "finalized_at": None}
+            if comparable != record:
+                raise ValueError(f"Pending research batch {batch_id} is immutable")
+            return
+        self.pending_batches[batch_id] = record
+
+    def latest_pending_batch(self, as_of: date) -> dict[str, Any] | None:
+        eligible = [
+            record
+            for record in self.pending_batches.values()
+            if record["as_of"] == as_of and record["status"] == "pending"
+        ]
+        return max(eligible, key=lambda item: item["created_at"]) if eligible else None
+
+    def finalize_pending_batch(
+        self,
+        batch_id: str,
+        status: str,
+        finalized_at: datetime | None = None,
+    ) -> None:
+        if status not in {"finalized", "rejected"}:
+            raise ValueError("Pending batch status must be finalized or rejected")
+        record = self.pending_batches.get(batch_id)
+        if record is None:
+            raise ValueError(f"Unknown pending research batch {batch_id}")
+        if record["status"] == status:
+            return
+        if record["status"] != "pending":
+            raise ValueError(f"Pending batch {batch_id} is already {record['status']}")
+        record["status"] = status
+        record["finalized_at"] = finalized_at or datetime.now(UTC)
 
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
         if not packet.verify_hash():
@@ -1143,6 +1216,107 @@ class PostgresLedger:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown research batch {batch_id}")
+
+    def stage_pending_batch(
+        self,
+        batch_id: str,
+        as_of: date,
+        created_at: datetime,
+        prompt_hash: str,
+        analyst_model_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        from psycopg.types.json import Jsonb
+
+        values = (
+            batch_id,
+            as_of,
+            created_at,
+            prompt_hash,
+            analyst_model_id,
+            payload,
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO picker_pending_research_batches
+                    (batch_id, as_of, created_at, prompt_hash,
+                     analyst_model_id, payload)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (batch_id) DO NOTHING
+                """,
+                (*values[:-1], Jsonb(payload)),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT batch_id, as_of, created_at, prompt_hash,
+                       analyst_model_id, payload
+                FROM picker_pending_research_batches
+                WHERE batch_id = %s
+                """,
+                (batch_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != values:
+                raise ValueError(f"Pending research batch {batch_id} is immutable")
+
+    def latest_pending_batch(self, as_of: date) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT batch_id, as_of, created_at, prompt_hash,
+                       analyst_model_id, status, payload, finalized_at
+                FROM picker_pending_research_batches
+                WHERE as_of = %s AND status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (as_of,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "batch_id": row[0],
+                "as_of": row[1],
+                "created_at": row[2],
+                "prompt_hash": row[3],
+                "analyst_model_id": row[4],
+                "status": row[5],
+                "payload": row[6],
+                "finalized_at": row[7],
+            }
+
+    def finalize_pending_batch(
+        self,
+        batch_id: str,
+        status: str,
+        finalized_at: datetime | None = None,
+    ) -> None:
+        if status not in {"finalized", "rejected"}:
+            raise ValueError("Pending batch status must be finalized or rejected")
+        finalized_at = finalized_at or datetime.now(UTC)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE picker_pending_research_batches
+                SET status = %s, finalized_at = %s
+                WHERE batch_id = %s AND status = 'pending'
+                """,
+                (status, finalized_at, batch_id),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                "SELECT status FROM picker_pending_research_batches "
+                "WHERE batch_id = %s",
+                (batch_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] != status:
+                raise ValueError(f"Pending batch {batch_id} cannot become {status}")
 
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
         if not packet.verify_hash():

@@ -315,3 +315,20 @@ def test_latest_research_batch_remains_available_after_stock_authorization(now):
 
     assert ledger.latest_staged_batch(now.date()) is None
     assert ledger.latest_research_batch(now.date())["batch_id"] == "batch-1"
+
+
+def test_pending_batch_requires_separate_finalization(now):
+    ledger = InMemoryLedger()
+    payload = {"drafts": [{"draft_id": "draft-1"}], "option_drafts": []}
+    ledger.stage_pending_batch(
+        "pending-1",
+        now.date(),
+        now,
+        "a" * 64,
+        "claude-sonnet",
+        payload,
+    )
+    assert ledger.latest_pending_batch(now.date())["batch_id"] == "pending-1"
+    ledger.finalize_pending_batch("pending-1", "finalized", now)
+    assert ledger.latest_pending_batch(now.date()) is None
+    ledger.finalize_pending_batch("pending-1", "finalized", now)

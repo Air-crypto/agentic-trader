@@ -671,6 +671,136 @@ def command_picker_stage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_pending_research_payload(
+    payload: dict[str, object],
+) -> tuple[datetime, date, list[EvidenceVersion], list[PickerDraft], list[OptionDraft]]:
+    created_at = datetime.fromisoformat(
+        str(payload["created_at"]).replace("Z", "+00:00")
+    ).astimezone(UTC)
+    as_of = date.fromisoformat(str(payload["as_of"]))
+    evidence = [EvidenceVersion.from_dict(item) for item in payload["evidence"]]
+    drafts = [PickerDraft.from_dict(item) for item in payload["drafts"]]
+    option_drafts = [
+        OptionDraft.from_dict(item) for item in payload.get("option_drafts", [])
+    ]
+    all_drafts = [*drafts, *option_drafts]
+    if not all_drafts or len({item.run_id for item in all_drafts}) != 1:
+        raise ValueError("A pending research batch requires exactly one run_id")
+    if any(item.created_at.date() != as_of for item in all_drafts):
+        raise ValueError("Every pending draft must be created on the as_of date")
+    if len(str(payload["prompt_hash"])) != 64:
+        raise ValueError("prompt_hash must be a SHA-256 digest")
+    return created_at, as_of, evidence, drafts, option_drafts
+
+
+def command_picker_stage_pending(args: argparse.Namespace) -> int:
+    """Stage analyst output for a separate Grok critic automation."""
+    payload = json.loads(Path(args.bundle).read_text())
+    created_at, as_of, _, drafts, option_drafts = _validate_pending_research_payload(
+        payload
+    )
+    batch_id = str(payload["batch_id"])
+    PostgresLedger.from_env().stage_pending_batch(
+        batch_id,
+        as_of,
+        created_at,
+        str(payload["prompt_hash"]),
+        str(payload["model_id"]),
+        payload,
+    )
+    result = {
+        "pending": True,
+        "batch_id": batch_id,
+        "drafts": len(drafts),
+        "option_drafts": len(option_drafts),
+    }
+    print(json.dumps(result))
+    return 0
+
+
+def command_picker_export_pending(args: argparse.Namespace) -> int:
+    """Export today's latest pending batch for independent criticism."""
+    as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.now(UTC).date()
+    batch = PostgresLedger.from_env().latest_pending_batch(as_of)
+    if batch is None:
+        print(json.dumps({"exported": False, "reason": "no_pending_batch"}))
+        return 2
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(batch["payload"], indent=2) + "\n")
+    print(json.dumps({"exported": True, "batch_id": batch["batch_id"]}))
+    return 0
+
+
+def command_picker_finalize_pending(args: argparse.Namespace) -> int:
+    """Attach real Grok verdicts and promote a pending batch to staged."""
+    now = datetime.now(UTC)
+    as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
+    ledger = PostgresLedger.from_env()
+    pending = ledger.latest_pending_batch(as_of)
+    if pending is None:
+        print(json.dumps({"finalized": False, "reason": "no_pending_batch"}))
+        return 2
+    payload = dict(pending["payload"])
+    created_at, _, evidence, drafts, option_drafts = (
+        _validate_pending_research_payload(payload)
+    )
+    critics = [
+        CriticVerdict.from_dict(item) for item in _json_items(args.critics, "critics")
+    ]
+    critic_ids = {item.draft_id for item in critics}
+    required_ids = {item.draft_id for item in drafts} | {
+        item.source_draft_id or item.draft_id for item in option_drafts
+    }
+    if critic_ids != required_ids:
+        raise ValueError("Independent critics must cover every required draft exactly")
+    analyst_model_id = str(pending["analyst_model_id"])
+    if any(
+        "grok" not in item.model_id.lower() or item.model_id == analyst_model_id
+        for item in critics
+    ):
+        raise ValueError("Every critic must record an independent Grok model ID")
+    payload["critics"] = [item.to_dict() for item in critics]
+    run_id = next(iter({item.run_id for item in [*drafts, *option_drafts]}))
+    ledger.put_run(
+        run_id,
+        content_hash("ai-picker-research"),
+        created_at,
+        as_of,
+        analyst_model_id,
+        str(pending["prompt_hash"]),
+        metadata={
+            "batch_id": pending["batch_id"],
+            "schema": "ai_picker_v1_unvalidated",
+            "critic": "independent_grok",
+        },
+    )
+    for item in evidence:
+        ledger.put_evidence(item)
+    for item in drafts:
+        ledger.put_draft(item)
+    stock_draft_ids = {item.draft_id for item in drafts}
+    for item in critics:
+        if item.draft_id in stock_draft_ids:
+            ledger.put_critic(item)
+    ledger.stage_batch(
+        str(pending["batch_id"]),
+        as_of,
+        created_at,
+        str(pending["prompt_hash"]),
+        analyst_model_id,
+        payload,
+    )
+    ledger.finalize_pending_batch(str(pending["batch_id"]), "finalized", now)
+    result = {
+        "finalized": True,
+        "batch_id": pending["batch_id"],
+        "critics": len(critics),
+    }
+    print(json.dumps(result))
+    return 0
+
+
 def command_picker_verify_evidence(args: argparse.Namespace) -> int:
     """Ground every evidence quote in a saved source document and hash it."""
     raw_items = _json_items(args.evidence, "evidence")
@@ -1150,9 +1280,16 @@ def command_option_authorize_batch(args: argparse.Namespace) -> int:
 
 
 def command_option_migrate(args: argparse.Namespace) -> int:
-    """Apply the idempotent options ledger migration."""
-    PostgresLedger.from_env().apply_migration(args.path)
-    payload = {"applied": True, "migration": str(args.path)}
+    """Apply all idempotent picker/options migrations in order."""
+    paths = (
+        [Path(args.path)]
+        if args.path
+        else sorted(Path("db/migrations").glob("*.sql"))
+    )
+    ledger = PostgresLedger.from_env()
+    for path in paths:
+        ledger.apply_migration(path)
+    payload = {"applied": True, "migrations": [str(path) for path in paths]}
     print(json.dumps(payload))
     return 0
 
@@ -1815,6 +1952,31 @@ def build_parser() -> argparse.ArgumentParser:
     picker_stage.add_argument("--bundle", required=True)
     picker_stage.set_defaults(func=command_picker_stage)
 
+    picker_stage_pending = subparsers.add_parser(
+        "picker-stage-pending",
+        help="Stage analyst output for a separate independent critic",
+    )
+    picker_stage_pending.add_argument("--bundle", required=True)
+    picker_stage_pending.set_defaults(func=command_picker_stage_pending)
+
+    picker_export_pending = subparsers.add_parser(
+        "picker-export-pending",
+        help="Export today's latest pending research batch for criticism",
+    )
+    picker_export_pending.add_argument("--as-of")
+    picker_export_pending.add_argument(
+        "--output", default="artifacts/picker/pending-research.json"
+    )
+    picker_export_pending.set_defaults(func=command_picker_export_pending)
+
+    picker_finalize_pending = subparsers.add_parser(
+        "picker-finalize-pending",
+        help="Attach independent Grok critics and promote a pending batch",
+    )
+    picker_finalize_pending.add_argument("--critics", required=True)
+    picker_finalize_pending.add_argument("--as-of")
+    picker_finalize_pending.set_defaults(func=command_picker_finalize_pending)
+
     picker_verify = subparsers.add_parser(
         "picker-verify-evidence",
         help="Verify evidence quotes against saved source documents",
@@ -1872,7 +2034,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Apply the idempotent Postgres migration for Level 2 options",
     )
     option_migrate.add_argument(
-        "--path", default="db/migrations/002_options.sql"
+        "--path"
     )
     option_migrate.set_defaults(func=command_option_migrate)
 
