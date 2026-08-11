@@ -28,14 +28,8 @@ def test_automation_crons_are_utc_and_market_safe():
     research = json.loads((ROOT / "automations" / "research.json").read_text())
     execution = json.loads((ROOT / "automations" / "execution.json").read_text())
     critic = json.loads((ROOT / "automations" / "critic.json").read_text())
-    assert research["triggers"] == [
-        {"cron": {"cron": "0 12 * * 1-5"}},
-        {"cron": {"cron": "15 15,17 * * 1-5"}},
-    ]
-    assert critic["triggers"] == [
-        {"cron": {"cron": "0 14 * * 1-5"}},
-        {"cron": {"cron": "15 16,18 * * 1-5"}},
-    ]
+    assert research["triggers"] == [{"cron": {"cron": "0 12 * * 1-5"}}]
+    assert critic["triggers"] == [{"cron": {"cron": "0 14 * * 1-5"}}]
     assert "grok" in critic["model"]
     assert execution["triggers"] == [
         {"cron": {"cron": "0 15,17,19 * * 1-5"}}

@@ -1,15 +1,10 @@
 {
   "name": "Agentic Trader \u2014 Independent Grok Critic",
-  "description": "Three-times-daily Grok hard-veto/soft-majority review that finalizes pending batches; no Robinhood tools.",
+  "description": "Once-daily independent Grok review using hard vetoes and structured 3-of-5 soft-majority checks. Finalizes exact hash-bound pending batches; no Robinhood tools.",
   "triggers": [
     {
       "cron": {
         "cron": "0 14 * * 1-5"
-      }
-    },
-    {
-      "cron": {
-        "cron": "15 16,18 * * 1-5"
       }
     }
   ],

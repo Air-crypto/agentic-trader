@@ -1,15 +1,10 @@
 {
   "name": "Agentic Trader \u2014 AI Picker Research + Options",
-  "description": "Three-times-daily Sonnet evidence research that stages pending stock and option drafts for separate Grok criticism; no Robinhood tools.",
+  "description": "Once-daily Sonnet research that rechecks active positions, verifies SEC-bound evidence, and stages pending stock/option drafts for independent Grok criticism. No Robinhood tools.",
   "triggers": [
     {
       "cron": {
         "cron": "0 12 * * 1-5"
-      }
-    },
-    {
-      "cron": {
-        "cron": "15 15,17 * * 1-5"
       }
     }
   ],
