@@ -48,8 +48,8 @@ An agent may propose; only the guard may approve.
 | Max single-name weight | 25% | Concentration limit for individual issuers |
 | Max broad-fund weight | 60% | Index funds are diversified; a stock is not |
 | Cash reserve | 10% | Never fully invested |
-| Max orders/day | 4 | Bounds a runaway loop |
-| Max notional/day | $400 | Bounds a runaway loop in dollars |
+| Max orders/day | 8 total; 6 entries | Reserves two slots for exits |
+| Max notional/day | $800 total; $600 entries | Reserves $200 for exits |
 | Daily loss halt | −3% | Stops trading into a bad session |
 | Drawdown halt | −10% from high-water mark | Matches the original mandate |
 | Capital floor | −10% of `AGENTIC_TRADER_NET_DEPOSITS` | Stateless; works with no persistence |
@@ -67,6 +67,7 @@ An agent may propose; only the guard may approve.
 | --- | --- |
 | `AGENTIC_TRADER_ACCOUNT` | Every order rejected (`agentic_account_not_configured`) |
 | `AGENTIC_TRADER_NET_DEPOSITS` | Capital floor disabled; without a persisted peak, every order rejected |
+| `SEC_USER_AGENT` | Evidence symbol/CIK cannot be reverified against SEC before authorization |
 
 In Cursor Cloud these are set in the dashboard Secrets tab, since
 `.cursor/environment.json` has no field for them. Set the account number as a
@@ -89,14 +90,16 @@ Cursor's documentation offers no exactly-once guarantee for scheduled triggers
 and describes no mutual exclusion between concurrent runs of one automation, so
 this must be assumed possible rather than designed against.
 
-Three layers address it, and only the third works in the cloud:
+Four layers address it; the broker idempotency key and Postgres reservation work
+across cloud VMs:
 
 1. **Session lock** (`artifacts/live/session.lock`) serializes runs on one
    machine. Two cloud runs execute on separate VMs with separate filesystems, so
    this protects a local scheduled job and nothing else. It is not a cloud
    control and must not be relied on as one.
-2. **Broker order count** via `get_equity_orders` with `created_at_gte` set to
-   today and `placed_agent="agentic"`. The broker sees a concurrent run's orders
+2. **Broker order count** via both `get_equity_orders` and `get_option_orders`
+   with `created_at_gte` set to today and `placed_agent="agentic"`. The broker
+   sees a concurrent run's orders
    before either has written anything locally. This narrows the race to the
    window between query and placement but does not eliminate it. The raw broker
    orders are passed to `live-plan`, which derives count and notional itself and
@@ -109,6 +112,10 @@ Three layers address it, and only the third works in the cloud:
    `approved_orders` carries its `ref_id` and it must be passed through to
    `place_equity_order` verbatim. Generating a fresh UUID instead reintroduces
    the double trade.
+4. **Postgres execution reservation**, acquired after broker review and
+   immediately before placement. It atomically reserves total and entry
+   order/notional capacity across fresh cloud VMs; `live-reserve` covers equity
+   and `option-reserve` covers option premium notional.
 
 Local persisted consumption is retained as a floor under the broker count, since
 an order accepted but not yet visible in history would otherwise read as zero.
@@ -203,7 +210,7 @@ through expiration remain prohibited. This stage is immediate-live only after a
 same-day `PLAN_ONLY` broker smoke passes under the initial hard caps.
 
 Required secrets for Stage 3: `AGENTIC_TRADER_ACCOUNT` (Runtime Secret),
-`AGENTIC_TRADER_NET_DEPOSITS` (currently 1750 after deposits), and
+`AGENTIC_TRADER_NET_DEPOSITS` (currently 5750 after deposits), and
 `DATABASE_URL` (Runtime Secret) set to the Supabase **Shared Pooler** URI
 copied from the Connect panel (`*.pooler.supabase.com`, username
 `postgres.<project-ref>`, not bare `postgres` and not `db.*.supabase.co`) with
@@ -211,6 +218,8 @@ copied from the Connect panel (`*.pooler.supabase.com`, username
 Direct hosts are IPv6-only
 (`Network is unreachable` in Cursor cloud). A pooler host with the wrong
 username/password fails as `password authentication failed`.
+Set `SEC_USER_AGENT` to an application name plus monitored contact email; both
+Research and Live use it to verify official ticker/CIK mappings.
 
 ## 5. Running without local persistence
 
@@ -238,11 +247,12 @@ stale value silently moves the floor.
 
 1. Stop immediately if `KILL_SWITCH` exists. Do not delete it.
 2. Trade only on a regular session day. Skip weekends and market holidays.
-3. Fetch account, positions, and quotes via the Robinhood MCP. Also call
-   `get_equity_orders` with `created_at_gte` set to today and
-   `placed_agent="agentic"`.
+3. Fetch account, positions, and quotes via the Robinhood MCP. Also call both
+   `get_equity_orders` and `get_option_orders` with `created_at_gte` set to
+   today and `placed_agent="agentic"`.
 4. Write the native position and order arrays to `broker_positions` and
-   `broker_orders` in `artifacts/live/request.json`. Do not calculate position
+   `broker_orders` / `broker_option_orders` in
+   `artifacts/live/request.json`. Do not calculate position
    values, order counts, daily notional, or `orders_source`; deterministic code
    does that and fails closed when a required price or broker field is missing.
    Never edit a value to make an order pass.

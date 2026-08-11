@@ -51,7 +51,10 @@ def test_sector_cap_scales_multiple_names(draft, evidence, quant, critic, now):
         item_draft = replace(draft, draft_id=f"draft-{index}", symbol=symbol)
         item_critic = replace(critic, draft_id=item_draft.draft_id)
         item_quant = replace(quant, symbol=symbol, sector="Technology")
-        packets.append(packet(item_draft, evidence, item_quant, item_critic, now))
+        item_evidence = [replace(item, symbol=symbol) for item in evidence]
+        packets.append(
+            packet(item_draft, item_evidence, item_quant, item_critic, now)
+        )
         prices[symbol] = 100.0
     plan = build_picker_portfolio(packets, [], prices, 500.0, now.date(), now)
     assert abs(sum(plan.targets.values()) - 0.30) < 1e-12

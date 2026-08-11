@@ -5,7 +5,11 @@ from datetime import timedelta
 
 import pytest
 
-from agentic_trader.picker.models import DecisionPacket, EvidenceVersion
+from agentic_trader.picker.models import (
+    CriticVerdict,
+    DecisionPacket,
+    EvidenceVersion,
+)
 
 
 def test_evidence_rejects_knowledge_time_before_publication(evidence):
@@ -13,6 +17,28 @@ def test_evidence_rejects_knowledge_time_before_publication(evidence):
     raw["first_seen_at"] = (evidence[0].published_at - timedelta(seconds=1)).isoformat()
     with pytest.raises(ValueError, match="first_seen_at"):
         EvidenceVersion.from_dict(raw)
+
+
+def test_evidence_requires_strict_booleans_and_valid_issuer_identity(evidence):
+    raw = evidence[0].to_dict()
+    raw["primary"] = "false"
+    with pytest.raises(ValueError, match="JSON booleans"):
+        EvidenceVersion.from_dict(raw)
+    raw = evidence[0].to_dict()
+    raw["cik"] = "not-a-cik"
+    with pytest.raises(ValueError, match="CIK"):
+        EvidenceVersion.from_dict(raw)
+    raw = evidence[0].to_dict()
+    raw["url"] = "https://example.com/not-sec"
+    with pytest.raises(ValueError, match="authority"):
+        EvidenceVersion.from_dict(raw)
+
+
+def test_critic_soft_checks_require_real_json_booleans(critic):
+    raw = critic.to_dict()
+    raw["soft_checks"]["freshness"] = "false"
+    with pytest.raises(ValueError, match="JSON booleans"):
+        CriticVerdict.from_dict(raw)
 
 
 def test_decision_packet_hash_detects_any_change(now):

@@ -19,8 +19,10 @@ from .execution import (
     broker_position_values,
     check_account_halts,
     daily_consumption,
+    daily_entry_consumption,
     deterministic_ref_id,
     load_live_state,
+    merge_broker_and_local_consumption,
     plan_orders_from_targets,
     record_live_state,
     record_plan_consumption,
@@ -42,12 +44,14 @@ from .options import OptionStructure, analyze_option_structure
 from .picker.invalidation import trading_day_expiry, trading_days_until
 from .picker.ledger import PostgresLedger, account_key
 from .picker.models import (
+    CRITIC_SOFT_DIMENSIONS,
     ActiveThesis,
     CriticVerdict,
     DecisionPacket,
     EvidenceVersion,
     PickerDraft,
     QuantSnapshot,
+    canonical_json,
     content_hash,
 )
 from .picker.option_models import (
@@ -325,6 +329,9 @@ def _live_plan(args: argparse.Namespace) -> int:
     # the request so a caller cannot clear a halt by rewriting its own input.
     state = load_live_state(args.root)
     persisted_orders, persisted_notional = daily_consumption(args.root)
+    persisted_entry_orders, persisted_entry_notional = daily_entry_consumption(
+        args.root
+    )
     raw_positions = raw_account.get("broker_positions")
     if raw_positions is not None:
         positions = broker_position_values(raw_positions, prices)
@@ -347,12 +354,20 @@ def _live_plan(args: argparse.Namespace) -> int:
         # A caller-provided label is not proof that the count came from the
         # broker. Only the raw response parsed above earns broker verification.
         orders_source = "unknown"
+    raw_option_orders = raw_account.get("broker_option_orders")
+    option_orders_verified = isinstance(raw_option_orders, list)
+    if option_orders_verified:
+        _, option_notional = summarize_broker_option_orders(raw_option_orders)
+        broker_orders += len(raw_option_orders)
+        broker_notional += option_notional
 
     equity = float(raw_account["equity"])
     picker_halts: list[str] = []
     database_high_water_mark: float | None = None
     option_reserved_cash = 0.0
     if bool(request.get("picker_mode", False)):
+        if not option_orders_verified:
+            picker_halts.append("broker_option_orders_missing")
         configured_account = os.environ.get("AGENTIC_TRADER_ACCOUNT", "")
         if not configured_account or configured_account != str(raw_account["account_number"]):
             picker_halts.append("picker_account_configuration_mismatch")
@@ -410,6 +425,16 @@ def _live_plan(args: argparse.Namespace) -> int:
                 ):
                     picker_halts.append(f"picker_target_exceeds_packet_weight:{packet.symbol}")
 
+    (
+        merged_orders,
+        merged_notional,
+        merged_entry_orders,
+        merged_entry_notional,
+    ) = merge_broker_and_local_consumption(
+        broker=(broker_orders, broker_notional),
+        persisted=(persisted_orders, persisted_notional),
+        persisted_entry=(persisted_entry_orders, persisted_entry_notional),
+    )
     account = AccountSnapshot(
         account_number=str(raw_account["account_number"]),
         equity=equity,
@@ -420,8 +445,10 @@ def _live_plan(args: argparse.Namespace) -> int:
         # Take the larger of the broker's count and what this repo approved
         # today, so a duplicate run cannot re-spend the daily budget whether or
         # not the other run's orders have reached the broker yet.
-        orders_today=max(broker_orders, persisted_orders),
-        notional_today=max(broker_notional, persisted_notional),
+        orders_today=merged_orders,
+        notional_today=merged_notional,
+        entry_orders_today=merged_entry_orders,
+        entry_notional_today=merged_entry_notional,
         pending_deposits=float(raw_account.get("pending_deposits", 0.0)),
         net_deposits=(
             float(raw_account["net_deposits"])
@@ -440,6 +467,8 @@ def _live_plan(args: argparse.Namespace) -> int:
         ),
         max_orders_per_day=args.max_orders_per_day,
         max_daily_notional=args.max_daily_notional,
+        max_entry_orders_per_day=args.max_entry_orders_per_day,
+        max_entry_daily_notional=args.max_entry_daily_notional,
         buy_symbol_allowlist=(
             tuple(str(item).upper() for item in request["buy_symbol_allowlist"])
             if "buy_symbol_allowlist" in request
@@ -484,17 +513,31 @@ def _live_plan(args: argparse.Namespace) -> int:
         "picker_mode": bool(request.get("picker_mode", False)),
         "orders_already_used_today": account.orders_today,
         "notional_already_used_today": account.notional_today,
+        "entry_orders_already_used_today": account.effective_entry_orders_today,
+        "entry_notional_already_used_today": account.effective_entry_notional_today,
         "authorization_packet_ids": list(request.get("authorization_packet_ids", [])),
+        "research_batch_id": str(request.get("research_batch_id", "")),
         "halts": list(check_account_halts(account, limits, args.root)),
         "approved_orders": approved,
         "rejected_orders": [d.to_dict() for d in decisions if not d.approved],
         "note": "Approval means the order is within risk limits, not that it is profitable.",
     }
     if approved:
+        entry_orders = [
+            order
+            for order in approved
+            if not (
+                str(order.get("side")).lower() == "sell"
+                and str(order.get("intent_class")).lower()
+                in {"mandatory_exit", "close"}
+            )
+        ]
         record_plan_consumption(
             len(approved),
             sum(order["notional"] for order in approved),
             root=args.root,
+            entry_orders=len(entry_orders),
+            entry_notional=sum(float(order["notional"]) for order in entry_orders),
         )
     if args.record_equity:
         record_live_state(equity, root=args.root)
@@ -532,6 +575,76 @@ def command_live_reconcile(args: argparse.Namespace) -> int:
     return 0 if result["clean"] else 2
 
 
+def command_live_reserve(args: argparse.Namespace) -> int:
+    """Atomically reserve the shared cloud budget immediately before placement."""
+    plan = json.loads(Path(args.plan).read_text())
+    configured_account = os.environ.get("AGENTIC_TRADER_ACCOUNT", "")
+    if not configured_account or configured_account != str(plan["account_number"]):
+        raise ValueError("Live plan account does not match AGENTIC_TRADER_ACCOUNT")
+    ledger = PostgresLedger.from_env()
+    trade_date = datetime.now(UTC).date()
+    research_batch_id = str(plan.get("research_batch_id", ""))
+    reservations = []
+    for order in plan.get("approved_orders", []):
+        is_exit = (
+            str(order.get("side", "")).lower() == "sell"
+            and str(order.get("intent_class", "")).lower()
+            in {"mandatory_exit", "close"}
+        )
+        reservations.append(
+            (
+                str(order["ref_id"]),
+                float(order["notional"]),
+                not is_exit,
+                False,
+            )
+        )
+    if not reservations:
+        print(json.dumps({"reserved": [], "reason": "no_approved_orders"}))
+        return 0
+    observed = (
+        int(plan["orders_already_used_today"]),
+        float(plan["notional_already_used_today"]),
+        int(plan["entry_orders_already_used_today"]),
+        float(plan["entry_notional_already_used_today"]),
+    )
+    exit_reservations = [item for item in reservations if not item[2]]
+    entry_reservations = [item for item in reservations if item[2]]
+    reserved: list[str] = []
+    blocked: list[str] = []
+    usage = None
+    if exit_reservations:
+        usage = ledger.reserve_execution_budget(
+            account_key(configured_account),
+            trade_date,
+            exit_reservations,
+            observed_usage=observed,
+        )
+        reserved.extend(item[0] for item in exit_reservations)
+    if entry_reservations:
+        try:
+            usage = ledger.reserve_execution_budget(
+                account_key(configured_account),
+                trade_date,
+                entry_reservations,
+                observed_usage=observed,
+                research_batch_id=research_batch_id,
+            )
+            reserved.extend(item[0] for item in entry_reservations)
+        except RuntimeError:
+            blocked.extend(item[0] for item in entry_reservations)
+    payload = {
+        "reserved_ref_ids": reserved,
+        "blocked_ref_ids": blocked,
+        "usage": usage,
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
+    print(json.dumps(payload))
+    return 0 if reserved else 2
+
+
 def _json_items(path: str, key: str) -> list[dict[str, object]]:
     raw = json.loads(Path(path).read_text())
     if isinstance(raw, list):
@@ -542,11 +655,29 @@ def _json_items(path: str, key: str) -> list[dict[str, object]]:
     return values
 
 
+def _verify_official_issuer_mappings(
+    evidence: list[EvidenceVersion],
+) -> None:
+    ticker_map = SECClient().ticker_map()
+    mismatches = [
+        item.evidence_id
+        for item in evidence
+        if not item.issuer_verified
+        or not item.symbol
+        or ticker_map.get(item.symbol) != item.cik
+    ]
+    if mismatches:
+        raise ValueError(
+            f"Evidence failed live SEC ticker/CIK verification: {sorted(mismatches)}"
+        )
+
+
 def command_picker_validate(args: argparse.Namespace) -> int:
     """Validate an AI draft and emit an immutable live DecisionPacket."""
     draft = PickerDraft.from_dict(json.loads(Path(args.draft).read_text()))
     critic = CriticVerdict.from_dict(json.loads(Path(args.critic).read_text()))
     evidence = [EvidenceVersion.from_dict(item) for item in _json_items(args.evidence, "evidence")]
+    _verify_official_issuer_mappings(evidence)
     evidence_by_id = {item.evidence_id: item for item in evidence}
     quant_raw = json.loads(Path(args.quant).read_text())
     if isinstance(quant_raw, dict) and "snapshots" in quant_raw:
@@ -616,6 +747,13 @@ def command_picker_stage(args: argparse.Namespace) -> int:
     option_drafts = [
         OptionDraft.from_dict(item) for item in payload.get("option_drafts", [])
     ]
+    all_draft_ids = [
+        item.draft_id for item in [*drafts, *option_drafts]
+    ]
+    if len(set(all_draft_ids)) != len(all_draft_ids):
+        raise ValueError("Every staged draft_id must be globally unique")
+    if len({item.evidence_id for item in evidence}) != len(evidence):
+        raise ValueError("Every staged evidence_id must be unique")
     critics = [CriticVerdict.from_dict(item) for item in payload["critics"]]
     critic_ids = {item.draft_id for item in critics}
     required_critic_ids = {
@@ -686,11 +824,29 @@ def _validate_pending_research_payload(
     all_drafts = [*drafts, *option_drafts]
     if not all_drafts or len({item.run_id for item in all_drafts}) != 1:
         raise ValueError("A pending research batch requires exactly one run_id")
+    draft_ids = [item.draft_id for item in all_drafts]
+    if len(set(draft_ids)) != len(draft_ids):
+        raise ValueError("Pending research draft IDs must be globally unique")
+    evidence_ids = [item.evidence_id for item in evidence]
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise ValueError("Pending evidence IDs must be unique")
     if any(item.created_at.date() != as_of for item in all_drafts):
         raise ValueError("Every pending draft must be created on the as_of date")
     if len(str(payload["prompt_hash"])) != 64:
         raise ValueError("prompt_hash must be a SHA-256 digest")
+    if not str(payload.get("cycle_id", "")).strip():
+        raise ValueError("Pending research bundle requires cycle_id")
     return created_at, as_of, evidence, drafts, option_drafts
+
+
+def _pending_draft_hashes(
+    drafts: list[PickerDraft],
+    option_drafts: list[OptionDraft],
+) -> dict[str, str]:
+    return {
+        item.draft_id: content_hash(canonical_json(item.to_dict()))
+        for item in [*drafts, *option_drafts]
+    }
 
 
 def command_picker_stage_pending(args: argparse.Namespace) -> int:
@@ -700,7 +856,8 @@ def command_picker_stage_pending(args: argparse.Namespace) -> int:
         payload
     )
     batch_id = str(payload["batch_id"])
-    PostgresLedger.from_env().stage_pending_batch(
+    ledger = PostgresLedger.from_env()
+    ledger.stage_pending_batch(
         batch_id,
         as_of,
         created_at,
@@ -708,6 +865,7 @@ def command_picker_stage_pending(args: argparse.Namespace) -> int:
         str(payload["model_id"]),
         payload,
     )
+    ledger.bind_research_cycle(str(payload["cycle_id"]), batch_id)
     result = {
         "pending": True,
         "batch_id": batch_id,
@@ -727,26 +885,68 @@ def command_picker_export_pending(args: argparse.Namespace) -> int:
         return 2
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(batch["payload"], indent=2) + "\n")
+    payload = dict(batch["payload"])
+    _, _, _, drafts, option_drafts = _validate_pending_research_payload(payload)
+    payload["_critic_binding"] = {
+        "batch_id": batch["batch_id"],
+        "prompt_hash": batch["prompt_hash"],
+        "analyst_model_id": batch["analyst_model_id"],
+        "draft_hashes": _pending_draft_hashes(drafts, option_drafts),
+        "payload_hash": content_hash(canonical_json(batch["payload"])),
+    }
+    output.write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps({"exported": True, "batch_id": batch["batch_id"]}))
+    return 0
+
+
+def command_picker_cycle_start(args: argparse.Namespace) -> int:
+    """Create a durable marker before an analyst cycle begins."""
+    now = datetime.now(UTC)
+    as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
+    PostgresLedger.from_env().start_research_cycle(args.cycle_id, as_of, now)
+    print(json.dumps({"started": True, "cycle_id": args.cycle_id, "as_of": str(as_of)}))
+    return 0
+
+
+def command_picker_cycle_fail(args: argparse.Namespace) -> int:
+    """Explicitly release a failed analyst/critic cycle marker."""
+    PostgresLedger.from_env().finish_research_cycle(args.cycle_id, "failed")
+    print(json.dumps({"failed": True, "cycle_id": args.cycle_id}))
     return 0
 
 
 def command_picker_finalize_pending(args: argparse.Namespace) -> int:
     """Attach real Grok verdicts and promote a pending batch to staged."""
     now = datetime.now(UTC)
-    as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
     ledger = PostgresLedger.from_env()
-    pending = ledger.latest_pending_batch(as_of)
+    critic_payload = json.loads(Path(args.critics).read_text())
+    binding = critic_payload.get("_critic_binding")
+    if not isinstance(binding, dict) or not binding.get("batch_id"):
+        raise ValueError("Critic output must bind an exact pending batch")
+    pending = ledger.pending_batch(str(binding["batch_id"]))
     if pending is None:
         print(json.dumps({"finalized": False, "reason": "no_pending_batch"}))
         return 2
+    if pending["status"] != "pending":
+        raise ValueError("Critic batch is no longer pending")
     payload = dict(pending["payload"])
-    created_at, _, evidence, drafts, option_drafts = (
+    created_at, as_of, evidence, drafts, option_drafts = (
         _validate_pending_research_payload(payload)
     )
+    if args.as_of and date.fromisoformat(args.as_of) != as_of:
+        raise ValueError("Critic as_of does not match the bound batch")
+    expected_binding = {
+        "batch_id": pending["batch_id"],
+        "prompt_hash": pending["prompt_hash"],
+        "analyst_model_id": pending["analyst_model_id"],
+        "draft_hashes": _pending_draft_hashes(drafts, option_drafts),
+        "payload_hash": content_hash(canonical_json(pending["payload"])),
+    }
+    if binding != expected_binding:
+        raise ValueError("Critic output binding does not match pending batch content")
     critics = [
-        CriticVerdict.from_dict(item) for item in _json_items(args.critics, "critics")
+        CriticVerdict.from_dict(item)
+        for item in critic_payload.get("critics", [])
     ]
     critic_ids = {item.draft_id for item in critics}
     required_ids = {item.draft_id for item in drafts} | {
@@ -760,6 +960,11 @@ def command_picker_finalize_pending(args: argparse.Namespace) -> int:
         for item in critics
     ):
         raise ValueError("Every critic must record an independent Grok model ID")
+    if any(
+        set(dict(item.soft_checks)) != CRITIC_SOFT_DIMENSIONS
+        for item in critics
+    ):
+        raise ValueError("Every critic must provide all five structured soft checks")
     payload["critics"] = [item.to_dict() for item in critics]
     run_id = next(iter({item.run_id for item in [*drafts, *option_drafts]}))
     ledger.put_run(
@@ -792,6 +997,7 @@ def command_picker_finalize_pending(args: argparse.Namespace) -> int:
         payload,
     )
     ledger.finalize_pending_batch(str(pending["batch_id"]), "finalized", now)
+    ledger.finish_research_cycle(str(payload["cycle_id"]), "finalized")
     result = {
         "finalized": True,
         "batch_id": pending["batch_id"],
@@ -805,6 +1011,7 @@ def command_picker_verify_evidence(args: argparse.Namespace) -> int:
     """Ground every evidence quote in a saved source document and hash it."""
     raw_items = _json_items(args.evidence, "evidence")
     documents = Path(args.documents)
+    ticker_map = SECClient().ticker_map()
     verified = []
     failures = []
     for raw in raw_items:
@@ -818,10 +1025,23 @@ def command_picker_verify_evidence(args: argparse.Namespace) -> int:
         if not grounded:
             failures.append({"evidence_id": evidence_id, "reason": "quote_not_grounded"})
             continue
+        issuer_verified = (
+            ticker_map.get(str(raw.get("symbol", "")).upper())
+            == str(raw.get("cik", "")).zfill(10)
+        )
+        if not issuer_verified:
+            failures.append(
+                {
+                    "evidence_id": evidence_id,
+                    "reason": "ticker_cik_not_verified",
+                }
+            )
+            continue
         candidate = {
             **raw,
             "document_hash": content_hash(document),
             "quote_verified": True,
+            "issuer_verified": True,
         }
         verified.append(EvidenceVersion.from_dict(candidate).to_dict())
     payload = {"evidence": verified, "failures": failures}
@@ -855,10 +1075,11 @@ def command_picker_authorize_batch(args: argparse.Namespace) -> int:
         print(json.dumps({"authorized": [], "reason": "no_staged_batch"}))
         return 2
     payload = batch["payload"]
-    evidence = {
-        item.evidence_id: item
-        for item in (EvidenceVersion.from_dict(raw) for raw in payload["evidence"])
-    }
+    evidence_items = [
+        EvidenceVersion.from_dict(raw) for raw in payload["evidence"]
+    ]
+    _verify_official_issuer_mappings(evidence_items)
+    evidence = {item.evidence_id: item for item in evidence_items}
     critics = {
         item.draft_id: item
         for item in (CriticVerdict.from_dict(raw) for raw in payload["critics"])
@@ -966,6 +1187,7 @@ def command_picker_plan(args: argparse.Namespace) -> int:
         "authorization_packet_ids": list(plan.accepted_packet_ids),
         "max_position_weight": 0.15,
         "picker_plan": plan.to_dict(),
+        "research_batch_id": str(snapshot.get("research_batch_id", "")),
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1216,10 +1438,11 @@ def command_option_authorize_batch(args: argparse.Namespace) -> int:
         print(json.dumps(payload))
         return 2
 
-    evidence = {
-        item.evidence_id: item
-        for item in (EvidenceVersion.from_dict(raw) for raw in staged["evidence"])
-    }
+    evidence_items = [
+        EvidenceVersion.from_dict(raw) for raw in staged["evidence"]
+    ]
+    _verify_official_issuer_mappings(evidence_items)
+    evidence = {item.evidence_id: item for item in evidence_items}
     source_drafts = {
         item.draft_id: item
         for item in (PickerDraft.from_dict(raw) for raw in staged.get("drafts", []))
@@ -1324,23 +1547,54 @@ def _option_account_snapshot(
     raw: dict[str, object],
     positions: list[ActiveOptionPosition],
     planned_equity_orders: int = 0,
+    planned_equity_entry_orders: int = 0,
+    planned_equity_notional: float = 0.0,
+    planned_equity_entry_notional: float = 0.0,
     persisted_orders_today: int = 0,
+    persisted_entry_orders_today: int = 0,
+    persisted_notional_today: float = 0.0,
+    persisted_entry_notional_today: float = 0.0,
 ) -> OptionAccountSnapshot:
     broker_option_orders = raw.get("broker_option_orders")
     broker_equity_orders = raw.get("broker_equity_orders")
     if isinstance(broker_option_orders, list) and isinstance(
         broker_equity_orders, list
     ):
-        openings, _ = summarize_broker_option_orders(broker_option_orders)
-        equity_order_count, _ = summarize_broker_orders(broker_equity_orders)
+        openings, option_notional = summarize_broker_option_orders(
+            broker_option_orders
+        )
+        equity_order_count, equity_notional = summarize_broker_orders(
+            broker_equity_orders
+        )
         orders_today = max(
             equity_order_count + len(broker_option_orders) + planned_equity_orders,
             persisted_orders_today,
+        )
+        entry_orders_today = max(
+            equity_order_count
+            + len(broker_option_orders)
+            + planned_equity_entry_orders,
+            persisted_entry_orders_today,
+        )
+        notional_today = max(
+            equity_notional + option_notional + planned_equity_notional,
+            persisted_notional_today,
+        )
+        entry_notional_today = max(
+            equity_notional
+            + option_notional
+            + planned_equity_entry_notional,
+            persisted_entry_notional_today,
         )
         orders_source = "broker"
     else:
         openings = int(raw.get("option_openings_today", 0))
         orders_today = int(raw.get("orders_today", 0))
+        entry_orders_today = int(raw.get("entry_orders_today", orders_today))
+        notional_today = float(raw.get("notional_today", 0.0))
+        entry_notional_today = float(
+            raw.get("entry_notional_today", notional_today)
+        )
         orders_source = "unknown"
     open_positions = [
         item for item in positions if item.status in {"pending_open", "open", "closing"}
@@ -1407,6 +1661,9 @@ def _option_account_snapshot(
         open_option_positions=len(open_positions),
         option_openings_today=openings,
         orders_today=orders_today,
+        entry_orders_today=entry_orders_today,
+        notional_today=notional_today,
+        entry_notional_today=entry_notional_today,
         aggregate_long_debit=sum(
             item.premium_at_risk
             for item in open_positions
@@ -1484,16 +1741,50 @@ def _option_plan(args: argparse.Namespace) -> int:
         )
     account_payload["halt_reasons"] = halt_reasons
     planned_equity_orders = 0
+    planned_equity_entry_orders = 0
+    planned_equity_notional = 0.0
+    planned_equity_entry_notional = 0.0
+    research_batch_id = ""
     equity_plan_path = Path(args.equity_plan)
     if equity_plan_path.exists():
         equity_plan = json.loads(equity_plan_path.read_text())
-        planned_equity_orders = len(equity_plan.get("approved_orders", []))
-    persisted_orders_today, _ = daily_consumption(args.root)
+        research_batch_id = str(equity_plan.get("research_batch_id", ""))
+        equity_approved_orders = equity_plan.get("approved_orders", [])
+        planned_equity_orders = len(equity_approved_orders)
+        equity_entry_orders = [
+            order
+            for order in equity_approved_orders
+            if not (
+                str(order.get("side")).lower() == "sell"
+                and str(order.get("intent_class")).lower()
+                in {"mandatory_exit", "close"}
+            )
+        ]
+        planned_equity_entry_orders = len(equity_entry_orders)
+        planned_equity_notional = sum(
+            float(order["notional"]) for order in equity_approved_orders
+        )
+        planned_equity_entry_notional = sum(
+            float(order["notional"]) for order in equity_entry_orders
+        )
+    persisted_orders_today, persisted_notional_today = daily_consumption(
+        args.root
+    )
+    (
+        persisted_entry_orders_today,
+        persisted_entry_notional_today,
+    ) = daily_entry_consumption(args.root)
     account = _option_account_snapshot(
         account_payload,
         positions,
         planned_equity_orders=planned_equity_orders,
+        planned_equity_entry_orders=planned_equity_entry_orders,
+        planned_equity_notional=planned_equity_notional,
+        planned_equity_entry_notional=planned_equity_entry_notional,
         persisted_orders_today=persisted_orders_today,
+        persisted_entry_orders_today=persisted_entry_orders_today,
+        persisted_notional_today=persisted_notional_today,
+        persisted_entry_notional_today=persisted_entry_notional_today,
     )
     packets = ledger.valid_option_packets(as_of, now)
     contracts = {
@@ -1575,12 +1866,36 @@ def _option_plan(args: argparse.Namespace) -> int:
         "approved_orders": approved,
         "rejected_orders": rejected,
         "halts": list(account.external_halt_reasons),
+        "orders_already_used_today": account.orders_today,
+        "notional_already_used_today": account.notional_today,
+        "entry_orders_already_used_today": account.effective_entry_orders_today,
+        "entry_notional_already_used_today": account.effective_entry_notional_today,
+        "option_openings_already_used_today": account.option_openings_today,
+        "open_option_positions": account.open_option_positions,
+        "research_batch_id": research_batch_id,
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, indent=2) + "\n")
     if approved:
-        record_plan_consumption(len(approved), 0.0, root=args.root)
+        opening_orders = [
+            order for order in approved if str(order.get("position_effect")) == "open"
+        ]
+        option_notional = sum(
+            float(order["limit_price"]) * int(order["quantity"]) * 100
+            for order in approved
+        )
+        opening_notional = sum(
+            float(order["limit_price"]) * int(order["quantity"]) * 100
+            for order in opening_orders
+        )
+        record_plan_consumption(
+            len(approved),
+            option_notional,
+            root=args.root,
+            entry_orders=len(opening_orders),
+            entry_notional=opening_notional,
+        )
     append_audit_record({"event": "option_plan", **payload}, root=args.root)
     print(json.dumps(payload, indent=2))
     return 0 if approved else 2
@@ -1623,6 +1938,50 @@ def command_option_reserve(args: argparse.Namespace) -> int:
     if not configured_account or configured_account != str(account["account_number"]):
         raise ValueError("Option snapshot account does not match AGENTIC_TRADER_ACCOUNT")
     ledger = PostgresLedger.from_env()
+    trade_date = datetime.now(UTC).date()
+    research_batch_id = str(plan.get("research_batch_id", ""))
+    budget_reservations = [
+        (
+            str(order["ref_id"]),
+            float(order["limit_price"]) * int(order["quantity"]) * 100,
+            str(order.get("position_effect")) == "open",
+            str(order.get("position_effect")) == "open",
+        )
+        for order in plan.get("approved_orders", [])
+    ]
+    exit_budget = [item for item in budget_reservations if not item[2]]
+    entry_budget = [item for item in budget_reservations if item[2]]
+    observed_usage = (
+        int(plan["orders_already_used_today"]),
+        float(plan["notional_already_used_today"]),
+        int(plan["entry_orders_already_used_today"]),
+        float(plan["entry_notional_already_used_today"]),
+    )
+    budget_usage = None
+    reserved_ref_ids: list[str] = []
+    blocked_ref_ids: list[str] = []
+    if exit_budget:
+        budget_usage = ledger.reserve_execution_budget(
+            account_key(configured_account),
+            trade_date,
+            exit_budget,
+            observed_usage=observed_usage,
+            observed_open_option_positions=int(plan["open_option_positions"]),
+        )
+        reserved_ref_ids.extend(item[0] for item in exit_budget)
+    if entry_budget:
+        try:
+            budget_usage = ledger.reserve_execution_budget(
+                account_key(configured_account),
+                trade_date,
+                entry_budget,
+                observed_usage=observed_usage,
+                observed_open_option_positions=int(plan["open_option_positions"]),
+                research_batch_id=research_batch_id,
+            )
+            reserved_ref_ids.extend(item[0] for item in entry_budget)
+        except RuntimeError:
+            blocked_ref_ids.extend(item[0] for item in entry_budget)
     packets = {
         packet.packet_id: packet
         for packet in ledger.valid_option_packets(datetime.now(UTC).date())
@@ -1641,6 +2000,8 @@ def command_option_reserve(args: argparse.Namespace) -> int:
     }
     reserved: list[str] = []
     for order in plan.get("approved_orders", []):
+        if str(order["ref_id"]) not in reserved_ref_ids:
+            continue
         if str(order.get("position_effect")) != "open":
             continue
         packet_id = str(order.get("packet_id") or "")
@@ -1662,9 +2023,17 @@ def command_option_reserve(args: argparse.Namespace) -> int:
             available_shares=available_shares,
         )
         reserved.append(packet.packet_id)
-    payload = {"reserved": reserved}
+    payload = {
+        "reserved_ref_ids": reserved_ref_ids,
+        "blocked_ref_ids": blocked_ref_ids,
+        "resource_packet_ids": reserved,
+        "budget_usage": budget_usage,
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps(payload))
-    return 0
+    return 0 if reserved_ref_ids else 2
 
 
 def command_option_sync(args: argparse.Namespace) -> int:
@@ -1942,8 +2311,12 @@ def build_parser() -> argparse.ArgumentParser:
     live_plan.add_argument("--root", default=".")
     live_plan.add_argument("--max-order-notional", type=float, default=150.0)
     live_plan.add_argument("--max-position-weight", type=float, default=0.25)
-    live_plan.add_argument("--max-orders-per-day", type=int, default=4)
-    live_plan.add_argument("--max-daily-notional", type=float, default=400.0)
+    live_plan.add_argument("--max-orders-per-day", type=int, default=8)
+    live_plan.add_argument("--max-daily-notional", type=float, default=800.0)
+    live_plan.add_argument("--max-entry-orders-per-day", type=int, default=6)
+    live_plan.add_argument(
+        "--max-entry-daily-notional", type=float, default=600.0
+    )
     live_plan.add_argument("--rebalance-threshold", type=float, default=0.05)
     live_plan.add_argument("--record-equity", action="store_true")
     live_plan.add_argument("--output", default="artifacts/live/plan.json")
@@ -1957,6 +2330,16 @@ def build_parser() -> argparse.ArgumentParser:
     live_reconcile.add_argument("--root", default=".")
     live_reconcile.add_argument("--output", default="artifacts/live/reconciliation.json")
     live_reconcile.set_defaults(func=command_live_reconcile)
+
+    live_reserve = subparsers.add_parser(
+        "live-reserve",
+        help="Atomically reserve the shared cloud budget before equity placement",
+    )
+    live_reserve.add_argument("--plan", default="artifacts/live/plan.json")
+    live_reserve.add_argument(
+        "--output", default="artifacts/live/reservation.json"
+    )
+    live_reserve.set_defaults(func=command_live_reserve)
 
     picker_validate = subparsers.add_parser(
         "picker-validate", help="Validate an AI stock-pick draft for live eligibility"
@@ -1984,6 +2367,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     picker_stage_pending.add_argument("--bundle", required=True)
     picker_stage_pending.set_defaults(func=command_picker_stage_pending)
+
+    picker_cycle_start = subparsers.add_parser(
+        "picker-cycle-start",
+        help="Create a durable marker before an analyst cycle begins",
+    )
+    picker_cycle_start.add_argument("--cycle-id", required=True)
+    picker_cycle_start.add_argument("--as-of")
+    picker_cycle_start.set_defaults(func=command_picker_cycle_start)
+
+    picker_cycle_fail = subparsers.add_parser(
+        "picker-cycle-fail",
+        help="Release a failed analyst or critic cycle marker",
+    )
+    picker_cycle_fail.add_argument("--cycle-id", required=True)
+    picker_cycle_fail.set_defaults(func=command_picker_cycle_fail)
 
     picker_export_pending = subparsers.add_parser(
         "picker-export-pending",
@@ -2095,6 +2493,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     option_reserve.add_argument("--plan", default="artifacts/live/options-plan.json")
     option_reserve.add_argument("--snapshot", required=True)
+    option_reserve.add_argument(
+        "--output", default="artifacts/live/options-reservation.json"
+    )
     option_reserve.set_defaults(func=command_option_reserve)
 
     option_sync = subparsers.add_parser(

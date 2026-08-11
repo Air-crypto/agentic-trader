@@ -65,6 +65,46 @@ def _validate_option_reservation(
     return normalized
 
 
+def _validate_execution_reservation(
+    orders: list[tuple[str, float, bool, bool]],
+    max_orders: int,
+    max_notional: float,
+    max_entry_orders: int,
+    max_entry_notional: float,
+) -> None:
+    if not orders or len({ref_id for ref_id, _, _, _ in orders}) != len(orders):
+        raise ValueError("Execution reservations require unique ref_ids")
+    if any(
+        not ref_id or not isfinite(notional) or notional <= 0
+        for ref_id, notional, _, _ in orders
+    ):
+        raise ValueError("Execution reservation notionals must be finite and positive")
+    if not 0 < max_orders <= 8 or not 0 < max_entry_orders <= min(max_orders, 6):
+        raise ValueError("Execution order caps cannot relax hard limits")
+    if (
+        not 0 < max_notional <= 800
+        or not 0 < max_entry_notional <= min(max_notional, 600)
+    ):
+        raise ValueError("Execution notional caps cannot relax hard limits")
+
+
+def _validate_observed_execution_usage(
+    observed_usage: tuple[int, float, int, float],
+) -> None:
+    total_orders, total_notional, entry_orders, entry_notional = observed_usage
+    if (
+        total_orders < 0
+        or entry_orders < 0
+        or entry_orders > total_orders
+        or not isfinite(total_notional)
+        or not isfinite(entry_notional)
+        or total_notional < 0
+        or entry_notional < 0
+        or entry_notional > total_notional
+    ):
+        raise ValueError("Observed execution usage is inconsistent")
+
+
 class PickerLedger(Protocol):
     def put_run(
         self,
@@ -130,12 +170,27 @@ class PickerLedger(Protocol):
 
     def latest_pending_batch(self, as_of: date) -> dict[str, Any] | None: ...
 
+    def pending_batch(self, batch_id: str) -> dict[str, Any] | None: ...
+
     def finalize_pending_batch(
         self,
         batch_id: str,
         status: str,
         finalized_at: datetime | None = None,
     ) -> None: ...
+
+    def start_research_cycle(
+        self,
+        cycle_id: str,
+        as_of: date,
+        started_at: datetime,
+    ) -> None: ...
+
+    def bind_research_cycle(self, cycle_id: str, batch_id: str) -> None: ...
+
+    def finish_research_cycle(self, cycle_id: str, status: str) -> None: ...
+
+    def latest_unfinished_cycle(self, as_of: date) -> dict[str, Any] | None: ...
 
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None: ...
 
@@ -223,6 +278,22 @@ class PickerLedger(Protocol):
         occurred_at: datetime | None = None,
     ) -> None: ...
 
+    def reserve_execution_budget(
+        self,
+        account_hash: str,
+        trade_date: date,
+        orders: list[tuple[str, float, bool, bool]],
+        *,
+        max_orders: int = 8,
+        max_notional: float = 800.0,
+        max_entry_orders: int = 6,
+        max_entry_notional: float = 600.0,
+        observed_usage: tuple[int, float, int, float] = (0, 0.0, 0, 0.0),
+        max_option_openings: int = 3,
+        observed_open_option_positions: int = 0,
+        research_batch_id: str = "",
+    ) -> dict[str, float | int]: ...
+
 
 class InMemoryLedger:
     """Test ledger with the same immutability and uniqueness rules as Postgres."""
@@ -238,11 +309,14 @@ class InMemoryLedger:
         self.outcomes: dict[tuple[str, int], OutcomeMark] = {}
         self.batches: dict[str, dict[str, Any]] = {}
         self.pending_batches: dict[str, dict[str, Any]] = {}
+        self.research_cycles: dict[str, dict[str, Any]] = {}
         self.option_packets: dict[str, OptionDecisionPacket] = {}
         self.option_packet_states: dict[str, dict[str, Any]] = {}
         self.option_positions_by_id: dict[str, ActiveOptionPosition] = {}
         self.option_reservations: dict[str, dict[str, Any]] = {}
         self.option_order_events: dict[str, dict[str, Any]] = {}
+        self.execution_reservations: dict[str, dict[str, Any]] = {}
+        self.execution_usage: dict[tuple[str, date], dict[str, float | int]] = {}
 
     def put_run(
         self,
@@ -461,6 +535,9 @@ class InMemoryLedger:
         ]
         return max(eligible, key=lambda item: item["created_at"]) if eligible else None
 
+    def pending_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return self.pending_batches.get(batch_id)
+
     def finalize_pending_batch(
         self,
         batch_id: str,
@@ -478,6 +555,50 @@ class InMemoryLedger:
             raise ValueError(f"Pending batch {batch_id} is already {record['status']}")
         record["status"] = status
         record["finalized_at"] = finalized_at or datetime.now(UTC)
+
+    def start_research_cycle(
+        self,
+        cycle_id: str,
+        as_of: date,
+        started_at: datetime,
+    ) -> None:
+        record = {
+            "cycle_id": cycle_id,
+            "as_of": as_of,
+            "started_at": started_at,
+            "status": "running",
+            "batch_id": None,
+        }
+        existing = self.research_cycles.get(cycle_id)
+        if existing is not None and existing != record:
+            raise ValueError(f"Research cycle {cycle_id} is immutable")
+        self.research_cycles[cycle_id] = existing or record
+
+    def bind_research_cycle(self, cycle_id: str, batch_id: str) -> None:
+        record = self.research_cycles.get(cycle_id)
+        if record is None or record["status"] not in {"running", "pending"}:
+            raise ValueError(f"Research cycle {cycle_id} is not running")
+        if record["batch_id"] not in {None, batch_id}:
+            raise ValueError(f"Research cycle {cycle_id} is bound elsewhere")
+        record["batch_id"] = batch_id
+        record["status"] = "pending"
+
+    def finish_research_cycle(self, cycle_id: str, status: str) -> None:
+        if status not in {"finalized", "failed"}:
+            raise ValueError("Research cycle must finish finalized or failed")
+        record = self.research_cycles.get(cycle_id)
+        if record is None:
+            raise ValueError(f"Unknown research cycle {cycle_id}")
+        record["status"] = status
+
+    def latest_unfinished_cycle(self, as_of: date) -> dict[str, Any] | None:
+        eligible = [
+            record
+            for record in self.research_cycles.values()
+            if record["as_of"] == as_of
+            and record["status"] in {"running", "pending"}
+        ]
+        return max(eligible, key=lambda item: item["started_at"]) if eligible else None
 
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
         if not packet.verify_hash():
@@ -799,6 +920,121 @@ class InMemoryLedger:
         if reservation is not None and reservation["status"] == "active":
             self.release_option_collateral(packet_id, occurred_at)
         self.revoke_option_packet(packet_id, reason, occurred_at)
+
+    def reserve_execution_budget(
+        self,
+        account_hash: str,
+        trade_date: date,
+        orders: list[tuple[str, float, bool, bool]],
+        *,
+        max_orders: int = 8,
+        max_notional: float = 800.0,
+        max_entry_orders: int = 6,
+        max_entry_notional: float = 600.0,
+        observed_usage: tuple[int, float, int, float] = (0, 0.0, 0, 0.0),
+        max_option_openings: int = 3,
+        observed_open_option_positions: int = 0,
+        research_batch_id: str = "",
+    ) -> dict[str, float | int]:
+        _validate_execution_reservation(
+            orders,
+            max_orders,
+            max_notional,
+            max_entry_orders,
+            max_entry_notional,
+        )
+        _validate_observed_execution_usage(observed_usage)
+        if not 0 < max_option_openings <= 3 or observed_open_option_positions < 0:
+            raise ValueError("Option opening limits cannot relax hard caps")
+        if any(is_entry for _, _, is_entry, _ in orders):
+            latest_batch = self.latest_research_batch(trade_date)
+            if (
+                not research_batch_id
+                or latest_batch is None
+                or latest_batch["batch_id"] != research_batch_id
+                or self.latest_unfinished_cycle(trade_date) is not None
+            ):
+                raise RuntimeError(
+                    "Execution reservation references stale research"
+                )
+        new_orders: list[tuple[str, float, bool, bool]] = []
+        for ref_id, notional, is_entry, is_option_open in orders:
+            existing = self.execution_reservations.get(ref_id)
+            record = {
+                "ref_id": ref_id,
+                "account_key": account_hash,
+                "trade_date": trade_date,
+                "notional": float(notional),
+                "is_entry": bool(is_entry),
+                "is_option_open": bool(is_option_open),
+            }
+            if existing is not None:
+                if existing != record:
+                    raise ValueError(f"Execution reservation {ref_id} is immutable")
+            else:
+                new_orders.append(
+                    (
+                        ref_id,
+                        float(notional),
+                        bool(is_entry),
+                        bool(is_option_open),
+                    )
+                )
+        key = (account_hash, trade_date)
+        usage = dict(
+            self.execution_usage.get(
+                key,
+                {
+                    "total_orders": 0,
+                    "total_notional": 0.0,
+                    "entry_orders": 0,
+                    "entry_notional": 0.0,
+                    "option_openings": 0,
+                },
+            )
+        )
+        observed_orders, observed_notional, observed_entry_orders, observed_entry_notional = (
+            observed_usage
+        )
+        projected = {
+            "total_orders": max(int(usage["total_orders"]), observed_orders)
+            + len(new_orders),
+            "total_notional": max(float(usage["total_notional"]), observed_notional)
+            + sum(notional for _, notional, _, _ in new_orders),
+            "entry_orders": max(int(usage["entry_orders"]), observed_entry_orders)
+            + sum(is_entry for _, _, is_entry, _ in new_orders),
+            "entry_notional": max(
+                float(usage["entry_notional"]), observed_entry_notional
+            )
+            + sum(
+                notional
+                for _, notional, is_entry, _ in new_orders
+                if is_entry
+            ),
+            "option_openings": int(usage["option_openings"])
+            + sum(is_option_open for _, _, _, is_option_open in new_orders),
+        }
+        if (
+            projected["total_orders"] > max_orders
+            or projected["total_notional"] > max_notional
+            or projected["entry_orders"] > max_entry_orders
+            or projected["entry_notional"] > max_entry_notional
+            or projected["option_openings"] > max_option_openings
+            or observed_open_option_positions + projected["option_openings"]
+            > max_option_openings
+        ):
+            raise RuntimeError("Durable execution budget would be exceeded")
+        for ref_id, notional, is_entry, is_option_open in new_orders:
+            self.execution_reservations[ref_id] = {
+                "ref_id": ref_id,
+                "account_key": account_hash,
+                "trade_date": trade_date,
+                "notional": notional,
+                "is_entry": is_entry,
+                "is_option_open": is_option_open,
+            }
+        self.execution_usage[key] = projected
+        return projected
 
     def _option_packet_state(self, packet_id: str) -> dict[str, Any]:
         if packet_id not in self.option_packets:
@@ -1289,6 +1525,31 @@ class PostgresLedger:
                 "finalized_at": row[7],
             }
 
+    def pending_batch(self, batch_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT batch_id, as_of, created_at, prompt_hash,
+                       analyst_model_id, status, payload, finalized_at
+                FROM picker_pending_research_batches
+                WHERE batch_id = %s
+                """,
+                (batch_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "batch_id": row[0],
+                "as_of": row[1],
+                "created_at": row[2],
+                "prompt_hash": row[3],
+                "analyst_model_id": row[4],
+                "status": row[5],
+                "payload": row[6],
+                "finalized_at": row[7],
+            }
+
     def finalize_pending_batch(
         self,
         batch_id: str,
@@ -1317,6 +1578,90 @@ class PostgresLedger:
             row = cursor.fetchone()
             if row is None or row[0] != status:
                 raise ValueError(f"Pending batch {batch_id} cannot become {status}")
+
+    def start_research_cycle(
+        self,
+        cycle_id: str,
+        as_of: date,
+        started_at: datetime,
+    ) -> None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"research-execution-cycle:{as_of.isoformat()}",),
+            )
+            cursor.execute(
+                """
+                INSERT INTO picker_research_cycles
+                    (cycle_id, as_of, started_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (cycle_id) DO NOTHING
+                """,
+                (cycle_id, as_of, started_at),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                "SELECT as_of, started_at FROM picker_research_cycles "
+                "WHERE cycle_id = %s",
+                (cycle_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != (as_of, started_at):
+                raise ValueError(f"Research cycle {cycle_id} is immutable")
+
+    def bind_research_cycle(self, cycle_id: str, batch_id: str) -> None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE picker_research_cycles
+                SET status = 'pending', batch_id = %s, updated_at = now()
+                WHERE cycle_id = %s
+                  AND status IN ('running', 'pending')
+                  AND (batch_id IS NULL OR batch_id = %s)
+                """,
+                (batch_id, cycle_id, batch_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Research cycle {cycle_id} cannot bind {batch_id}")
+
+    def finish_research_cycle(self, cycle_id: str, status: str) -> None:
+        if status not in {"finalized", "failed"}:
+            raise ValueError("Research cycle must finish finalized or failed")
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE picker_research_cycles
+                SET status = %s, updated_at = now()
+                WHERE cycle_id = %s
+                """,
+                (status, cycle_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown research cycle {cycle_id}")
+
+    def latest_unfinished_cycle(self, as_of: date) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT cycle_id, as_of, started_at, status, batch_id
+                FROM picker_research_cycles
+                WHERE as_of = %s AND status IN ('running', 'pending')
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (as_of,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "cycle_id": row[0],
+                "as_of": row[1],
+                "started_at": row[2],
+                "status": row[3],
+                "batch_id": row[4],
+            }
 
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
         if not packet.verify_hash():
@@ -1932,6 +2277,225 @@ class PostgresLedger:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Option packet cancellation raced")
+
+    def reserve_execution_budget(
+        self,
+        account_hash: str,
+        trade_date: date,
+        orders: list[tuple[str, float, bool, bool]],
+        *,
+        max_orders: int = 8,
+        max_notional: float = 800.0,
+        max_entry_orders: int = 6,
+        max_entry_notional: float = 600.0,
+        observed_usage: tuple[int, float, int, float] = (0, 0.0, 0, 0.0),
+        max_option_openings: int = 3,
+        observed_open_option_positions: int = 0,
+        research_batch_id: str = "",
+    ) -> dict[str, float | int]:
+        _validate_execution_reservation(
+            orders,
+            max_orders,
+            max_notional,
+            max_entry_orders,
+            max_entry_notional,
+        )
+        _validate_observed_execution_usage(observed_usage)
+        if not 0 < max_option_openings <= 3 or observed_open_option_positions < 0:
+            raise ValueError("Option opening limits cannot relax hard caps")
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"research-execution-cycle:{trade_date.isoformat()}",),
+            )
+            if any(is_entry for _, _, is_entry, _ in orders):
+                cursor.execute(
+                    """
+                    SELECT batch_id
+                    FROM picker_research_batches
+                    WHERE as_of = %s AND status <> 'consumed'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (trade_date,),
+                )
+                latest_batch = cursor.fetchone()
+                cursor.execute(
+                    """
+                    SELECT cycle_id
+                    FROM picker_research_cycles
+                    WHERE as_of = %s AND status IN ('running', 'pending')
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (trade_date,),
+                )
+                unfinished = cursor.fetchone()
+                if (
+                    not research_batch_id
+                    or latest_batch is None
+                    or str(latest_batch[0]) != research_batch_id
+                    or unfinished is not None
+                ):
+                    raise RuntimeError(
+                        "Execution reservation references stale research"
+                    )
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"execution-budget:{account_hash}:{trade_date.isoformat()}",),
+            )
+            cursor.execute(
+                """
+                INSERT INTO execution_daily_usage (account_key, trade_date)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (account_hash, trade_date),
+            )
+            cursor.execute(
+                """
+                SELECT total_orders, total_notional,
+                       entry_orders, entry_notional, option_openings
+                FROM execution_daily_usage
+                WHERE account_key = %s AND trade_date = %s
+                FOR UPDATE
+                """,
+                (account_hash, trade_date),
+            )
+            row = cursor.fetchone()
+            usage = {
+                "total_orders": int(row[0]),
+                "total_notional": float(row[1]),
+                "entry_orders": int(row[2]),
+                "entry_notional": float(row[3]),
+                "option_openings": int(row[4]),
+            }
+            ref_ids = [ref_id for ref_id, _, _, _ in orders]
+            cursor.execute(
+                """
+                SELECT ref_id, account_key, trade_date, notional,
+                       is_entry, is_option_open
+                FROM execution_plan_reservations
+                WHERE ref_id = ANY(%s)
+                """,
+                (ref_ids,),
+            )
+            existing = {
+                str(item[0]): (
+                    str(item[1]),
+                    item[2],
+                    float(item[3]),
+                    bool(item[4]),
+                    bool(item[5]),
+                )
+                for item in cursor.fetchall()
+            }
+            new_orders: list[tuple[str, float, bool, bool]] = []
+            for ref_id, notional, is_entry, is_option_open in orders:
+                if ref_id in existing:
+                    if existing[ref_id] != (
+                        account_hash,
+                        trade_date,
+                        float(notional),
+                        bool(is_entry),
+                        bool(is_option_open),
+                    ):
+                        raise ValueError(
+                            f"Execution reservation {ref_id} is immutable"
+                        )
+                else:
+                    new_orders.append(
+                        (
+                            ref_id,
+                            float(notional),
+                            bool(is_entry),
+                            bool(is_option_open),
+                        )
+                    )
+            (
+                observed_orders,
+                observed_notional,
+                observed_entry_orders,
+                observed_entry_notional,
+            ) = observed_usage
+            projected = {
+                "total_orders": max(usage["total_orders"], observed_orders)
+                + len(new_orders),
+                "total_notional": max(
+                    usage["total_notional"], observed_notional
+                )
+                + sum(notional for _, notional, _, _ in new_orders),
+                "entry_orders": max(
+                    usage["entry_orders"], observed_entry_orders
+                )
+                + sum(is_entry for _, _, is_entry, _ in new_orders),
+                "entry_notional": max(
+                    usage["entry_notional"], observed_entry_notional
+                )
+                + sum(
+                    notional
+                    for _, notional, is_entry, _ in new_orders
+                    if is_entry
+                ),
+                "option_openings": usage["option_openings"]
+                + sum(
+                    is_option_open
+                    for _, _, _, is_option_open in new_orders
+                ),
+            }
+            if (
+                projected["total_orders"] > max_orders
+                or projected["total_notional"] > max_notional
+                or projected["entry_orders"] > max_entry_orders
+                or projected["entry_notional"] > max_entry_notional
+                or projected["option_openings"] > max_option_openings
+                or observed_open_option_positions
+                + projected["option_openings"]
+                > max_option_openings
+            ):
+                raise RuntimeError("Durable execution budget would be exceeded")
+            cursor.execute(
+                """
+                UPDATE execution_daily_usage
+                SET total_orders = %s,
+                    total_notional = %s,
+                    entry_orders = %s,
+                    entry_notional = %s,
+                    option_openings = %s,
+                    updated_at = now()
+                WHERE account_key = %s AND trade_date = %s
+                """,
+                (
+                    projected["total_orders"],
+                    projected["total_notional"],
+                    projected["entry_orders"],
+                    projected["entry_notional"],
+                    projected["option_openings"],
+                    account_hash,
+                    trade_date,
+                ),
+            )
+            if new_orders:
+                cursor.executemany(
+                    """
+                    INSERT INTO execution_plan_reservations
+                        (ref_id, account_key, trade_date, notional,
+                         is_entry, is_option_open)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            ref_id,
+                            account_hash,
+                            trade_date,
+                            notional,
+                            is_entry,
+                            is_option_open,
+                        )
+                        for ref_id, notional, is_entry, is_option_open in new_orders
+                    ],
+                )
+            return projected
 
     @staticmethod
     def _option_packet_status(cursor: Any, packet_id: str) -> str:

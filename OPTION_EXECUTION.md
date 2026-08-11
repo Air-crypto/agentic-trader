@@ -26,12 +26,14 @@ for a put remains unavailable until the short contract is closed.
 ## Initial live limits
 
 - One contract per order.
-- One opening options order per trading day.
-- At most two open option positions.
+- At most three opening option orders per trading day across all runs.
+- At most three simultaneously open option positions.
 - Entry expiration from 21 through 60 calendar days.
 - Broker quote no older than 60 seconds.
 - Positive bid and ask; spread no more than 10% of midpoint.
 - Limit, good-for-day, regular-hours orders only.
+- Option premium notional counts toward the shared $800 total and $600 entry
+  budgets; CSP collateral and covered shares remain separately reserved.
 - Long premium at risk is the lesser of $75 and 5% of current account equity.
 - Aggregate open long premium is at most 10% of current equity.
 - Cash-secured-put collateral is at most 30% of current equity.

@@ -5,9 +5,17 @@ import json
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 PICK_ACTIONS = {"long", "reject", "close"}
 CRITIC_VERDICTS = {"pass", "veto"}
+CRITIC_SOFT_DIMENSIONS = {
+    "source_breadth",
+    "freshness",
+    "materiality",
+    "novelty",
+    "not_priced_in",
+}
 PACKET_ACTIONS = {"buy", "close"}
 THESIS_STATUSES = {"pending_entry", "active", "expired", "invalidated", "closed", "cancelled"}
 
@@ -65,6 +73,10 @@ class EvidenceVersion:
     independence_group: str
     quote_verified: bool
     valid_at: datetime | None = None
+    symbol: str = ""
+    cik: str = ""
+    authority: str = ""
+    issuer_verified: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> EvidenceVersion:
@@ -85,9 +97,35 @@ class EvidenceVersion:
         document_hash = str(raw["document_hash"])
         if len(document_hash) != 64:
             raise ValueError("document_hash must be a SHA-256 hex digest")
+        primary = raw["primary"]
+        quote_verified = raw["quote_verified"]
+        issuer_verified = raw.get("issuer_verified", False)
+        if (
+            not isinstance(primary, bool)
+            or not isinstance(quote_verified, bool)
+            or not isinstance(issuer_verified, bool)
+        ):
+            raise ValueError("Evidence boolean fields must be JSON booleans")
+        cik = str(raw.get("cik", "")).strip()
+        if cik and (not cik.isdigit() or len(cik) > 10):
+            raise ValueError("Evidence CIK must contain at most 10 digits")
+        source_type = str(raw["source_type"])
+        host = urlparse(url).hostname or ""
+        if (
+            (host == "sec.gov" or host.endswith(".sec.gov"))
+            and source_type == "sec_filing"
+        ):
+            derived_authority = "sec"
+        elif host.endswith(".gov") and source_type == "government_record":
+            derived_authority = "government"
+        else:
+            derived_authority = "reporting"
+        declared_authority = str(raw.get("authority", derived_authority)).lower()
+        if declared_authority and declared_authority != derived_authority:
+            raise ValueError("Evidence authority does not match source URL/type")
         return cls(
             evidence_id=str(raw["evidence_id"]),
-            source_type=str(raw["source_type"]),
+            source_type=source_type,
             title=str(raw["title"]),
             publisher=str(raw["publisher"]),
             url=url,
@@ -96,10 +134,14 @@ class EvidenceVersion:
             retrieved_at=retrieved_at,
             quote=quote,
             document_hash=document_hash,
-            primary=bool(raw["primary"]),
+            primary=primary,
             independence_group=str(raw["independence_group"]),
-            quote_verified=bool(raw["quote_verified"]),
+            quote_verified=quote_verified,
             valid_at=valid_at,
+            symbol=str(raw.get("symbol", "")).upper(),
+            cik=cik.zfill(10) if cik else "",
+            authority=derived_authority,
+            issuer_verified=issuer_verified,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -226,6 +268,8 @@ class CriticVerdict:
     verdict: str
     reasons: tuple[str, ...]
     contradicted_evidence_ids: tuple[str, ...]
+    hard_vetoes: tuple[str, ...] = ()
+    soft_checks: tuple[tuple[str, bool], ...] = ()
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> CriticVerdict:
@@ -235,6 +279,26 @@ class CriticVerdict:
         reasons = tuple(str(item) for item in raw.get("reasons", ()))
         if verdict == "veto" and not reasons:
             raise ValueError("A critic veto requires at least one reason")
+        raw_soft_checks = raw.get("soft_checks", {})
+        if isinstance(raw_soft_checks, dict):
+            if any(not isinstance(value, bool) for value in raw_soft_checks.values()):
+                raise ValueError("Critic soft checks must be JSON booleans")
+            soft_checks = tuple(
+                sorted((str(key), value) for key, value in raw_soft_checks.items())
+            )
+        else:
+            if any(not isinstance(value, bool) for _, value in raw_soft_checks):
+                raise ValueError("Critic soft checks must be booleans")
+            soft_checks = tuple(
+                sorted((str(key), value) for key, value in raw_soft_checks)
+            )
+        unknown_soft_checks = {
+            key for key, _ in soft_checks
+        } - CRITIC_SOFT_DIMENSIONS
+        if unknown_soft_checks:
+            raise ValueError(
+                f"Unknown critic soft checks: {sorted(unknown_soft_checks)}"
+            )
         return cls(
             draft_id=str(raw["draft_id"]),
             model_id=str(raw["model_id"]),
@@ -244,6 +308,8 @@ class CriticVerdict:
             contradicted_evidence_ids=tuple(
                 str(item) for item in raw.get("contradicted_evidence_ids", ())
             ),
+            hard_vetoes=tuple(str(item) for item in raw.get("hard_vetoes", ())),
+            soft_checks=soft_checks,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -252,6 +318,8 @@ class CriticVerdict:
             "created_at": self.created_at.isoformat(),
             "reasons": list(self.reasons),
             "contradicted_evidence_ids": list(self.contradicted_evidence_ids),
+            "hard_vetoes": list(self.hard_vetoes),
+            "soft_checks": dict(self.soft_checks),
         }
 
 

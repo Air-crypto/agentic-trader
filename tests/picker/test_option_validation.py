@@ -153,6 +153,30 @@ def test_grounded_long_call_authorizes_one_limit_contract(
     assert result.packet.verify_hash()
 
 
+def test_one_inherited_primary_source_and_critic_pass_authorize(
+    now, evidence, critic, draft
+):
+    source_draft = replace(draft, evidence_ids=("sec-1",))
+    option = replace(
+        option_draft(now),
+        evidence_ids=("sec-1",),
+        draft_hash="",
+    )
+
+    result = authorize(
+        option,
+        [snapshot(now)],
+        evidence[:1],
+        critic,
+        source_draft,
+        now,
+    )
+
+    assert result.accepted
+    assert result.packet is not None
+    assert result.packet.evidence_ids == ("sec-1",)
+
+
 def test_quantity_policy_cannot_expand_single_contract_authority(
     now, evidence, critic, draft
 ):
@@ -295,7 +319,7 @@ def test_source_evidence_and_critic_are_inherited_exactly(
 
     assert not result.accepted
     assert "evidence_not_inherited_exactly" in result.reasons
-    assert "fewer_than_two_independent_sources" in result.reasons
+    assert "fewer_than_two_independent_sources" not in result.reasons
 
 
 def test_critic_veto_blocks_option_authorization(now, evidence, critic, draft):
@@ -304,6 +328,23 @@ def test_critic_veto_blocks_option_authorization(now, evidence, critic, draft):
 
     assert not result.accepted
     assert "critic_veto" in result.reasons
+
+
+def test_critic_contradiction_hard_vetoes_option_with_pass(
+    now, evidence, critic, draft
+):
+    contradicted = replace(critic, contradicted_evidence_ids=("sec-1",))
+    result = authorize(
+        option_draft(now),
+        [snapshot(now)],
+        evidence,
+        contradicted,
+        draft,
+        now,
+    )
+
+    assert not result.accepted
+    assert "critic_found_contradicted_evidence" in result.reasons
 
 
 def test_option_authorization_requires_independent_grok_critic(

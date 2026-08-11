@@ -29,6 +29,9 @@ def evidence(now: datetime) -> list[EvidenceVersion]:
         "quote": document,
         "document_hash": content_hash(document),
         "quote_verified": True,
+        "symbol": "EXM",
+        "cik": "1234567",
+        "issuer_verified": True,
     }
     return [
         EvidenceVersion(
@@ -37,6 +40,7 @@ def evidence(now: datetime) -> list[EvidenceVersion]:
             publisher="SEC",
             url="https://www.sec.gov/example",
             primary=True,
+            authority="sec",
             independence_group="issuer",
             **common,
         ),
@@ -46,6 +50,7 @@ def evidence(now: datetime) -> list[EvidenceVersion]:
             publisher="USAspending",
             url="https://www.usaspending.gov/example",
             primary=False,
+            authority="government",
             independence_group="government",
             **{**common, "source_type": "government_record"},
         ),
@@ -107,4 +112,12 @@ def critic(now: datetime) -> CriticVerdict:
         verdict="pass",
         reasons=(),
         contradicted_evidence_ids=(),
+        hard_vetoes=(),
+        soft_checks=(
+            ("freshness", True),
+            ("materiality", True),
+            ("not_priced_in", True),
+            ("novelty", True),
+            ("source_breadth", True),
+        ),
     )

@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -117,8 +118,10 @@ class ExecutionLimits:
     max_position_weight: float = 0.25
     max_broad_market_weight: float = 0.60
     min_cash_reserve_weight: float = 0.10
-    max_orders_per_day: int = 4
-    max_daily_notional: float = 400.0
+    max_orders_per_day: int = 8
+    max_daily_notional: float = 800.0
+    max_entry_orders_per_day: int = 6
+    max_entry_daily_notional: float = 600.0
     max_daily_loss_weight: float = 0.03
     max_drawdown_weight: float = 0.10
     max_loss_from_deposits_weight: float = 0.10
@@ -148,16 +151,30 @@ class ExecutionLimits:
         return symbol in (allowed if allowed is not None else self.symbol_allowlist)
 
     def __post_init__(self) -> None:
-        if self.max_order_notional <= 0:
-            raise ValueError("max_order_notional must be positive")
+        if (
+            not isfinite(self.max_order_notional)
+            or self.max_order_notional <= 0
+            or self.max_order_notional > 150
+        ):
+            raise ValueError("max_order_notional cannot relax the $150 hard cap")
         if self.min_order_notional > self.max_order_notional:
             raise ValueError("min_order_notional cannot exceed max_order_notional")
         if not 0 < self.max_position_weight <= 1:
             raise ValueError("max_position_weight must be within (0, 1]")
         if not 0 <= self.min_cash_reserve_weight < 1:
             raise ValueError("min_cash_reserve_weight must be within [0, 1)")
-        if self.max_orders_per_day <= 0:
-            raise ValueError("max_orders_per_day must be positive")
+        if not 0 < self.max_orders_per_day <= 8:
+            raise ValueError("max_orders_per_day cannot relax the 8-order hard cap")
+        if not 0 < self.max_daily_notional <= 800:
+            raise ValueError("max_daily_notional cannot relax the $800 hard cap")
+        if not 0 < self.max_entry_orders_per_day <= min(
+            self.max_orders_per_day, 6
+        ):
+            raise ValueError("entry orders cannot exceed 6 or the total cap")
+        if not 0 < self.max_entry_daily_notional <= min(
+            self.max_daily_notional, 600
+        ):
+            raise ValueError("entry notional cannot exceed $600 or the total cap")
 
 
 @dataclass(frozen=True)
@@ -182,6 +199,12 @@ class AccountSnapshot:
     # 9:30-16:00 ET, so planning them then produces orders that cannot be filled.
     session_is_regular: bool = False
     external_halt_reasons: tuple[str, ...] = ()
+    # Entry/rebalance usage is tracked separately so mandatory exits can use
+    # reserved capacity. None means the historical intent is unknown; treating
+    # all prior usage as entry activity fails closed without weakening the
+    # broker-verified hard total.
+    entry_orders_today: int | None = None
+    entry_notional_today: float | None = None
 
     @property
     def settled_equity(self) -> float:
@@ -190,6 +213,18 @@ class AccountSnapshot:
 
     def position_value(self, symbol: str) -> float:
         return float(self.positions.get(symbol.upper(), 0.0))
+
+    @property
+    def effective_entry_orders_today(self) -> int:
+        if self.entry_orders_today is None:
+            return self.orders_today
+        return self.entry_orders_today
+
+    @property
+    def effective_entry_notional_today(self) -> float:
+        if self.entry_notional_today is None:
+            return self.notional_today
+        return self.entry_notional_today
 
 
 def _broker_number(value: Any) -> float | None:
@@ -281,10 +316,19 @@ class ProposedOrder:
         object.__setattr__(self, "symbol", self.symbol.upper())
         object.__setattr__(self, "side", self.side.lower())
         object.__setattr__(self, "order_type", self.order_type.lower())
+        object.__setattr__(self, "intent_class", self.intent_class.strip().lower())
 
     @property
     def is_fractional(self) -> bool:
         return self.order_type == "market"
+
+    @property
+    def uses_exit_reserve(self) -> bool:
+        """Whether this order may consume capacity reserved for urgent exits."""
+        return (
+            self.side == "sell"
+            and self.intent_class in {"mandatory_exit", "close"}
+        )
 
     def broker_parameters(self) -> dict[str, Any]:
         """Exactly the arguments place_equity_order should receive."""
@@ -430,6 +474,14 @@ def evaluate_order(
         reasons.append("order_notional_below_minimum")
     if account.notional_today + notional > limits.max_daily_notional:
         reasons.append("order_would_breach_daily_notional")
+    if not order.uses_exit_reserve:
+        if account.effective_entry_orders_today >= limits.max_entry_orders_per_day:
+            reasons.append("entry_order_count_limit_reached")
+        if (
+            account.effective_entry_notional_today + notional
+            > limits.max_entry_daily_notional
+        ):
+            reasons.append("order_would_breach_entry_daily_notional")
 
     current_value = account.position_value(order.symbol)
     if order.side == "buy":
@@ -476,6 +528,14 @@ def evaluate_batch(
                 cash=running.cash - delta,
                 orders_today=running.orders_today + 1,
                 notional_today=running.notional_today + order.notional,
+                entry_orders_today=(
+                    running.effective_entry_orders_today
+                    + (0 if order.uses_exit_reserve else 1)
+                ),
+                entry_notional_today=(
+                    running.effective_entry_notional_today
+                    + (0.0 if order.uses_exit_reserve else order.notional)
+                ),
             )
     return decisions
 
@@ -623,7 +683,13 @@ def plan_orders_from_targets(
                 )
             )
 
-    priority = {"mandatory_exit": 0, "sell": 1, "rebalance": 2, "entry": 3}
+    priority = {
+        "mandatory_exit": 0,
+        "close": 0,
+        "sell": 1,
+        "rebalance": 2,
+        "entry": 3,
+    }
     drifts.sort(
         key=lambda item: (
             priority.get(item[1].intent_class, 4),
@@ -669,19 +735,97 @@ def daily_consumption(root: str | Path = ".", day: date | None = None) -> tuple[
     return int(entry.get("orders", 0)), float(entry.get("notional", 0.0))
 
 
+def daily_entry_consumption(
+    root: str | Path = ".", day: date | None = None
+) -> tuple[int, float]:
+    """Entry/rebalance usage persisted across runs.
+
+    State written before intent-aware accounting is conservatively interpreted
+    as entirely entry usage, preserving the exit reserve during migration.
+    """
+    state = load_live_state(root)
+    key = (day or datetime.now(UTC).date()).isoformat()
+    entry = state.get("daily", {}).get(key, {})
+    return (
+        int(entry.get("entry_orders", entry.get("orders", 0))),
+        float(entry.get("entry_notional", entry.get("notional", 0.0))),
+    )
+
+
+def merge_broker_and_local_consumption(
+    broker: tuple[int, float],
+    persisted: tuple[int, float],
+    persisted_entry: tuple[int, float],
+) -> tuple[int, float, int, float]:
+    """Merge verified hard totals with intent-aware local counters.
+
+    Broker usage not represented in local state has unknown intent and is
+    therefore charged to the entry cap. This preserves both cross-machine
+    broker verification and the exit reserve.
+    """
+    broker_orders, broker_notional = broker
+    persisted_orders, persisted_notional = persisted
+    persisted_entry_orders, persisted_entry_notional = persisted_entry
+    values = (
+        broker_orders,
+        broker_notional,
+        persisted_orders,
+        persisted_notional,
+        persisted_entry_orders,
+        persisted_entry_notional,
+    )
+    if any(value < 0 for value in values):
+        raise ValueError("Daily consumption counters cannot be negative")
+    if persisted_entry_orders > persisted_orders:
+        raise ValueError("Persisted entry orders cannot exceed total orders")
+    if persisted_entry_notional > persisted_notional:
+        raise ValueError("Persisted entry notional cannot exceed total notional")
+
+    total_orders = max(broker_orders, persisted_orders)
+    total_notional = max(broker_notional, persisted_notional)
+    entry_orders = min(
+        total_orders,
+        persisted_entry_orders + max(broker_orders - persisted_orders, 0),
+    )
+    entry_notional = min(
+        total_notional,
+        persisted_entry_notional + max(broker_notional - persisted_notional, 0.0),
+    )
+    return total_orders, total_notional, entry_orders, entry_notional
+
+
 def record_plan_consumption(
     orders: int,
     notional: float,
     root: str | Path = ".",
     day: date | None = None,
+    *,
+    entry_orders: int | None = None,
+    entry_notional: float | None = None,
 ) -> tuple[int, float]:
-    """Persist approved-order usage so a concurrent run sees it immediately."""
+    """Persist total and entry usage so another run cannot re-spend either cap.
+
+    Callers that do not provide intent-aware counters are treated
+    conservatively: all usage consumes entry capacity.
+    """
     state = load_live_state(root)
     key = (day or datetime.now(UTC).date()).isoformat()
     daily = state.setdefault("daily", {})
     entry = daily.setdefault(key, {"orders": 0, "notional": 0.0})
+    previous_orders = int(entry["orders"])
+    previous_notional = float(entry["notional"])
+    entry.setdefault("entry_orders", previous_orders)
+    entry.setdefault("entry_notional", previous_notional)
+    consumed_entry_orders = orders if entry_orders is None else entry_orders
+    consumed_entry_notional = notional if entry_notional is None else entry_notional
+    if not 0 <= consumed_entry_orders <= orders:
+        raise ValueError("entry_orders must be between zero and orders")
+    if not 0.0 <= consumed_entry_notional <= notional:
+        raise ValueError("entry_notional must be between zero and notional")
     entry["orders"] = int(entry["orders"]) + orders
     entry["notional"] = float(entry["notional"]) + notional
+    entry["entry_orders"] = int(entry["entry_orders"]) + consumed_entry_orders
+    entry["entry_notional"] = float(entry["entry_notional"]) + consumed_entry_notional
     path = Path(root) / LIVE_STATE_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2) + "\n")

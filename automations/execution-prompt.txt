@@ -20,8 +20,9 @@ quant, deterministic authorization, guarded placement, and reconciliation.
 PREFLIGHT — run checks 1 to 4 in order and report every result, then apply the
 trading-day gate in 5. Do not work around a failure.
 1. KILL_SWITCH exists at the repository root. Stop. Never delete it.
-2. AGENTIC_TRADER_ACCOUNT, AGENTIC_TRADER_NET_DEPOSITS, or DATABASE_URL is
-   unset. Stop.
+2. AGENTIC_TRADER_ACCOUNT, AGENTIC_TRADER_NET_DEPOSITS, DATABASE_URL, or
+   SEC_USER_AGENT is unset. Stop. SEC_USER_AGENT must contain a monitored
+   contact email; authorization rechecks every symbol/CIK against SEC data.
 3. uv sync --frozen, uv run pytest, or uv run ruff check . fails. Stop.
    If the uv command is not found, use "$HOME/.local/bin/uv".
 4. Broker connectivity. Call get_accounts and confirm the configured account is
@@ -67,7 +68,8 @@ AUTHORIZE AND PLAN
     Exit code 2 with zero authorized packets is a valid fail-closed outcome;
     continue to plan so exits and cash can still be produced.
 12. Write artifacts/picker/snapshot.json with account_number, equity, cash,
-    pending_deposits, broker_positions, broker_orders, prices, and
+    pending_deposits, broker_positions, broker_orders, broker_option_orders,
+    prices, and research_batch_id copied exactly from authorized-batch.json; and
     session_is_regular from steps 6-8. Never set orders_source, orders_today,
     notional_today, or position market values yourself.
 13. Run: uv run agentic-trader picker-plan
@@ -89,10 +91,14 @@ AUTHORIZE AND PLAN
     code 3 means another session holds the lock. Stop; never delete the lock.
 
 EXECUTE — only when MODE is LIVE and at least one plan has approved orders.
-17. For each equity entry in approved_orders call review_equity_order, then
-    place_equity_order with that entry's broker_parameters object exactly as
-    given, plus its ref_id. Place nothing not in the list. Never generate your
-    own ref_id.
+17. Review every equity approved_order with review_equity_order. If any review
+    differs or blocks, place none. If all match, run:
+    uv run agentic-trader live-reserve --plan artifacts/live/plan.json
+    This Postgres transaction is the final shared $800/8 and $600/6 gate across
+    concurrent cloud runs. It writes reservation.json. Place only approved
+    orders whose ref_id appears in reserved_ref_ids, using each exact
+    broker_parameters object plus its plan ref_id. A blocked entry must not
+    suppress a reserved exit. Never generate a ref_id.
 18. For every entry in options-plan.json approved_orders call
     review_option_order with its review_parameters object exactly and surface
     every alert. If any review differs from the plan or has a blocking alert,
@@ -100,8 +106,10 @@ EXECUTE — only when MODE is LIVE and at least one plan has approved orders.
     uv run agentic-trader option-reserve
     --plan artifacts/live/options-plan.json
     --snapshot artifacts/options/snapshot.json
-    Then call place_option_order with each place_parameters object exactly; it
-    already contains the deterministic ref_id.
+    It writes options-reservation.json. Then call place_option_order only for
+    orders whose ref_id appears in reserved_ref_ids, using each place_parameters
+    object exactly; it already contains the deterministic ref_id. A blocked
+    option entry must not suppress a reserved close.
     The operator's saved MODE: LIVE automation is explicit authorization for
     these guard-approved orders. Never alter a leg, quantity, limit, or
     position effect.
@@ -126,6 +134,13 @@ EXECUTE — only when MODE is LIVE and at least one plan has approved orders.
     --executed artifacts/live/executed-options.json
     --reconciliation artifacts/live/options-reconciliation.json
     --equity-reconciliation artifacts/live/reconciliation.json
+
+SHARED DAILY LIMITS — apply across all three runs:
+- $800 and 8 orders total.
+- Entries/rebalances may use at most $600 and 6 orders.
+- Preserve $200 and 2 orders for mandatory/risk-reducing exits.
+- At most three new option positions/day and three simultaneously open; one
+  contract/order and all existing premium/collateral gates remain.
 
 REPORT — always, including when you stopped early.
 - MODE, UTC and ET timestamps, and whether today was a trading day.

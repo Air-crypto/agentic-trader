@@ -61,6 +61,26 @@ def make_order(**overrides) -> ProposedOrder:
     return ProposedOrder(**defaults)
 
 
+def test_default_limits_preserve_exit_capacity():
+    limits = ExecutionLimits()
+    assert limits.max_order_notional == 150.0
+    assert limits.max_orders_per_day == 8
+    assert limits.max_daily_notional == 800.0
+    assert limits.max_entry_orders_per_day == 6
+    assert limits.max_entry_daily_notional == 600.0
+
+
+def test_daily_limits_cannot_be_relaxed_through_cli_style_overrides():
+    with pytest.raises(ValueError, match="8-order"):
+        ExecutionLimits(max_orders_per_day=9)
+    with pytest.raises(ValueError, match="800"):
+        ExecutionLimits(max_daily_notional=801)
+    with pytest.raises(ValueError, match="6"):
+        ExecutionLimits(max_entry_orders_per_day=7)
+    with pytest.raises(ValueError, match="600"):
+        ExecutionLimits(max_entry_daily_notional=601)
+
+
 def test_clean_order_is_approved():
     decision = evaluate_order(make_order(), make_account())
     assert decision.approved
@@ -306,13 +326,17 @@ def test_capital_floor_tracks_additional_deposits():
 
 
 def test_daily_order_count_limit():
-    account = make_account(orders_today=4)
+    account = make_account(orders_today=8)
     decision = evaluate_order(make_order(), account)
     assert "daily_order_count_limit_reached" in decision.reasons
 
 
 def test_order_breaching_daily_notional_is_rejected():
-    account = make_account(notional_today=350.0)
+    account = make_account(
+        notional_today=750.0,
+        entry_orders_today=0,
+        entry_notional_today=0.0,
+    )
     decision = evaluate_order(make_order(notional=100.0), account)
     assert "order_would_breach_daily_notional" in decision.reasons
 
@@ -324,16 +348,122 @@ def test_kill_switch_blocks_everything(tmp_path):
 
 
 def test_batch_consumes_daily_budget_sequentially():
-    orders = [make_order(notional=150.0) for _ in range(4)]
+    orders = [
+        make_order(symbol=symbol, notional=150.0, intent_class="entry")
+        for symbol in ("SPY", "QQQ", "IWM", "EFA", "EEM")
+    ]
     decisions = evaluate_batch(orders, make_account(equity=5_000.0, cash=5_000.0))
-    approved = [decision for decision in decisions if decision.approved]
-    assert len(approved) == 2
-    assert "order_would_breach_daily_notional" in decisions[2].reasons
+    assert all(decision.approved for decision in decisions[:4])
+    assert "order_would_breach_entry_daily_notional" in decisions[4].reasons
+
+
+def test_entry_order_count_cap_preserves_two_slots_for_exits():
+    account = make_account(
+        equity=5_000.0,
+        cash=4_900.0,
+        positions={"SPY": 100.0},
+        orders_today=6,
+        notional_today=300.0,
+        entry_orders_today=6,
+        entry_notional_today=300.0,
+    )
+    entry = evaluate_order(make_order(symbol="QQQ", intent_class="entry"), account)
+    exit_order = evaluate_order(
+        make_order(
+            side="sell",
+            notional=100.0,
+            intent_class="mandatory_exit",
+        ),
+        account,
+    )
+    assert "entry_order_count_limit_reached" in entry.reasons
+    assert exit_order.approved
+
+
+def test_mandatory_exits_use_reserve_but_never_exceed_total_caps():
+    account = make_account(
+        equity=5_000.0,
+        cash=4_700.0,
+        positions={"SPY": 300.0},
+        orders_today=6,
+        notional_today=600.0,
+        entry_orders_today=6,
+        entry_notional_today=600.0,
+    )
+    exits = [
+        make_order(
+            side="sell",
+            notional=100.0,
+            intent_class="mandatory_exit",
+        )
+        for _ in range(3)
+    ]
+    decisions = evaluate_batch(exits, account)
+    assert decisions[0].approved
+    assert decisions[1].approved
+    assert "daily_order_count_limit_reached" in decisions[2].reasons
+    assert "daily_notional_limit_reached" in decisions[2].reasons
+
+
+def test_close_intent_can_use_exit_reserve_case_insensitively():
+    account = make_account(
+        positions={"SPY": 100.0},
+        orders_today=6,
+        notional_today=600.0,
+        entry_orders_today=6,
+        entry_notional_today=600.0,
+    )
+    order = make_order(side="sell", intent_class=" Close ")
+    assert order.intent_class == "close"
+    assert evaluate_order(order, account).approved
+
+
+def test_buy_cannot_consume_exit_reserve_by_mislabeled_intent():
+    account = make_account(
+        orders_today=6,
+        notional_today=600.0,
+        entry_orders_today=6,
+        entry_notional_today=600.0,
+    )
+    order = make_order(side="buy", intent_class="close")
+    decision = evaluate_order(order, account)
+    assert "entry_order_count_limit_reached" in decision.reasons
+    assert "order_would_breach_entry_daily_notional" in decision.reasons
+
+
+def test_unknown_historical_intents_conservatively_consume_entry_capacity():
+    account = make_account(orders_today=6, notional_today=600.0)
+    decision = evaluate_order(make_order(intent_class="entry"), account)
+    assert "entry_order_count_limit_reached" in decision.reasons
+    assert "order_would_breach_entry_daily_notional" in decision.reasons
+
+
+def test_batch_enforces_total_budget_sequentially_for_mandatory_exits():
+    symbols = ("SPY", "QQQ", "IWM", "EFA", "EEM", "VNQ", "DBC", "IEF", "TLT")
+    orders = [
+        make_order(
+            symbol=symbol,
+            side="sell",
+            notional=100.0,
+            intent_class="mandatory_exit",
+        )
+        for symbol in symbols
+    ]
+    account = make_account(
+        equity=5_000.0,
+        cash=4_100.0,
+        positions={symbol: 100.0 for symbol in symbols},
+    )
+    decisions = evaluate_batch(orders, account)
+    assert all(decision.approved for decision in decisions[:8])
+    assert "daily_order_count_limit_reached" in decisions[8].reasons
+    assert "daily_notional_limit_reached" in decisions[8].reasons
 
 
 def test_batch_accumulates_position_weight():
     limits = ExecutionLimits(
-        max_position_weight=0.25, max_broad_market_weight=0.25, max_daily_notional=10_000.0
+        max_position_weight=0.25,
+        max_broad_market_weight=0.25,
     )
     orders = [make_order(notional=100.0) for _ in range(3)]
     decisions = evaluate_batch(orders, make_account(equity=750.0, cash=750.0), limits)
@@ -449,6 +579,37 @@ def test_mandatory_exit_is_planned_before_new_entry():
     assert decisions[0].order.symbol == "OLD"
     assert decisions[0].order.intent_class == "mandatory_exit"
     assert decisions[1].order.symbol == "NEW"
+
+
+def test_exit_priority_gets_last_total_slot_before_entry():
+    account = make_account(
+        equity=1_000.0,
+        cash=900.0,
+        positions={"OLD": 100.0},
+        orders_today=7,
+        notional_today=700.0,
+        entry_orders_today=6,
+        entry_notional_today=600.0,
+    )
+    limits = ExecutionLimits(
+        symbol_allowlist=(),
+        buy_symbol_allowlist=("NEW",),
+        sell_symbol_allowlist=("OLD",),
+    )
+    decisions = plan_orders_from_targets(
+        {"NEW": 0.1, "OLD": 0.0},
+        account,
+        prices={"NEW": 100.0, "OLD": 100.0},
+        limits=limits,
+        metadata_by_symbol={
+            "OLD": {"intent_class": "close"},
+            "NEW": {"intent_class": "entry"},
+        },
+    )
+    assert decisions[0].order.symbol == "OLD"
+    assert decisions[0].approved
+    assert decisions[1].order.symbol == "NEW"
+    assert "daily_order_count_limit_reached" in decisions[1].reasons
 
 
 def test_broker_positions_are_valued_from_quantities_and_current_prices():

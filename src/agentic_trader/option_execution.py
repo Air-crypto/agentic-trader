@@ -80,9 +80,12 @@ class OptionExecutionLimits:
     minimum_option_level: int = 2
     allowed_strategies: tuple[str, ...] = ALLOWED_STRATEGIES
     max_contracts_per_order: int = 1
-    max_openings_per_day: int = 1
-    max_open_option_positions: int = 2
-    max_orders_per_day: int = 4
+    max_openings_per_day: int = 3
+    max_open_option_positions: int = 3
+    max_orders_per_day: int = 8
+    max_entry_orders_per_day: int = 6
+    max_daily_notional: float = 800.0
+    max_entry_daily_notional: float = 600.0
     min_entry_dte: int = 21
     max_entry_dte: int = 60
     max_quote_age_seconds: int = 60
@@ -101,13 +104,22 @@ class OptionExecutionLimits:
             raise ValueError("Only one-contract option orders are supported")
         if (
             self.max_openings_per_day <= 0
-            or self.max_openings_per_day > 1
+            or self.max_openings_per_day > 3
             or self.max_open_option_positions <= 0
-            or self.max_open_option_positions > 2
+            or self.max_open_option_positions > 3
             or self.max_orders_per_day <= 0
-            or self.max_orders_per_day > 4
+            or self.max_orders_per_day > 8
+            or self.max_entry_orders_per_day <= 0
+            or self.max_entry_orders_per_day > 6
+            or self.max_entry_orders_per_day > self.max_orders_per_day
         ):
-            raise ValueError("Opening, position, or daily-order limit relaxes hard caps")
+            raise ValueError("Opening, position, entry, or daily-order limit relaxes hard caps")
+        if not 0 < self.max_daily_notional <= 800:
+            raise ValueError("max_daily_notional cannot relax the $800 hard cap")
+        if not 0 < self.max_entry_daily_notional <= min(
+            self.max_daily_notional, 600
+        ):
+            raise ValueError("entry notional cannot exceed $600 or the total cap")
         if (
             self.min_entry_dte < 21
             or self.max_entry_dte > 60
@@ -163,6 +175,9 @@ class OptionAccountSnapshot:
     open_option_positions: int = 0
     option_openings_today: int = 0
     orders_today: int = 0
+    entry_orders_today: int | None = None
+    notional_today: float = 0.0
+    entry_notional_today: float | None = None
     aggregate_long_debit: float = 0.0
     csp_collateral: float = 0.0
     pending_deposits: float = 0.0
@@ -182,6 +197,7 @@ class OptionAccountSnapshot:
             "aggregate_long_debit",
             "csp_collateral",
             "pending_deposits",
+            "notional_today",
         ):
             value = float(getattr(self, name))
             if not isfinite(value) or value < 0:
@@ -192,6 +208,22 @@ class OptionAccountSnapshot:
             if value < 0:
                 raise ValueError(f"{name} cannot be negative")
             object.__setattr__(self, name, value)
+        entry_orders = self.entry_orders_today
+        if entry_orders is not None:
+            entry_orders = int(entry_orders)
+            if entry_orders < 0:
+                raise ValueError("entry_orders_today cannot be negative")
+            if entry_orders > self.orders_today:
+                raise ValueError("entry_orders_today cannot exceed orders_today")
+            object.__setattr__(self, "entry_orders_today", entry_orders)
+        entry_notional = self.entry_notional_today
+        if entry_notional is not None:
+            entry_notional = float(entry_notional)
+            if not isfinite(entry_notional) or entry_notional < 0:
+                raise ValueError("entry_notional_today must be finite and non-negative")
+            if entry_notional > self.notional_today:
+                raise ValueError("entry_notional_today cannot exceed notional_today")
+            object.__setattr__(self, "entry_notional_today", entry_notional)
         if not str(self.account_number).strip():
             raise ValueError("account_number is required")
         normalized_shares = {
@@ -246,6 +278,19 @@ class OptionAccountSnapshot:
     @property
     def settled_cash(self) -> float:
         return self.cash - self.pending_deposits
+
+    @property
+    def effective_entry_orders_today(self) -> int:
+        """Fail closed when broker history cannot distinguish entries from exits."""
+        if self.entry_orders_today is None:
+            return self.orders_today
+        return self.entry_orders_today
+
+    @property
+    def effective_entry_notional_today(self) -> float:
+        if self.entry_notional_today is None:
+            return self.notional_today
+        return self.entry_notional_today
 
     def shares(self, symbol: str) -> float:
         return float(self.underlying_shares.get(symbol.upper(), 0.0))
@@ -547,8 +592,18 @@ def evaluate_option_order(
         reasons.append("option_level_2_required")
     if account.equity <= 0:
         reasons.append("non_positive_equity")
-    if opening and account.orders_today >= limits.max_orders_per_day:
+    if account.orders_today >= limits.max_orders_per_day:
         reasons.append("daily_order_count_limit_reached")
+    if opening and account.effective_entry_orders_today >= limits.max_entry_orders_per_day:
+        reasons.append("daily_entry_order_count_limit_reached")
+    if account.notional_today + order.premium_notional > limits.max_daily_notional:
+        reasons.append("option_order_would_breach_daily_notional")
+    if (
+        opening
+        and account.effective_entry_notional_today + order.premium_notional
+        > limits.max_entry_daily_notional
+    ):
+        reasons.append("option_order_would_breach_entry_daily_notional")
     if account.orders_source != "broker":
         reasons.append("option_order_count_not_broker_verified")
     if not account.session_is_regular:
@@ -666,11 +721,25 @@ def evaluate_option_batch(
     root: str | Path = ".",
     now: datetime | None = None,
 ) -> list[OptionOrderDecision]:
-    """Evaluate sequentially so approvals consume risk, cash, and daily limits."""
+    """Evaluate risk-reducing closes first, then consume risk and daily limits."""
     limits = limits or OptionExecutionLimits()
     decisions: list[OptionOrderDecision] = []
     running = account
-    for order in orders:
+    mandatory_ids = set(account.mandatory_close_option_ids)
+    prioritized_orders = sorted(
+        enumerate(orders),
+        key=lambda item: (
+            (
+                0
+                if item[1].position_effect == "close" and item[1].option_id in mandatory_ids
+                else 1
+                if item[1].position_effect == "close"
+                else 2
+            ),
+            item[0],
+        ),
+    )
+    for _, order in prioritized_orders:
         decision = evaluate_option_order(order, running, limits, root, now)
         decisions.append(decision)
         if not decision.approved:
@@ -708,6 +777,12 @@ def evaluate_option_batch(
             open_option_positions=open_positions,
             option_openings_today=openings_today,
             orders_today=running.orders_today + 1,
+            entry_orders_today=running.effective_entry_orders_today + int(opening),
+            notional_today=running.notional_today + order.premium_notional,
+            entry_notional_today=(
+                running.effective_entry_notional_today
+                + (order.premium_notional if opening else 0.0)
+            ),
             aggregate_long_debit=aggregate_debit,
             csp_collateral=csp_collateral,
             covered_call_contracts=covered,

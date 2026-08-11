@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from .critic_policy import evaluate_critic_policy
 from .models import (
     CriticVerdict,
     DecisionPacket,
@@ -23,10 +24,11 @@ class LivePickerPolicy:
     min_market_cap: float = 2_000_000_000.0
     min_average_dollar_volume: float = 50_000_000.0
     max_spread_bps: float = 25.0
-    min_event_quality: float = 0.65
+    min_event_quality: float = 0.60
+    # Retained as critic calibration references; these are soft-majority inputs.
     min_materiality: float = 0.20
     min_novelty: float = 0.40
-    min_timing: float = 0.40
+    min_timing: float = 0.35
     max_speculation: float = 0.40
     max_stock_weight: float = 0.15
     risk_per_thesis: float = 0.01
@@ -77,16 +79,14 @@ def validate_picker_draft(
         reasons.append("draft_timestamp_in_future")
     if draft.horizon_trading_days > policy.max_horizon_days:
         reasons.append("horizon_exceeds_live_limit")
-    if critic.draft_id != draft.draft_id:
-        reasons.append("critic_draft_mismatch")
-    if critic.created_at < draft.created_at:
-        reasons.append("critic_predates_draft")
-    if "grok" not in critic.model_id.lower() or critic.model_id == model_id:
-        reasons.append("critic_model_not_independent")
-    if critic.verdict != "pass":
-        reasons.append("critic_veto")
-    if critic.contradicted_evidence_ids:
-        reasons.append("critic_found_contradicted_evidence")
+    critic_policy = evaluate_critic_policy(
+        critic,
+        draft_id=draft.draft_id,
+        draft_created_at=draft.created_at,
+        analyst_model_id=model_id,
+        now=now,
+    )
+    reasons.extend(critic_policy.reasons)
 
     evidence: list[EvidenceVersion] = []
     for evidence_id in draft.evidence_ids:
@@ -101,16 +101,21 @@ def validate_picker_draft(
             reasons.append(f"ungrounded_quote:{evidence_id}")
 
     if draft.action != "reject":
-        if not any(item.primary for item in evidence):
-            reasons.append("no_primary_source")
-        if len({item.independence_group for item in evidence}) < 2:
-            reasons.append("fewer_than_two_independent_sources")
+        if any(item.symbol != draft.symbol for item in evidence):
+            reasons.append("evidence_symbol_mismatch")
+        authoritative_primary = [
+            item
+            for item in evidence
+            if item.primary
+            and item.symbol == draft.symbol
+            and item.cik
+            and item.issuer_verified
+            and item.authority in {"sec", "government"}
+        ]
+        if not authoritative_primary:
+            reasons.append("no_authoritative_primary_source")
     if draft.event_quality < policy.min_event_quality:
         reasons.append("event_quality_below_gate")
-    if draft.materiality < policy.min_materiality:
-        reasons.append("materiality_below_gate")
-    if draft.novelty < policy.min_novelty:
-        reasons.append("novelty_below_gate")
     if draft.timing < policy.min_timing:
         reasons.append("timing_below_gate")
     if draft.speculation > policy.max_speculation:

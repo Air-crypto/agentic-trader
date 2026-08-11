@@ -27,6 +27,63 @@ def test_grounded_independently_confirmed_draft_is_authorized(draft, evidence, q
     assert result.packet.horizon_trading_days == 20
 
 
+def test_one_primary_source_and_critic_pass_authorize(draft, evidence, quant, critic, now):
+    single_source_draft = replace(
+        draft,
+        evidence_ids=("sec-1",),
+        event_quality=0.60,
+        materiality=0.10,
+        novelty=0.10,
+        timing=0.35,
+    )
+
+    result = validate(single_source_draft, evidence[:1], quant, critic, now)
+
+    assert result.accepted
+    assert result.packet is not None
+    assert result.packet.evidence_ids == ("sec-1",)
+
+
+def test_primary_source_must_bind_the_same_symbol_and_cik(
+    draft, evidence, quant, critic, now
+):
+    wrong_symbol = replace(evidence[0], symbol="OTHER")
+    result = validate(draft, [wrong_symbol], quant, critic, now)
+    assert not result.accepted
+    assert "evidence_symbol_mismatch" in result.reasons
+    assert "no_authoritative_primary_source" in result.reasons
+
+
+def test_soft_concerns_use_structured_three_of_five_majority(
+    draft, evidence, quant, critic, now
+):
+    three_pass = replace(
+        critic,
+        soft_checks=(
+            ("source_breadth", False),
+            ("freshness", True),
+            ("materiality", True),
+            ("novelty", False),
+            ("not_priced_in", True),
+        ),
+    )
+    assert validate(draft, evidence, quant, three_pass, now).accepted
+
+    two_pass = replace(
+        critic,
+        soft_checks=(
+            ("source_breadth", False),
+            ("freshness", True),
+            ("materiality", True),
+            ("novelty", False),
+            ("not_priced_in", False),
+        ),
+    )
+    result = validate(draft, evidence, quant, two_pass, now)
+    assert not result.accepted
+    assert "critic_verdict_policy_mismatch" in result.reasons
+
+
 def test_critic_veto_fails_closed(draft, evidence, quant, critic, now):
     result = validate(
         draft,
@@ -39,6 +96,34 @@ def test_critic_veto_fails_closed(draft, evidence, quant, critic, now):
     assert "critic_veto" in result.reasons
 
 
+def test_critic_contradiction_hard_vetoes_even_with_pass(
+    draft, evidence, quant, critic, now
+):
+    result = validate(
+        draft,
+        evidence,
+        quant,
+        replace(critic, contradicted_evidence_ids=("sec-1",)),
+        now,
+    )
+    assert not result.accepted
+    assert "critic_found_contradicted_evidence" in result.reasons
+
+
+def test_structured_hard_veto_overrides_soft_majority(
+    draft, evidence, quant, critic, now
+):
+    result = validate(
+        draft,
+        evidence,
+        quant,
+        replace(critic, hard_vetoes=("ticker_cik_ambiguity",)),
+        now,
+    )
+    assert not result.accepted
+    assert "critic_hard_veto:ticker_cik_ambiguity" in result.reasons
+
+
 def test_same_model_or_non_grok_critic_cannot_authorize(
     draft, evidence, quant, critic, now
 ):
@@ -47,6 +132,20 @@ def test_same_model_or_non_grok_critic_cannot_authorize(
         evidence,
         quant,
         replace(critic, model_id="analyst-model"),
+        now,
+    )
+    assert not result.accepted
+    assert "critic_model_not_independent" in result.reasons
+
+
+def test_grok_substring_does_not_spoof_critic_identity(
+    draft, evidence, quant, critic, now
+):
+    result = validate(
+        draft,
+        evidence,
+        quant,
+        replace(critic, model_id="not-grok-critic"),
         now,
     )
     assert not result.accepted

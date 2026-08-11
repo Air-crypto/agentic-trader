@@ -22,6 +22,10 @@ Bounded Level 2 options are governed separately by
 long puts, covered calls, cash-secured puts, and closes are eligible; naked
 options, multi-leg spreads, 0DTE, and market option orders remain blocked.
 
+The live workflow runs three research → independent Grok critic → execution
+cycles per trading day. All cycles share an $800/8-order total; entries are
+limited to $600/6 orders so exit capacity remains available.
+
 ```bash
 uv run agentic-trader picker-authorize-batch --quant artifacts/picker/quant.json
 uv run agentic-trader picker-plan --snapshot artifacts/picker/snapshot.json

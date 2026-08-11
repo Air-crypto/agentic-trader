@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+from argparse import Namespace
+
 import pytest
 
+import agentic_trader.cli as cli
 from agentic_trader.sources.sec import SECClient
 
 
@@ -39,3 +43,54 @@ def test_recent_filings_parses_legacy_and_iso_acceptance_datetime(monkeypatch, t
     assert filings[0].accepted_at.isoformat() == "2026-08-01T09:30:00+00:00"
     assert filings[1].accepted_at is not None
     assert filings[1].accepted_at.isoformat() == "2026-08-05T20:38:25+00:00"
+
+
+def test_evidence_verifier_binds_symbol_to_official_sec_cik(
+    monkeypatch,
+    tmp_path,
+    evidence,
+):
+    raw = evidence[0].to_dict()
+    raw["quote_verified"] = False
+    raw["issuer_verified"] = False
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps({"evidence": [raw]}))
+    documents = tmp_path / "documents"
+    documents.mkdir()
+    (documents / f"{raw['evidence_id']}.txt").write_text(raw["quote"])
+
+    class FakeSECClient:
+        @staticmethod
+        def quote_is_grounded(document, quote):
+            return SECClient.quote_is_grounded(document, quote)
+
+        @staticmethod
+        def ticker_map():
+            return {"EXM": "0001234567"}
+
+    monkeypatch.setattr(cli, "SECClient", FakeSECClient)
+    output = tmp_path / "verified.json"
+    assert (
+        cli.command_picker_verify_evidence(
+            Namespace(
+                evidence=str(evidence_path),
+                documents=str(documents),
+                output=str(output),
+            )
+        )
+        == 0
+    )
+    verified = json.loads(output.read_text())["evidence"][0]
+    assert verified["issuer_verified"] is True
+    assert verified["authority"] == "sec"
+
+    class WrongMapClient(FakeSECClient):
+        @staticmethod
+        def ticker_map():
+            return {"EXM": "0000000001"}
+
+    monkeypatch.setattr(cli, "SECClient", WrongMapClient)
+    with pytest.raises(ValueError, match="live SEC"):
+        cli._verify_official_issuer_mappings(
+            [cli.EvidenceVersion.from_dict(verified)]
+        )

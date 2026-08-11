@@ -94,6 +94,64 @@ def test_strategy_allowlist_cannot_be_configured_to_allow_naked_options():
         OptionExecutionLimits(max_quote_age_seconds=61)
     with pytest.raises(ValueError, match="75"):
         OptionExecutionLimits(max_long_debit=76)
+    with pytest.raises(ValueError, match="hard caps"):
+        OptionExecutionLimits(max_openings_per_day=4)
+    with pytest.raises(ValueError, match="hard caps"):
+        OptionExecutionLimits(max_open_option_positions=4)
+    with pytest.raises(ValueError, match="hard caps"):
+        OptionExecutionLimits(max_orders_per_day=9)
+    with pytest.raises(ValueError, match="hard caps"):
+        OptionExecutionLimits(max_entry_orders_per_day=7)
+    with pytest.raises(ValueError, match="800"):
+        OptionExecutionLimits(max_daily_notional=801)
+    with pytest.raises(ValueError, match="600"):
+        OptionExecutionLimits(max_entry_daily_notional=601)
+
+
+def test_default_frequency_limits_reserve_shared_exit_capacity():
+    limits = OptionExecutionLimits()
+    assert limits.max_openings_per_day == 3
+    assert limits.max_open_option_positions == 3
+    assert limits.max_orders_per_day == 8
+    assert limits.max_entry_orders_per_day == 6
+    assert limits.max_daily_notional == 800.0
+    assert limits.max_entry_daily_notional == 600.0
+
+
+def test_option_premium_shares_total_and_reserved_entry_notional():
+    entry = evaluate_option_order(
+        order(limit_price=0.60),
+        account(
+            notional_today=550.0,
+            entry_notional_today=550.0,
+        ),
+        now=NOW,
+    )
+    assert "option_order_would_breach_entry_daily_notional" in entry.reasons
+
+    close = order(
+        strategy="close",
+        side="sell",
+        position_effect="close",
+        limit_price=0.60,
+    )
+    assert evaluate_option_order(
+        close,
+        account(
+            notional_today=550.0,
+            entry_notional_today=550.0,
+        ),
+        now=NOW,
+    ).approved
+    total_breach = evaluate_option_order(
+        close,
+        account(
+            notional_today=750.0,
+            entry_notional_today=550.0,
+        ),
+        now=NOW,
+    )
+    assert "option_order_would_breach_daily_notional" in total_breach.reasons
 
 
 @pytest.mark.parametrize(
@@ -200,10 +258,24 @@ def test_cash_secured_put_caps_collateral_and_assignment_concentration():
     assert "cash_secured_put_collateral_exceeds_cap" in collateral.reasons
 
 
-def test_opening_limits_and_mandatory_closes_block_entries():
+def test_third_opening_and_position_are_allowed_but_fourth_is_blocked():
+    third = evaluate_option_order(
+        order(),
+        account(
+            option_openings_today=2,
+            open_option_positions=2,
+            orders_today=2,
+            entry_orders_today=2,
+        ),
+        now=NOW,
+    )
+    assert third.approved
+
     snapshot = account(
-        option_openings_today=1,
-        open_option_positions=2,
+        option_openings_today=3,
+        open_option_positions=3,
+        orders_today=3,
+        entry_orders_today=3,
         mandatory_close_option_ids=("old-option",),
     )
     reasons = evaluate_option_order(order(), snapshot, now=NOW).reasons
@@ -213,7 +285,7 @@ def test_opening_limits_and_mandatory_closes_block_entries():
 
 
 def test_option_order_shares_the_account_daily_order_limit():
-    decision = evaluate_option_order(order(), account(orders_today=4), now=NOW)
+    decision = evaluate_option_order(order(), account(orders_today=8), now=NOW)
     assert "daily_order_count_limit_reached" in decision.reasons
 
 
@@ -235,14 +307,70 @@ def test_mandatory_close_can_clear_halt_before_batch_entry():
     assert decisions[1].approved
 
 
-def test_batch_consumes_one_opening_per_day():
+def test_batch_prioritizes_mandatory_close_before_an_earlier_entry():
+    close = order(
+        option_id="old-option",
+        strategy="close",
+        side="sell",
+        position_effect="close",
+        option_type="call",
+        days_to_expiration=5,
+    )
+    snapshot = account(
+        open_option_positions=3,
+        option_openings_today=2,
+        orders_today=2,
+        entry_orders_today=2,
+        mandatory_close_option_ids=("old-option",),
+    )
+    decisions = evaluate_option_batch([order(), close], snapshot, now=NOW)
+    assert [decision.order.option_id for decision in decisions] == ["old-option", OPTION_ID]
+    assert all(decision.approved for decision in decisions)
+
+
+def test_batch_allows_three_openings_and_blocks_the_fourth():
     decisions = evaluate_option_batch(
-        [order(), order(option_id="second-option", option_type="put", strategy="long_put")],
+        [
+            order(limit_price=0.10),
+            order(option_id="second-option", limit_price=0.10),
+            order(option_id="third-option", limit_price=0.10),
+            order(option_id="fourth-option", limit_price=0.10),
+        ],
         account(),
         now=NOW,
     )
+    assert all(decision.approved for decision in decisions[:3])
+    assert "daily_option_opening_limit_reached" in decisions[3].reasons
+    assert "max_open_option_positions_reached" in decisions[3].reasons
+
+
+def test_entry_cap_reserves_exit_slots_and_total_cap_still_applies():
+    correction = order(
+        option_id="correction-option",
+        strategy="close",
+        side="sell",
+        position_effect="close",
+    )
+    snapshot = account(
+        open_option_positions=1,
+        orders_today=6,
+        entry_orders_today=6,
+    )
+    decisions = evaluate_option_batch([order(), correction], snapshot, now=NOW)
+    assert decisions[0].order.option_id == "correction-option"
     assert decisions[0].approved
-    assert "daily_option_opening_limit_reached" in decisions[1].reasons
+    assert "daily_entry_order_count_limit_reached" in decisions[1].reasons
+
+    total_exhausted = evaluate_option_order(
+        correction,
+        account(
+            open_option_positions=1,
+            orders_today=8,
+            entry_orders_today=6,
+        ),
+        now=NOW,
+    )
+    assert "daily_order_count_limit_reached" in total_exhausted.reasons
 
 
 def test_kill_switch_blocks_option_orders(tmp_path):
@@ -261,7 +389,7 @@ def test_risk_reducing_close_remains_available_during_entry_halts(tmp_path):
     decision = evaluate_option_order(
         close,
         account(
-            orders_today=4,
+            orders_today=7,
             external_halt_reasons=("picker_database_halt:test",),
         ),
         root=tmp_path,

@@ -8,6 +8,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from math import isfinite
 from typing import Any
 
+from .critic_policy import evaluate_critic_policy
 from .models import CriticVerdict, EvidenceVersion, PickerDraft
 from .option_models import (
     OPTION_ACTIONS,
@@ -244,10 +245,17 @@ def _append_evidence_reasons(
         if not item.quote_verified:
             reasons.append(f"ungrounded_quote:{evidence_id}")
     if draft.action not in {"close", "reject"}:
-        if not any(item.primary for item in evidence):
-            reasons.append("no_primary_source")
-        if len({item.independence_group for item in evidence}) < 2:
-            reasons.append("fewer_than_two_independent_sources")
+        if any(item.symbol != draft.underlying for item in evidence):
+            reasons.append("evidence_symbol_mismatch")
+        if not any(
+            item.primary
+            and item.symbol == draft.underlying
+            and item.cik
+            and item.issuer_verified
+            and item.authority in {"sec", "government"}
+            for item in evidence
+        ):
+            reasons.append("no_authoritative_primary_source")
 
 
 def _append_inheritance_reasons(
@@ -255,6 +263,8 @@ def _append_inheritance_reasons(
     draft: OptionDraft,
     critic: CriticVerdict,
     source_draft: PickerDraft | None,
+    analyst_model_id: str,
+    now: datetime,
 ) -> None:
     critic_target = draft.draft_id
     earliest_critic_time = draft.created_at
@@ -275,14 +285,14 @@ def _append_inheritance_reasons(
     elif source_draft is not None:
         reasons.append("unexpected_source_picker_draft")
 
-    if critic.draft_id != critic_target:
-        reasons.append("critic_draft_mismatch")
-    if critic.created_at < earliest_critic_time:
-        reasons.append("critic_predates_draft")
-    if critic.verdict != "pass":
-        reasons.append("critic_veto")
-    if critic.contradicted_evidence_ids:
-        reasons.append("critic_found_contradicted_evidence")
+    critic_policy = evaluate_critic_policy(
+        critic,
+        draft_id=critic_target,
+        draft_created_at=earliest_critic_time,
+        analyst_model_id=analyst_model_id,
+        now=now,
+    )
+    reasons.extend(critic_policy.reasons)
 
 
 def _open_positions(
@@ -338,9 +348,14 @@ def validate_option_draft(
     if any(not position.verify_hash() for position in positions):
         reasons.append("active_position_hash_mismatch")
 
-    _append_inheritance_reasons(reasons, draft, critic, source_draft)
-    if "grok" not in critic.model_id.lower() or critic.model_id == model_id:
-        reasons.append("critic_model_not_independent")
+    _append_inheritance_reasons(
+        reasons,
+        draft,
+        critic,
+        source_draft,
+        model_id,
+        now,
+    )
     _append_evidence_reasons(reasons, draft, evidence_by_id, now)
 
     matching_position: ActiveOptionPosition | None = None

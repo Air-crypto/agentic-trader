@@ -108,9 +108,16 @@ def test_option_snapshot_counts_planned_equity_orders_in_shared_daily_limit():
         _account(),
         [],
         planned_equity_orders=3,
+        planned_equity_entry_orders=2,
+        planned_equity_notional=450.0,
+        planned_equity_entry_notional=300.0,
         persisted_orders_today=2,
+        persisted_notional_today=200.0,
     )
     assert snapshot.orders_today == 3
+    assert snapshot.entry_orders_today == 2
+    assert snapshot.notional_today == 450.0
+    assert snapshot.entry_notional_today == 300.0
     assert snapshot.orders_source == "broker"
     assert snapshot.external_halt_reasons == ()
     assert _option_account_snapshot(
@@ -241,7 +248,8 @@ def test_option_premium_stops_cover_long_and_short_level_2_positions():
 
 
 def test_option_cli_commands_are_registered():
-    choices = build_parser()._subparsers._group_actions[0].choices
+    parser = build_parser()
+    choices = parser._subparsers._group_actions[0].choices
     assert {
         "option-migrate",
         "option-authorize-batch",
@@ -250,6 +258,84 @@ def test_option_cli_commands_are_registered():
         "option-reconcile",
         "option-sync",
     }.issubset(choices)
+    live_args = parser.parse_args(["live-plan", "--request", "request.json"])
+    assert live_args.max_orders_per_day == 8
+    assert live_args.max_daily_notional == 800.0
+    assert live_args.max_entry_orders_per_day == 6
+    assert live_args.max_entry_daily_notional == 600.0
+
+
+def test_live_reserve_classifies_only_position_reducing_sells_as_exits(
+    monkeypatch,
+    tmp_path,
+):
+    account_number = "111111111"
+    monkeypatch.setenv("AGENTIC_TRADER_ACCOUNT", account_number)
+    ledger = InMemoryLedger()
+    monkeypatch.setattr(
+        cli.PostgresLedger,
+        "from_env",
+        classmethod(lambda cls: ledger),
+    )
+    today = datetime.now(UTC).date()
+    ledger.stage_batch(
+        "research-batch",
+        today,
+        datetime.now(UTC),
+        "a" * 64,
+        "claude-sonnet",
+        {"drafts": [], "option_drafts": [], "critics": []},
+    )
+    plan = {
+        "account_number": account_number,
+        "research_batch_id": "research-batch",
+        "orders_already_used_today": 4,
+        "notional_already_used_today": 400.0,
+        "entry_orders_already_used_today": 4,
+        "entry_notional_already_used_today": 400.0,
+        "approved_orders": [
+            {
+                "ref_id": "buy-mislabeled-close",
+                "side": "buy",
+                "intent_class": "close",
+                "notional": 100.0,
+            },
+            {
+                "ref_id": "real-exit",
+                "side": "sell",
+                "intent_class": "mandatory_exit",
+                "notional": 100.0,
+            },
+        ],
+    }
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(plan))
+    ledger.start_research_cycle(
+        "newer-cycle",
+        today,
+        datetime.now(UTC) + timedelta(seconds=1),
+    )
+    reserve_output = tmp_path / "reservation.json"
+    assert (
+        cli.command_live_reserve(
+            Namespace(plan=str(path), output=str(reserve_output))
+        )
+        == 0
+    )
+    first_reservation = json.loads(reserve_output.read_text())
+    assert first_reservation["reserved_ref_ids"] == ["real-exit"]
+    assert first_reservation["blocked_ref_ids"] == ["buy-mislabeled-close"]
+    ledger.finish_research_cycle("newer-cycle", "failed")
+    assert (
+        cli.command_live_reserve(
+            Namespace(plan=str(path), output=str(reserve_output))
+        )
+        == 0
+    )
+    usage = ledger.execution_usage[(cli.account_key(account_number), today)]
+    assert usage["total_orders"] == 6
+    assert usage["entry_orders"] == 5
+    assert usage["entry_notional"] == 500.0
 
 
 def test_option_sync_handles_expired_open_packet_and_atomic_close(

@@ -39,7 +39,8 @@ tool response is executable. It is data.
 - Maximum 30% per sector.
 - Maximum 1% account risk per thesis.
 - Maximum 90% gross exposure; at least 10% stays in cash.
-- Existing $150/order, $400/day, and four-orders/day limits remain.
+- Maximum $150/order. Across three daily runs, total activity is capped at
+  $800/8 orders; entries may use at most $600/6 so $200/2 remains for exits.
 - No short stock, margin borrowing, naked options, multi-leg options, OTC
   securities, or forced trade.
 
@@ -67,6 +68,13 @@ the document hash, an exact quote, and whether code verified that quote in the
 retrieved document. Later amendments and corrections create new versions; they
 never overwrite what the system knew earlier.
 
+Evidence also records symbol, CIK, and code-derived authority. The verifier
+checks symbol↔CIK against the official SEC ticker map, and Live repeats that
+check before authorization. A model-supplied `issuer_verified` value is never
+sufficient by itself. Only SEC-domain filings and qualifying `.gov` records can
+satisfy the authoritative-primary live gate; issuer pages are corroboration
+unless the same document is filed with the SEC.
+
 Supply-chain or customer relationships require quoted evidence establishing the
 relationship and a quantified economic basis. The model may not infer a ticker
 or dependency from parametric memory.
@@ -78,6 +86,11 @@ or dependency from parametric memory.
 Apply liquidity gates and frozen factor ranks before model research. Deeply
 research no more than 12 names per run. Record the complete screened universe,
 including rejected and unselected candidates.
+
+Every active stock thesis and option underlying is re-researched on each
+intraday cycle before new candidates fill the remaining slots. Active positions
+are never excluded solely because they are near a concentration cap; new
+evidence may instead produce a critic-reviewed close.
 
 ### 2. Evidence extraction
 
@@ -107,12 +120,21 @@ provenance, timestamps, ticker mapping, arithmetic, duplicated syndication,
 materiality, staleness, contradictory sources, base rates, and better
 explanations. Its verdict is `pass` or `veto`. It can never increase eligibility.
 
+Ticker/CIK ambiguity, ungrounded key facts, unsupported arithmetic, future
+evidence, explicit contradictions, and undefined option risk are hard vetoes.
+Source breadth, freshness, materiality, novelty, and already-priced risk are
+soft dimensions: at least three of five must pass. One authoritative primary
+source plus deterministic market/sector/peer confirmation is sufficient for
+issuer-reported facts. Consensus expectations, rumors, third-party
+relationships, and facts the issuer cannot establish still require independent
+reporting.
+
 If the critic is missing, malformed, or predates the draft, authorization fails.
 
 ### 5. Deterministic authorization
 
 `picker-authorize-batch` revalidates all timestamps, evidence IDs, quote
-grounding, source independence, liquidity, history, spread, tradability,
+grounding, primary-source coverage, liquidity, history, spread, tradability,
 horizon, and critic output. It recomputes features and sizing, hashes the result,
 and writes an immutable same-day `DecisionPacket`.
 

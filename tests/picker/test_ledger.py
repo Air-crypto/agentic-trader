@@ -332,3 +332,99 @@ def test_pending_batch_requires_separate_finalization(now):
     ledger.finalize_pending_batch("pending-1", "finalized", now)
     assert ledger.latest_pending_batch(now.date()) is None
     ledger.finalize_pending_batch("pending-1", "finalized", now)
+
+
+def test_research_cycle_marker_blocks_until_finalized(now):
+    ledger = InMemoryLedger()
+    ledger.start_research_cycle("cycle-1", now.date(), now)
+    assert ledger.latest_unfinished_cycle(now.date())["cycle_id"] == "cycle-1"
+    ledger.bind_research_cycle("cycle-1", "batch-1")
+    assert ledger.latest_unfinished_cycle(now.date())["status"] == "pending"
+    ledger.finish_research_cycle("cycle-1", "finalized")
+    assert ledger.latest_unfinished_cycle(now.date()) is None
+
+
+def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
+    ledger = InMemoryLedger()
+    account_hash = "account-hash"
+    ledger.stage_batch(
+        "research-batch",
+        now.date(),
+        now,
+        "a" * 64,
+        "claude-sonnet",
+        {"drafts": [], "option_drafts": [], "critics": []},
+    )
+    usage = ledger.reserve_execution_budget(
+        account_hash,
+        now.date(),
+        [
+            ("entry-1", 100.0, True, False),
+            ("entry-2", 100.0, True, False),
+        ],
+        observed_usage=(4, 400.0, 4, 400.0),
+        research_batch_id="research-batch",
+    )
+    assert usage == {
+        "total_orders": 6,
+        "total_notional": 600.0,
+        "entry_orders": 6,
+        "entry_notional": 600.0,
+        "option_openings": 0,
+    }
+    # Exact retries are idempotent.
+    assert ledger.reserve_execution_budget(
+        account_hash,
+        now.date(),
+        [
+            ("entry-1", 100.0, True, False),
+            ("entry-2", 100.0, True, False),
+        ],
+        observed_usage=(4, 400.0, 4, 400.0),
+        research_batch_id="research-batch",
+    ) == usage
+    exits = ledger.reserve_execution_budget(
+        account_hash,
+        now.date(),
+        [
+            ("exit-1", 100.0, False, False),
+            ("exit-2", 100.0, False, False),
+        ],
+        observed_usage=(4, 400.0, 4, 400.0),
+    )
+    assert exits["total_orders"] == 8
+    assert exits["total_notional"] == 800.0
+    assert exits["entry_orders"] == 6
+    with pytest.raises(RuntimeError, match="budget"):
+        ledger.reserve_execution_budget(
+            account_hash,
+            now.date(),
+            [("too-much", 25.0, False, False)],
+        )
+
+
+def test_durable_budget_atomically_limits_concurrent_option_openings(now):
+    ledger = InMemoryLedger()
+    ledger.stage_batch(
+        "option-research-batch",
+        now.date(),
+        now,
+        "a" * 64,
+        "claude-sonnet",
+        {"drafts": [], "option_drafts": [], "critics": []},
+    )
+    ledger.reserve_execution_budget(
+        "account-hash",
+        now.date(),
+        [("option-open-1", 50.0, True, True)],
+        observed_open_option_positions=2,
+        research_batch_id="option-research-batch",
+    )
+    with pytest.raises(RuntimeError, match="budget"):
+        ledger.reserve_execution_budget(
+            "account-hash",
+            now.date(),
+            [("option-open-2", 50.0, True, True)],
+            observed_open_option_positions=2,
+            research_batch_id="option-research-batch",
+        )
