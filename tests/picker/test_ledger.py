@@ -45,17 +45,21 @@ def populated_ledger(draft, evidence, critic, now):
     return ledger
 
 
-def test_prior_close_is_durable_and_immutable_within_session():
+def test_prior_close_write_fails_closed_without_verified_reconstruction():
     ledger = InMemoryLedger()
     first = date(2026, 8, 20)
-    assert ledger.record_prior_close("account", 1000.0, first) == 1000.0
-    assert ledger.record_prior_close("account", 1000.0, first) == 1000.0
-    with pytest.raises(ValueError, match="immutable"):
-        ledger.record_prior_close("account", 999.0, first)
-    assert ledger.record_prior_close("account", 1010.0, date(2026, 8, 21)) == 1010.0
-    state = ledger.control_state("account")
-    assert state["prior_close_equity"] == 1010.0
-    assert state["prior_close_date"] == date(2026, 8, 21)
+    metric_at = datetime(2026, 8, 20, 20, 0, tzinfo=UTC)
+    with pytest.raises(RuntimeError, match="writes are disabled"):
+        ledger.record_prior_close(
+            "account",
+            1000.0,
+            first,
+            metric_at=metric_at,
+            observed_at=metric_at,
+            source="robinhood_official_regular_close",
+            artifact_hash="a" * 64,
+        )
+    assert ledger.control_state("account")["prior_close_equity"] is None
 
 
 def test_authorized_packet_round_trip(draft, evidence, quant, critic, now):
@@ -389,16 +393,17 @@ def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
             ("entry-1", 100.0, True, False),
             ("entry-2", 100.0, True, False),
         ],
-        observed_usage=(4, 400.0, 4, 400.0),
+        observed_usage=(0, 0.0, 0, 0.0),
         research_batch_id="research-batch",
     )
     assert usage == {
-        "total_orders": 6,
-        "total_notional": 600.0,
-        "entry_orders": 6,
-        "entry_notional": 600.0,
+        "total_orders": 2,
+        "total_notional": 200.0,
+        "entry_orders": 2,
+        "entry_notional": 200.0,
         "option_openings": 0,
     }
+    assert ledger.execution_budget_usage(account_hash, now.date()) == usage
     # Exact retries are idempotent.
     assert (
         ledger.reserve_execution_budget(
@@ -408,7 +413,7 @@ def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
                 ("entry-1", 100.0, True, False),
                 ("entry-2", 100.0, True, False),
             ],
-            observed_usage=(4, 400.0, 4, 400.0),
+            observed_usage=(0, 0.0, 0, 0.0),
             research_batch_id="research-batch",
         )
         == usage
@@ -420,18 +425,18 @@ def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
             ("exit-1", 100.0, False, False),
             ("exit-2", 100.0, False, False),
         ],
-        observed_usage=(4, 400.0, 4, 400.0),
+        observed_usage=(0, 0.0, 0, 0.0),
     )
-    assert exits["total_orders"] == 8
-    assert exits["total_notional"] == 800.0
-    assert exits["entry_orders"] == 6
+    assert exits["total_orders"] == 4
+    assert exits["total_notional"] == 400.0
+    assert exits["entry_orders"] == 2
     over_cap_exit = ledger.reserve_execution_budget(
         account_hash,
         now.date(),
         [("risk-reducing-exit", 250.0, False, False)],
     )
-    assert over_cap_exit["total_orders"] == 9
-    assert over_cap_exit["total_notional"] == 1050.0
+    assert over_cap_exit["total_orders"] == 5
+    assert over_cap_exit["total_notional"] == 650.0
 
     with pytest.raises(RuntimeError, match="budget"):
         ledger.reserve_execution_budget(
@@ -439,6 +444,104 @@ def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
             now.date(),
             [("blocked-entry", 25.0, True, False)],
             research_batch_id="research-batch",
+        )
+
+
+def test_durable_control_distinguishes_entry_and_all_order_halts():
+    ledger = InMemoryLedger()
+    ledger.halt("account-hash", "drawdown")
+    assert ledger.control_state("account-hash")["halt_scope"] == "entries"
+    ledger.halt("account-hash", "reconciliation", scope="all")
+    assert ledger.control_state("account-hash")["halt_scope"] == "all"
+    with pytest.raises(ValueError, match="scope"):
+        ledger.halt("account-hash", "invalid", scope="unknown")
+
+
+def test_cloud_reservation_binding_grants_one_placement_claim(now):
+    ledger = InMemoryLedger()
+    ledger.stage_batch(
+        "research-batch",
+        now.date(),
+        now,
+        "a" * 64,
+        "gpt-5.5",
+        {"drafts": [], "option_drafts": [], "critics": []},
+    )
+    order = [("ref-1", 100.0, True, False)]
+    bindings = {
+        "ref-1": (
+            "plan-1",
+            "confirmation-1",
+            "attempt-1",
+            now,
+            "b" * 64,
+            "c" * 64,
+        )
+    }
+
+    first = ledger.reserve_execution_budget(
+        "account-hash",
+        now.date(),
+        order,
+        max_entry_orders=2,
+        max_entry_notional=300.0,
+        research_batch_id="research-batch",
+        reservation_bindings=bindings,
+    )
+    second = ledger.reserve_execution_budget(
+        "account-hash",
+        now.date(),
+        order,
+        max_entry_orders=2,
+        max_entry_notional=300.0,
+        research_batch_id="research-batch",
+        reservation_bindings=bindings,
+    )
+
+    assert first["newly_reserved_ref_ids"] == ["ref-1"]
+    assert first["already_reserved_ref_ids"] == []
+    assert second["newly_reserved_ref_ids"] == []
+    assert second["already_reserved_ref_ids"] == ["ref-1"]
+    assert ledger.execution_reservations["ref-1"]["attempt_id"] == "attempt-1"
+    assert ledger.execution_reservations["ref-1"]["authority_fingerprint_hash"] == "c" * 64
+
+    # The budget ledger recognizes a fresh-snapshot retry as the same spend but
+    # leaves the freshness mutation to the cloud store's guarded CAS.
+    refreshed_bindings = {
+        "ref-1": (
+            "plan-1",
+            "confirmation-1",
+            "attempt-1",
+            now + timedelta(seconds=20),
+            "d" * 64,
+            "c" * 64,
+        )
+    }
+    refreshed = ledger.reserve_execution_budget(
+        "account-hash",
+        now.date(),
+        order,
+        max_entry_orders=2,
+        max_entry_notional=300.0,
+        research_batch_id="research-batch",
+        reservation_bindings=refreshed_bindings,
+    )
+    assert refreshed["newly_reserved_ref_ids"] == []
+    assert refreshed["already_reserved_ref_ids"] == ["ref-1"]
+    assert ledger.execution_reservations["ref-1"]["validation_snapshot_hash"] == "b" * 64
+
+    changed_authority = {
+        "ref-1": (*refreshed_bindings["ref-1"][:5], "e" * 64),
+    }
+    with pytest.raises(ValueError, match="immutable"):
+        ledger.reserve_execution_budget(
+            "account-hash",
+            now.date(),
+            order,
+            max_entry_orders=2,
+            max_entry_notional=300.0,
+            research_batch_id="research-batch",
+            reservation_bindings=changed_authority,
         )
 
 

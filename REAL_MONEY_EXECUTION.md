@@ -19,9 +19,9 @@ The scheduled run must stop after broker review and present, at minimum:
 - plan ID and five-minute expiry time;
 - the deterministic reasons the order passed or failed.
 
-Only an explicit reply confirming that exact order authorizes a resumed run to reserve and place it. A schedule, `MODE=live`, prior consent, a standing instruction, or approval of a different price or quantity is not sufficient.
+Only a later reply carrying a valid Ed25519 signature over that exact plan ID and review hash authorizes a resumed run to reserve and place it. A schedule, `MODE=live`, prior consent, a standing instruction, or approval of a different price or quantity is not sufficient. The private key stays on the user's Mac.
 
-Before acting on confirmation, the resumed run must re-read the plan, account, positions, open orders, quote, and market session. If five minutes have elapsed or any material order input has changed, the old confirmation is void. Regenerate the plan, obtain a new Robinhood review, show the new exact order, and ask again.
+Before acting on confirmation, the resumed run must re-read the plan, account, positions, open orders, quote, and market session. The unchanged reviewed broker parameters are re-evaluated under current durable usage and risk controls. If five minutes have elapsed or fresh state no longer authorizes them, the old confirmation is void. Regenerate the plan, obtain a new Robinhood review, show the new exact order, and ask again.
 
 ## Portfolio and loss limits
 
@@ -66,17 +66,17 @@ The scheduled tasks do not open options. They also do not close, cancel, roll, o
 
 ## Transactional lifecycle
 
-1. Reconcile broker positions, orders, fills, buying power, and session.
-2. Create a deterministic plan with a five-minute expiry.
-3. Request the broker's nonplacing order review.
-4. Display the exact order and wait for user confirmation.
-5. On a resumed run, validate that the plan and confirmation are still current.
-6. Reserve risk limits transactionally.
-7. Place once with a stable client order ID.
-8. Reconcile the broker response; never retry blindly after an ambiguous timeout.
-9. Append the decision, confirmation, reservation, placement, and reconciliation events.
+1. Pass the read-only migration checksum check and acquire a durable scheduled-window lease.
+2. Reconcile broker positions, orders, fills, buying power, session, and every nonterminal Supabase attempt.
+3. Persist the broker-snapshot hash, redacted artifacts, account hash, and deterministic five-minute plan in Supabase.
+4. Request the broker's nonplacing order review and persist the exact `order_checks`, full `quote_data`, verbatim market-data disclosure, complete native response, and exact request parameters under a review hash.
+5. Display the exact order and a local `confirmation-sign` command. Wait for its one-line `CONFIRM <plan_id> <review_hash> SIGNATURE <signature>` output in a later user turn.
+6. On the resumed turn, cryptographically verify and persist that exact confirmation, then revalidate expiry, identity, plan hash, broker state, session, usage, risk, and quotes. A failed revalidation requires a new review and signature.
+7. Persist a prepared attempt, reserve risk limits transactionally, and return exact broker parameters only for a newly safe attempt.
+8. Mark the attempt `submitting`, place once with its stable client order ID, then immediately persist `submitted` or `unknown`.
+9. Reconcile broker truth; never retry an unknown result. Persist the result, transition terminal attempts, and append every audit event in Supabase.
 
-Reservation and idempotency reduce concurrency risk, but the broker is authoritative. If local and broker state disagree, stop new activity until reconciliation is complete.
+The database, not a local artifact, carries the plan/confirmation/attempt handshake across VMs. Reservation and idempotency reduce concurrency risk, but Robinhood remains authoritative. If database and broker state disagree, an all-order durable halt blocks new activity until reconciliation is complete.
 
 ## Evidence and model boundaries
 
@@ -96,4 +96,8 @@ Before confirming an order:
 4. Confirm that no current/manual holding will be changed unintentionally.
 5. Confirm only that one exact order; do not use a general authorization phrase.
 
-Create a root-level `KILL_SWITCH` file whenever trading should stop. Keep `DATABASE_URL` and `AGENTIC_TRADER_NET_DEPOSITS` configured, and never store broker or model credentials in source control.
+Use the durable database halt whenever cloud trading should stop; a reconciliation breach engages its all-order scope automatically. A root-level `KILL_SWITCH` is an additional local override, not cloud authority. Keep `DATABASE_URL`, `AGENTIC_TRADER_NET_DEPOSITS`, and `AGENTIC_TRADER_CONFIRMATION_PUBLIC_KEY` in the runtime secret store. Keep the matching private key only on the user's Mac, and never store broker or model credentials in source control.
+
+The repository cannot physically intercept direct calls to a write-capable Robinhood MCP. For a hard order boundary, scheduled automation must receive only read/review broker tools; placement must be exposed through a separate user-triggered executor or proxy that verifies the signature and newly acquired database claim. If all Robinhood tools are attached to one Cursor automation, no-placement remains a prompt-enforced rule rather than a tool-permission guarantee.
+
+Inspect the durable controls with `live-control-status --snapshot <native-broker-snapshot>` and engage an emergency stop with `live-halt --snapshot <native-broker-snapshot> --scope all --reason <reason>`. There is deliberately no automation-callable resume command; clearing an all-order halt requires a separately reviewed operator/database procedure after broker reconciliation.

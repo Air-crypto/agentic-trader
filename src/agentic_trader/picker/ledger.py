@@ -21,11 +21,68 @@ from .option_models import ActiveOptionPosition, OptionDecisionPacket
 
 DATABASE_URL_ENV = "DATABASE_URL"
 RESEARCH_CYCLE_TTL = timedelta(hours=6)
+ReservationBinding = tuple[str, str, str, datetime, str, str]
+OFFICIAL_CLOSE_SOURCE = "robinhood_official_regular_close"
 
 
 def account_key(account_number: str) -> str:
     """Irreversible account identifier suitable for a shared decision ledger."""
     return hashlib.sha256(account_number.encode()).hexdigest()
+
+
+def _validate_reservation_bindings(
+    reservation_bindings: dict[str, ReservationBinding] | None,
+    ref_ids: set[str],
+) -> None:
+    if reservation_bindings is None:
+        return
+    if set(reservation_bindings) != ref_ids:
+        raise ValueError("Reservation bindings must cover every ref_id exactly once")
+    for binding in reservation_bindings.values():
+        if len(binding) != 6:
+            raise ValueError(
+                "Cloud reservation bindings require plan, confirmation, attempt, time, "
+                "snapshot hash, and authority hash"
+            )
+        (
+            plan_id,
+            confirmation_id,
+            attempt_id,
+            validated_at,
+            snapshot_hash,
+            authority_hash,
+        ) = binding
+        if not all(str(value).strip() for value in (plan_id, confirmation_id, attempt_id)):
+            raise ValueError("Cloud reservation identity cannot be empty")
+        if validated_at.tzinfo is None:
+            raise ValueError("Cloud reservation validation time must be timezone-aware")
+        if len(snapshot_hash) != 64:
+            raise ValueError("Cloud reservation snapshot hash must be SHA-256")
+        if len(authority_hash) != 64:
+            raise ValueError("Cloud reservation authority hash must be SHA-256")
+
+
+def _validated_close_provenance(
+    metric_at: datetime,
+    observed_at: datetime,
+    source: str,
+    artifact_hash: str,
+) -> tuple[datetime, datetime, str, str]:
+    if metric_at.tzinfo is None or observed_at.tzinfo is None:
+        raise ValueError("Prior-close provenance timestamps must be timezone-aware")
+    metric_at = metric_at.astimezone(UTC)
+    observed_at = observed_at.astimezone(UTC)
+    source = source.strip()
+    artifact_hash = artifact_hash.strip().lower()
+    if source != OFFICIAL_CLOSE_SOURCE:
+        raise ValueError("Prior-close provenance must identify the official regular close")
+    if observed_at < metric_at:
+        raise ValueError("Prior-close observation cannot precede its metric timestamp")
+    if len(artifact_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in artifact_hash
+    ):
+        raise ValueError("Prior-close provenance requires a SHA-256 artifact hash")
+    return metric_at, observed_at, source, artifact_hash
 
 
 def _validate_option_reservation(
@@ -79,9 +136,9 @@ def _validate_execution_reservation(
         not ref_id or not isfinite(notional) or notional <= 0 for ref_id, notional, _, _ in orders
     ):
         raise ValueError("Execution reservation notionals must be finite and positive")
-    if not 0 < max_orders <= 8 or not 0 < max_entry_orders <= min(max_orders, 6):
+    if not 0 < max_orders <= 8 or not 0 < max_entry_orders <= min(max_orders, 2):
         raise ValueError("Execution order caps cannot relax hard limits")
-    if not 0 < max_notional <= 800 or not 0 < max_entry_notional <= min(max_notional, 600):
+    if not 0 < max_notional <= 800 or not 0 < max_entry_notional <= min(max_notional, 300):
         raise ValueError("Execution notional caps cannot relax hard limits")
 
 
@@ -127,7 +184,11 @@ class PickerLedger(Protocol):
         self, valid_for: date, now: datetime | None = None
     ) -> list[DecisionPacket]: ...
 
+    def packet(self, packet_id: str) -> DecisionPacket | None: ...
+
     def upsert_thesis(self, thesis: ActiveThesis) -> None: ...
+
+    def thesis(self, pick_id: str) -> ActiveThesis | None: ...
 
     def active_theses(self) -> list[ActiveThesis]: ...
 
@@ -135,9 +196,23 @@ class PickerLedger(Protocol):
 
     def record_equity_peak(self, account_hash: str, equity: float) -> float: ...
 
-    def record_prior_close(self, account_hash: str, equity: float, session_date: date) -> float: ...
+    def record_prior_close(
+        self,
+        account_hash: str,
+        equity: float,
+        session_date: date,
+        *,
+        metric_at: datetime,
+        observed_at: datetime,
+        source: str,
+        artifact_hash: str,
+    ) -> float: ...
 
-    def halt(self, account_hash: str, reason: str) -> None: ...
+    def halt(self, account_hash: str, reason: str, scope: str = "entries") -> None: ...
+
+    def same_session_exit_symbols(self, account_hash: str, session_date: date) -> set[str]: ...
+
+    def equity_order_event(self, ref_id: str, event_type: str) -> dict[str, Any] | None: ...
 
     def put_outcome(self, outcome: OutcomeMark) -> None: ...
 
@@ -151,6 +226,9 @@ class PickerLedger(Protocol):
         packet_id: str | None = None,
         ref_id: str,
         broker_order_id: str | None = None,
+        account_hash: str | None = None,
+        symbol: str | None = None,
+        session_date: date | None = None,
     ) -> None: ...
 
     def stage_batch(
@@ -289,6 +367,16 @@ class PickerLedger(Protocol):
         occurred_at: datetime | None = None,
     ) -> None: ...
 
+    def execution_budget_usage(
+        self,
+        account_hash: str,
+        trade_date: date,
+    ) -> dict[str, float | int]: ...
+
+    def execution_reservations_for_session(
+        self, account_hash: str, trade_date: date
+    ) -> list[dict[str, Any]]: ...
+
     def reserve_execution_budget(
         self,
         account_hash: str,
@@ -297,13 +385,14 @@ class PickerLedger(Protocol):
         *,
         max_orders: int = 8,
         max_notional: float = 800.0,
-        max_entry_orders: int = 6,
-        max_entry_notional: float = 600.0,
+        max_entry_orders: int = 2,
+        max_entry_notional: float = 300.0,
         observed_usage: tuple[int, float, int, float] = (0, 0.0, 0, 0.0),
         max_option_openings: int = 3,
         observed_open_option_positions: int = 0,
         research_batch_id: str = "",
-    ) -> dict[str, float | int]: ...
+        reservation_bindings: dict[str, ReservationBinding] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class InMemoryLedger:
@@ -417,8 +506,15 @@ class InMemoryLedger:
             key=lambda item: (-item.rank_score, item.symbol),
         )
 
+    def packet(self, packet_id: str) -> DecisionPacket | None:
+        packet = self.packets.get(packet_id)
+        return packet if packet is not None else None
+
     def upsert_thesis(self, thesis: ActiveThesis) -> None:
         self.theses[thesis.pick_id] = thesis
+
+    def thesis(self, pick_id: str) -> ActiveThesis | None:
+        return self.theses.get(pick_id)
 
     def active_theses(self) -> list[ActiveThesis]:
         return sorted(
@@ -440,43 +536,95 @@ class InMemoryLedger:
                     "high_water_mark": None,
                     "prior_close_equity": None,
                     "prior_close_date": None,
+                    "prior_close_metric_at": None,
+                    "prior_close_observed_at": None,
+                    "prior_close_source": None,
+                    "prior_close_artifact_hash": None,
                     "cooldown_until": None,
+                    "halt_scope": "entries",
                 },
             )
         )
 
     def record_equity_peak(self, account_hash: str, equity: float) -> float:
-        if equity <= 0:
-            raise ValueError("Equity must be positive")
+        if not isfinite(equity) or equity <= 0:
+            raise ValueError("Equity must be finite and positive")
         state = self.control_state(account_hash)
         previous = state.get("high_water_mark")
+        if previous is not None and not isfinite(float(previous)):
+            raise ValueError("Stored equity peak is not finite")
         peak = equity if previous is None else max(float(previous), equity)
         state["high_water_mark"] = peak
         self.controls[account_hash] = state
         return peak
 
-    def record_prior_close(self, account_hash: str, equity: float, session_date: date) -> float:
+    def record_prior_close(
+        self,
+        account_hash: str,
+        equity: float,
+        session_date: date,
+        *,
+        metric_at: datetime,
+        observed_at: datetime,
+        source: str,
+        artifact_hash: str,
+    ) -> float:
+        raise RuntimeError(
+            "Prior-close writes are disabled until broker-verified close reconstruction exists"
+        )
         if not isfinite(equity) or equity <= 0:
             raise ValueError("Prior-close equity must be finite and positive")
+        metric_at, observed_at, source, artifact_hash = _validated_close_provenance(
+            metric_at, observed_at, source, artifact_hash
+        )
         state = self.control_state(account_hash)
         previous_date = state.get("prior_close_date")
         previous_equity = state.get("prior_close_equity")
         if previous_date is not None and previous_date > session_date:
             raise ValueError("Cannot move the prior-close session backward")
         if previous_date == session_date:
-            if previous_equity is None or abs(float(previous_equity) - equity) > 1e-6:
+            immutable = (
+                previous_equity is not None
+                and abs(float(previous_equity) - equity) <= 1e-6
+                and state.get("prior_close_metric_at") == metric_at
+                and state.get("prior_close_observed_at") == observed_at
+                and state.get("prior_close_source") == source
+                and state.get("prior_close_artifact_hash") == artifact_hash
+            )
+            if not immutable:
                 raise ValueError("Prior-close equity is immutable within a session")
             return float(previous_equity)
         state["prior_close_equity"] = equity
         state["prior_close_date"] = session_date
+        state["prior_close_metric_at"] = metric_at
+        state["prior_close_observed_at"] = observed_at
+        state["prior_close_source"] = source
+        state["prior_close_artifact_hash"] = artifact_hash
         self.controls[account_hash] = state
         return equity
 
-    def halt(self, account_hash: str, reason: str) -> None:
+    def halt(self, account_hash: str, reason: str, scope: str = "entries") -> None:
+        if scope not in {"entries", "all"}:
+            raise ValueError("Halt scope must be entries or all")
         state = self.control_state(account_hash)
         state["halted"] = True
         state["halt_reason"] = reason
+        state["halt_scope"] = scope
         self.controls[account_hash] = state
+
+    def same_session_exit_symbols(self, account_hash: str, session_date: date) -> set[str]:
+        return {
+            str(event["symbol"]).upper()
+            for event in self.equity_order_events.values()
+            if event["event_type"] in {"exit_filled", "stop_filled", "mandatory_exit_filled"}
+            and event.get("account_key") == account_hash
+            and event.get("session_date") == session_date
+            and event.get("symbol")
+        }
+
+    def equity_order_event(self, ref_id: str, event_type: str) -> dict[str, Any] | None:
+        event = self.equity_order_events.get((ref_id, event_type))
+        return dict(event) if event is not None else None
 
     def put_outcome(self, outcome: OutcomeMark) -> None:
         key = (outcome.packet_id, outcome.horizon_days)
@@ -495,6 +643,9 @@ class InMemoryLedger:
         packet_id: str | None = None,
         ref_id: str,
         broker_order_id: str | None = None,
+        account_hash: str | None = None,
+        symbol: str | None = None,
+        session_date: date | None = None,
     ) -> None:
         if not ref_id or not event_type:
             raise ValueError("Equity order events require ref_id and event_type")
@@ -507,6 +658,9 @@ class InMemoryLedger:
             "event_type": event_type,
             "occurred_at": occurred_at,
             "payload": dict(payload),
+            "account_key": account_hash,
+            "symbol": str(symbol).upper() if symbol else None,
+            "session_date": session_date,
         }
         existing = self.equity_order_events.get(key)
         if existing is not None and existing != record:
@@ -992,13 +1146,14 @@ class InMemoryLedger:
         *,
         max_orders: int = 8,
         max_notional: float = 800.0,
-        max_entry_orders: int = 6,
-        max_entry_notional: float = 600.0,
+        max_entry_orders: int = 2,
+        max_entry_notional: float = 300.0,
         observed_usage: tuple[int, float, int, float] = (0, 0.0, 0, 0.0),
         max_option_openings: int = 3,
         observed_open_option_positions: int = 0,
         research_batch_id: str = "",
-    ) -> dict[str, float | int]:
+        reservation_bindings: dict[str, ReservationBinding] | None = None,
+    ) -> dict[str, Any]:
         _validate_execution_reservation(
             orders,
             max_orders,
@@ -1009,6 +1164,8 @@ class InMemoryLedger:
         _validate_observed_execution_usage(observed_usage)
         if not 0 < max_option_openings <= 3 or observed_open_option_positions < 0:
             raise ValueError("Option opening limits cannot relax hard caps")
+        ref_ids = {ref_id for ref_id, _, _, _ in orders}
+        _validate_reservation_bindings(reservation_bindings, ref_ids)
         if any(is_entry for _, _, is_entry, _ in orders):
             latest_batch = self.latest_research_batch(trade_date)
             if (
@@ -1028,9 +1185,41 @@ class InMemoryLedger:
                 "notional": float(notional),
                 "is_entry": bool(is_entry),
                 "is_option_open": bool(is_option_open),
+                "plan_id": (
+                    reservation_bindings[ref_id][0] if reservation_bindings is not None else None
+                ),
+                "confirmation_id": (
+                    reservation_bindings[ref_id][1] if reservation_bindings is not None else None
+                ),
+                "attempt_id": (
+                    reservation_bindings[ref_id][2] if reservation_bindings is not None else None
+                ),
+                "validated_at": (
+                    reservation_bindings[ref_id][3].astimezone(UTC)
+                    if reservation_bindings is not None
+                    else None
+                ),
+                "validation_snapshot_hash": (
+                    reservation_bindings[ref_id][4] if reservation_bindings is not None else None
+                ),
+                "authority_fingerprint_hash": (
+                    reservation_bindings[ref_id][5] if reservation_bindings is not None else None
+                ),
             }
             if existing is not None:
-                if existing != record:
+                immutable_keys = {
+                    "ref_id",
+                    "account_key",
+                    "trade_date",
+                    "notional",
+                    "is_entry",
+                    "is_option_open",
+                    "plan_id",
+                    "confirmation_id",
+                    "attempt_id",
+                    "authority_fingerprint_hash",
+                }
+                if any(existing.get(key) != record.get(key) for key in immutable_keys):
                     raise ValueError(f"Execution reservation {ref_id} is immutable")
             else:
                 new_orders.append(
@@ -1096,9 +1285,66 @@ class InMemoryLedger:
                 "notional": notional,
                 "is_entry": is_entry,
                 "is_option_open": is_option_open,
+                "plan_id": (
+                    reservation_bindings[ref_id][0] if reservation_bindings is not None else None
+                ),
+                "confirmation_id": (
+                    reservation_bindings[ref_id][1] if reservation_bindings is not None else None
+                ),
+                "attempt_id": (
+                    reservation_bindings[ref_id][2] if reservation_bindings is not None else None
+                ),
+                "validated_at": (
+                    reservation_bindings[ref_id][3].astimezone(UTC)
+                    if reservation_bindings is not None
+                    else None
+                ),
+                "validation_snapshot_hash": (
+                    reservation_bindings[ref_id][4] if reservation_bindings is not None else None
+                ),
+                "authority_fingerprint_hash": (
+                    reservation_bindings[ref_id][5] if reservation_bindings is not None else None
+                ),
             }
         self.execution_usage[key] = projected
-        return projected
+        result: dict[str, Any] = projected
+        if reservation_bindings is not None:
+            result = {
+                **projected,
+                "newly_reserved_ref_ids": [item[0] for item in new_orders],
+                "already_reserved_ref_ids": sorted(ref_ids - {item[0] for item in new_orders}),
+            }
+        return result
+
+    def execution_budget_usage(
+        self,
+        account_hash: str,
+        trade_date: date,
+    ) -> dict[str, float | int]:
+        return dict(
+            self.execution_usage.get(
+                (account_hash, trade_date),
+                {
+                    "total_orders": 0,
+                    "total_notional": 0.0,
+                    "entry_orders": 0,
+                    "entry_notional": 0.0,
+                    "option_openings": 0,
+                },
+            )
+        )
+
+    def execution_reservations_for_session(
+        self, account_hash: str, trade_date: date
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            [
+                dict(item)
+                for item in self.execution_reservations.values()
+                if item["account_key"] == account_hash and item["trade_date"] == trade_date
+            ],
+            key=lambda item: str(item["ref_id"]),
+        )
 
     def _option_packet_state(self, packet_id: str) -> dict[str, Any]:
         if packet_id not in self.option_packets:
@@ -1300,6 +1546,19 @@ class PostgresLedger:
             )
             return [DecisionPacket.from_dict(row[0]) for row in cursor.fetchall()]
 
+    def packet(self, packet_id: str) -> DecisionPacket | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM decision_packets
+                WHERE packet_id = %s AND status = 'authorized'
+                """,
+                (packet_id,),
+            )
+            row = cursor.fetchone()
+        return DecisionPacket.from_dict(row[0]) if row is not None else None
+
     def upsert_thesis(self, thesis: ActiveThesis) -> None:
         from psycopg.types.json import Jsonb
 
@@ -1326,6 +1585,19 @@ class PostgresLedger:
                 ),
             )
 
+    def thesis(self, pick_id: str) -> ActiveThesis | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM active_theses
+                WHERE pick_id = %s
+                """,
+                (pick_id,),
+            )
+            row = cursor.fetchone()
+        return ActiveThesis.from_dict(row[0]) if row is not None else None
+
     def active_theses(self) -> list[ActiveThesis]:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -1343,7 +1615,9 @@ class PostgresLedger:
             cursor.execute(
                 """
                 SELECT halted, halt_reason, high_water_mark,
-                       prior_close_equity, prior_close_date, cooldown_until
+                       prior_close_equity, prior_close_date, cooldown_until,
+                       halt_scope, prior_close_metric_at, prior_close_observed_at,
+                       prior_close_source, prior_close_artifact_hash
                 FROM picker_control_state
                 WHERE account_key = %s
                 """,
@@ -1357,7 +1631,12 @@ class PostgresLedger:
                     "high_water_mark": None,
                     "prior_close_equity": None,
                     "prior_close_date": None,
+                    "prior_close_metric_at": None,
+                    "prior_close_observed_at": None,
+                    "prior_close_source": None,
+                    "prior_close_artifact_hash": None,
                     "cooldown_until": None,
+                    "halt_scope": "entries",
                 }
             return {
                 "halted": bool(row[0]),
@@ -1366,12 +1645,30 @@ class PostgresLedger:
                 "prior_close_equity": row[3],
                 "prior_close_date": row[4],
                 "cooldown_until": row[5],
+                "halt_scope": str(row[6] or "entries"),
+                "prior_close_metric_at": row[7],
+                "prior_close_observed_at": row[8],
+                "prior_close_source": row[9],
+                "prior_close_artifact_hash": row[10],
             }
 
     def record_equity_peak(self, account_hash: str, equity: float) -> float:
-        if equity <= 0:
-            raise ValueError("Equity must be positive")
+        if not isfinite(equity) or equity <= 0:
+            raise ValueError("Equity must be finite and positive")
         with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"picker-equity-peak:{account_hash}",),
+            )
+            cursor.execute(
+                "SELECT high_water_mark FROM picker_control_state WHERE account_key = %s",
+                (account_hash,),
+            )
+            previous = cursor.fetchone()
+            if previous is not None and previous[0] is not None:
+                previous_value = float(previous[0])
+                if not isfinite(previous_value):
+                    raise ValueError("Stored equity peak is not finite")
             cursor.execute(
                 """
                 INSERT INTO picker_control_state (account_key, high_water_mark)
@@ -1391,33 +1688,70 @@ class PostgresLedger:
             )
             return float(cursor.fetchone()[0])
 
-    def record_prior_close(self, account_hash: str, equity: float, session_date: date) -> float:
+    def record_prior_close(
+        self,
+        account_hash: str,
+        equity: float,
+        session_date: date,
+        *,
+        metric_at: datetime,
+        observed_at: datetime,
+        source: str,
+        artifact_hash: str,
+    ) -> float:
+        raise RuntimeError(
+            "Prior-close writes are disabled until broker-verified close reconstruction exists"
+        )
         if not isfinite(equity) or equity <= 0:
             raise ValueError("Prior-close equity must be finite and positive")
+        metric_at, observed_at, source, artifact_hash = _validated_close_provenance(
+            metric_at, observed_at, source, artifact_hash
+        )
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO picker_control_state
-                    (account_key, prior_close_equity, prior_close_date)
-                VALUES (%s, %s, %s)
+                    (account_key, prior_close_equity, prior_close_date,
+                     prior_close_metric_at, prior_close_observed_at,
+                     prior_close_source, prior_close_artifact_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (account_key) DO NOTHING
                 """,
-                (account_hash, equity, session_date),
+                (
+                    account_hash,
+                    equity,
+                    session_date,
+                    metric_at,
+                    observed_at,
+                    source,
+                    artifact_hash,
+                ),
             )
             cursor.execute(
                 """
-                SELECT prior_close_equity, prior_close_date
+                SELECT prior_close_equity, prior_close_date,
+                       prior_close_metric_at, prior_close_observed_at,
+                       prior_close_source, prior_close_artifact_hash
                 FROM picker_control_state
                 WHERE account_key = %s
                 FOR UPDATE
                 """,
                 (account_hash,),
             )
-            previous_equity, previous_date = cursor.fetchone()
+            previous = cursor.fetchone()
+            previous_equity, previous_date = previous[:2]
             if previous_date is not None and previous_date > session_date:
                 raise ValueError("Cannot move the prior-close session backward")
             if previous_date == session_date:
-                if previous_equity is None or abs(float(previous_equity) - equity) > 1e-6:
+                immutable = (
+                    previous_equity is not None
+                    and abs(float(previous_equity) - equity) <= 1e-6
+                    and previous[2] == metric_at
+                    and previous[3] == observed_at
+                    and str(previous[4] or "") == source
+                    and str(previous[5] or "") == artifact_hash
+                )
+                if not immutable:
                     raise ValueError("Prior-close equity is immutable within a session")
                 return float(previous_equity)
             cursor.execute(
@@ -1425,27 +1759,89 @@ class PostgresLedger:
                 UPDATE picker_control_state
                 SET prior_close_equity = %s,
                     prior_close_date = %s,
+                    prior_close_metric_at = %s,
+                    prior_close_observed_at = %s,
+                    prior_close_source = %s,
+                    prior_close_artifact_hash = %s,
                     updated_at = now()
                 WHERE account_key = %s
                 RETURNING prior_close_equity
                 """,
-                (equity, session_date, account_hash),
+                (
+                    equity,
+                    session_date,
+                    metric_at,
+                    observed_at,
+                    source,
+                    artifact_hash,
+                    account_hash,
+                ),
             )
             return float(cursor.fetchone()[0])
 
-    def halt(self, account_hash: str, reason: str) -> None:
+    def halt(self, account_hash: str, reason: str, scope: str = "entries") -> None:
+        if scope not in {"entries", "all"}:
+            raise ValueError("Halt scope must be entries or all")
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO picker_control_state (account_key, halted, halt_reason)
-                VALUES (%s, TRUE, %s)
+                INSERT INTO picker_control_state
+                    (account_key, halted, halt_reason, halt_scope)
+                VALUES (%s, TRUE, %s, %s)
                 ON CONFLICT (account_key) DO UPDATE
                 SET halted = TRUE,
                     halt_reason = EXCLUDED.halt_reason,
+                    halt_scope = EXCLUDED.halt_scope,
                     updated_at = now()
                 """,
-                (account_hash, reason),
+                (account_hash, reason, scope),
             )
+
+    def same_session_exit_symbols(self, account_hash: str, session_date: date) -> set[str]:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT symbol
+                FROM picker_order_events
+                WHERE account_key = %s
+                  AND session_date = %s
+                  AND event_type = ANY(%s)
+                  AND symbol IS NOT NULL
+                """,
+                (
+                    account_hash,
+                    session_date,
+                    ["exit_filled", "stop_filled", "mandatory_exit_filled"],
+                ),
+            )
+            return {str(row[0]).upper() for row in cursor.fetchall()}
+
+    def equity_order_event(self, ref_id: str, event_type: str) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT pick_id, packet_id, ref_id, broker_order_id,
+                       event_type, occurred_at, payload, account_key, symbol, session_date
+                FROM picker_order_events
+                WHERE ref_id = %s AND event_type = %s
+                """,
+                (ref_id, event_type),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "pick_id": row[0],
+            "packet_id": row[1],
+            "ref_id": str(row[2]),
+            "broker_order_id": row[3],
+            "event_type": str(row[4]),
+            "occurred_at": row[5],
+            "payload": row[6],
+            "account_key": row[7],
+            "symbol": row[8],
+            "session_date": row[9],
+        }
 
     def put_outcome(self, outcome: OutcomeMark) -> None:
         from psycopg.types.json import Jsonb
@@ -1480,6 +1876,9 @@ class PostgresLedger:
         packet_id: str | None = None,
         ref_id: str,
         broker_order_id: str | None = None,
+        account_hash: str | None = None,
+        symbol: str | None = None,
+        session_date: date | None = None,
     ) -> None:
         if not ref_id or not event_type:
             raise ValueError("Equity order events require ref_id and event_type")
@@ -1493,24 +1892,27 @@ class PostgresLedger:
             event_type,
             occurred_at,
             payload,
+            account_hash,
+            str(symbol).upper() if symbol else None,
+            session_date,
         )
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO picker_order_events
                     (pick_id, packet_id, ref_id, broker_order_id,
-                     event_type, occurred_at, payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                     event_type, occurred_at, payload, account_key, symbol, session_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
-                (*values[:-1], Jsonb(payload)),
+                (*values[:6], Jsonb(payload), *values[7:]),
             )
             if cursor.rowcount == 1:
                 return
             cursor.execute(
                 """
                 SELECT pick_id, packet_id, ref_id, broker_order_id,
-                       event_type, occurred_at, payload
+                       event_type, occurred_at, payload, account_key, symbol, session_date
                 FROM picker_order_events
                 WHERE ref_id = %s AND event_type = %s
                 """,
@@ -2451,13 +2853,14 @@ class PostgresLedger:
         *,
         max_orders: int = 8,
         max_notional: float = 800.0,
-        max_entry_orders: int = 6,
-        max_entry_notional: float = 600.0,
+        max_entry_orders: int = 2,
+        max_entry_notional: float = 300.0,
         observed_usage: tuple[int, float, int, float] = (0, 0.0, 0, 0.0),
         max_option_openings: int = 3,
         observed_open_option_positions: int = 0,
         research_batch_id: str = "",
-    ) -> dict[str, float | int]:
+        reservation_bindings: dict[str, ReservationBinding] | None = None,
+    ) -> dict[str, Any]:
         _validate_execution_reservation(
             orders,
             max_orders,
@@ -2468,6 +2871,8 @@ class PostgresLedger:
         _validate_observed_execution_usage(observed_usage)
         if not 0 < max_option_openings <= 3 or observed_open_option_positions < 0:
             raise ValueError("Option opening limits cannot relax hard caps")
+        ref_ids = {ref_id for ref_id, _, _, _ in orders}
+        _validate_reservation_bindings(reservation_bindings, ref_ids)
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
@@ -2533,15 +2938,17 @@ class PostgresLedger:
                 "entry_notional": float(row[3]),
                 "option_openings": int(row[4]),
             }
-            ref_ids = [ref_id for ref_id, _, _, _ in orders]
+            ordered_ref_ids = [ref_id for ref_id, _, _, _ in orders]
             cursor.execute(
                 """
                 SELECT ref_id, account_key, trade_date, notional,
-                       is_entry, is_option_open
+                       is_entry, is_option_open, plan_id, confirmation_id, attempt_id,
+                       validated_at, validation_snapshot_hash,
+                       authority_fingerprint_hash
                 FROM execution_plan_reservations
                 WHERE ref_id = ANY(%s)
                 """,
-                (ref_ids,),
+                (ordered_ref_ids,),
             )
             existing = {
                 str(item[0]): (
@@ -2550,18 +2957,58 @@ class PostgresLedger:
                     float(item[3]),
                     bool(item[4]),
                     bool(item[5]),
+                    str(item[6]) if item[6] is not None else None,
+                    str(item[7]) if item[7] is not None else None,
+                    str(item[8]) if item[8] is not None else None,
+                    item[9],
+                    str(item[10]) if item[10] is not None else None,
+                    str(item[11]) if item[11] is not None else None,
                 )
                 for item in cursor.fetchall()
             }
             new_orders: list[tuple[str, float, bool, bool]] = []
             for ref_id, notional, is_entry, is_option_open in orders:
                 if ref_id in existing:
-                    if existing[ref_id] != (
+                    requested = (
                         account_hash,
                         trade_date,
                         float(notional),
                         bool(is_entry),
                         bool(is_option_open),
+                        (
+                            reservation_bindings[ref_id][0]
+                            if reservation_bindings is not None
+                            else None
+                        ),
+                        (
+                            reservation_bindings[ref_id][1]
+                            if reservation_bindings is not None
+                            else None
+                        ),
+                        (
+                            reservation_bindings[ref_id][2]
+                            if reservation_bindings is not None
+                            else None
+                        ),
+                        (
+                            reservation_bindings[ref_id][3].astimezone(UTC)
+                            if reservation_bindings is not None
+                            else None
+                        ),
+                        (
+                            reservation_bindings[ref_id][4]
+                            if reservation_bindings is not None
+                            else None
+                        ),
+                        (
+                            reservation_bindings[ref_id][5]
+                            if reservation_bindings is not None
+                            else None
+                        ),
+                    )
+                    immutable_indexes = (*range(8), 10)
+                    if any(
+                        existing[ref_id][index] != requested[index] for index in immutable_indexes
                     ):
                         raise ValueError(f"Execution reservation {ref_id} is immutable")
                 else:
@@ -2636,8 +3083,10 @@ class PostgresLedger:
                     """
                     INSERT INTO execution_plan_reservations
                         (ref_id, account_key, trade_date, notional,
-                         is_entry, is_option_open)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                         is_entry, is_option_open, plan_id, confirmation_id, attempt_id,
+                         validated_at, validation_snapshot_hash,
+                         authority_fingerprint_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     [
                         (
@@ -2647,11 +3096,107 @@ class PostgresLedger:
                             notional,
                             is_entry,
                             is_option_open,
+                            (
+                                reservation_bindings[ref_id][0]
+                                if reservation_bindings is not None
+                                else None
+                            ),
+                            (
+                                reservation_bindings[ref_id][1]
+                                if reservation_bindings is not None
+                                else None
+                            ),
+                            (
+                                reservation_bindings[ref_id][2]
+                                if reservation_bindings is not None
+                                else None
+                            ),
+                            (
+                                reservation_bindings[ref_id][3].astimezone(UTC)
+                                if reservation_bindings is not None
+                                else None
+                            ),
+                            (
+                                reservation_bindings[ref_id][4]
+                                if reservation_bindings is not None
+                                else None
+                            ),
+                            (
+                                reservation_bindings[ref_id][5]
+                                if reservation_bindings is not None
+                                else None
+                            ),
                         )
                         for ref_id, notional, is_entry, is_option_open in new_orders
                     ],
                 )
-            return projected
+            result: dict[str, Any] = projected
+            if reservation_bindings is not None:
+                new_ref_ids = {item[0] for item in new_orders}
+                result = {
+                    **projected,
+                    "newly_reserved_ref_ids": [item[0] for item in new_orders],
+                    "already_reserved_ref_ids": sorted(ref_ids - new_ref_ids),
+                }
+            return result
+
+    def execution_budget_usage(
+        self,
+        account_hash: str,
+        trade_date: date,
+    ) -> dict[str, float | int]:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT total_orders, total_notional,
+                       entry_orders, entry_notional, option_openings
+                FROM execution_daily_usage
+                WHERE account_key = %s AND trade_date = %s
+                """,
+                (account_hash, trade_date),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return {
+                "total_orders": 0,
+                "total_notional": 0.0,
+                "entry_orders": 0,
+                "entry_notional": 0.0,
+                "option_openings": 0,
+            }
+        return {
+            "total_orders": int(row[0]),
+            "total_notional": float(row[1]),
+            "entry_orders": int(row[2]),
+            "entry_notional": float(row[3]),
+            "option_openings": int(row[4]),
+        }
+
+    def execution_reservations_for_session(
+        self, account_hash: str, trade_date: date
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT r.ref_id, r.notional, r.is_entry, r.is_option_open,
+                       a.broker_order_id
+                FROM execution_plan_reservations AS r
+                LEFT JOIN execution_order_attempts AS a ON a.attempt_id = r.attempt_id
+                WHERE r.account_key = %s AND r.trade_date = %s
+                ORDER BY r.ref_id
+                """,
+                (account_hash, trade_date),
+            )
+            return [
+                {
+                    "ref_id": str(row[0]),
+                    "notional": float(row[1]),
+                    "is_entry": bool(row[2]),
+                    "is_option_open": bool(row[3]),
+                    "broker_order_id": str(row[4] or ""),
+                }
+                for row in cursor.fetchall()
+            ]
 
     @staticmethod
     def _option_packet_status(cursor: Any, packet_id: str) -> str:

@@ -15,6 +15,10 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+from .cloud_runtime import (
+    _native_equity_order_parameters,
+    _normalized_equity_broker_parameters,
+)
 from .execution import KILL_SWITCH_FILENAME, append_audit_record
 
 # Fills drift from the plan for legitimate reasons: fractional rounding and
@@ -49,6 +53,7 @@ class ExecutedOrder:
     order_id: str
     state: str
     ref_id: str = ""
+    parameter_fingerprint: dict[str, str] | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> ExecutedOrder:
@@ -65,6 +70,13 @@ class ExecutedOrder:
         if filled_quantity is not None and average_price is not None:
             computed = filled_quantity * average_price
             notional = computed if isfinite(computed) else None
+        try:
+            parameter_fingerprint = _native_equity_order_parameters(
+                raw,
+                require_execution_fields=True,
+            )
+        except ValueError:
+            parameter_fingerprint = None
         return cls(
             symbol=str(raw.get("symbol") or "").upper(),
             side=str(raw.get("side") or "").lower(),
@@ -73,6 +85,7 @@ class ExecutedOrder:
             order_id=str(raw.get("order_id") or raw.get("id") or ""),
             state=str(raw.get("state") or "").lower(),
             ref_id=str(raw.get("ref_id") or raw.get("client_order_id") or ""),
+            parameter_fingerprint=parameter_fingerprint,
         )
 
     def fill_issues(self) -> list[str]:
@@ -174,7 +187,16 @@ def reconcile(
                     and abs(order.notional - approved_notional)
                     <= max(approved_notional * NOTIONAL_TOLERANCE, 1.0)
                 )
-                if same_instrument and within_size:
+                expected_parameters = approval.get("broker_parameters")
+                exact_parameters = True
+                if isinstance(expected_parameters, dict):
+                    try:
+                        exact_parameters = order.parameter_fingerprint == (
+                            _normalized_equity_broker_parameters(expected_parameters)
+                        )
+                    except ValueError:
+                        exact_parameters = False
+                if same_instrument and within_size and exact_parameters:
                     match_index = ref_index
                 else:
                     mismatch_reason = "ref_id_order_fingerprint_mismatch"
@@ -198,7 +220,16 @@ def reconcile(
                     and abs(order.notional - approved_notional)
                     <= max(approved_notional * NOTIONAL_TOLERANCE, 1.0)
                 )
-                if within_size:
+                expected_parameters = approval.get("broker_parameters")
+                exact_parameters = True
+                if isinstance(expected_parameters, dict):
+                    try:
+                        exact_parameters = order.parameter_fingerprint == (
+                            _normalized_equity_broker_parameters(expected_parameters)
+                        )
+                    except ValueError:
+                        exact_parameters = False
+                if within_size and exact_parameters:
                     match_index = index
                     break
             if match_index is None and any(approval.get("ref_id") for approval in unconsumed):

@@ -1,7 +1,11 @@
 # Trading knowledge graph
 
-Markdown in this directory is the source of truth. `graph.json` is a generated,
-reviewable index for the local viewer; do not hand-edit it.
+Supabase is the source of truth for runtime nodes, edges, and immutable outcome
+observations. Markdown in this directory is the curated schema/example layer,
+and `graph.json` is its generated, reviewable local index; do not hand-edit it.
+Scheduled cloud runs write through `cloud-kg-record` and never edit repository
+files. A reviewed export may later update this directory through a separate
+human-controlled development change.
 
 The checked-in nodes are schema examples, not market claims, trading signals,
 or investment advice. Every example edge has zero observations and no `as_of`
@@ -11,9 +15,9 @@ date so it cannot be mistaken for validated evidence.
 
 The graph is the reviewable hypothesis layer, not the statistical ledger.
 Immutable prediction batches and candidate outcomes live in Postgres under the
-`learning_*` tables. The evening task may propose graph changes under
-`artifacts/learning/kg-proposals.json`; a proposal does not change this source
-of truth and cannot authorize a trade.
+`learning_*` tables. Runtime graph state lives in `knowledge_nodes`,
+`knowledge_edges`, and `knowledge_observations`. Local proposal files are only
+disposable exports and cannot authorize a trade.
 
 When a relationship is reviewed into Markdown, `observations` counts only
 point-in-time observations with matching horizon and provenance. Record both

@@ -5,7 +5,11 @@
   "timezone": "America/Los_Angeles",
   "project": ".",
   "prompt_file": "automations/morning-live-prompt.txt",
-  "broker_mutations_allowed": true,
+  "cursor_setup": "automations/CURSOR_SETUP.md",
+  "durable_cloud_runtime_required": true,
+  "local_state_authoritative": false,
+  "scheduled_broker_mutations_allowed": false,
+  "signed_resume_broker_mutations_allowed": true,
   "requires_per_order_confirmation": true,
   "new_option_openings_allowed": false
 }

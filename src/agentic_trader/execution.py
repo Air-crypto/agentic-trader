@@ -144,6 +144,12 @@ class ExecutionLimits:
     max_order_notional: float = 150.0
     max_position_weight: float = 0.035
     max_broad_market_weight: float = 0.035
+    # These whole-portfolio caps apply before any new exposure is allowed. They
+    # deliberately include legacy/manual holdings so an oversized broker
+    # portfolio cannot keep adding risk one otherwise-small order at a time.
+    max_held_names: int = 3
+    max_global_position_weight: float = 0.035
+    max_sector_weight: float = 0.07
     min_cash_reserve_weight: float = 0.895
     max_orders_per_day: int = 8
     max_daily_notional: float = 800.0
@@ -186,6 +192,9 @@ class ExecutionLimits:
             "max_order_notional": self.max_order_notional,
             "max_position_weight": self.max_position_weight,
             "max_broad_market_weight": self.max_broad_market_weight,
+            "max_held_names": self.max_held_names,
+            "max_global_position_weight": self.max_global_position_weight,
+            "max_sector_weight": self.max_sector_weight,
             "min_cash_reserve_weight": self.min_cash_reserve_weight,
             "max_orders_per_day": self.max_orders_per_day,
             "max_daily_notional": self.max_daily_notional,
@@ -212,16 +221,26 @@ class ExecutionLimits:
             raise ValueError("max_position_weight must be within (0, 1]")
         if not 0 < self.max_broad_market_weight <= 1:
             raise ValueError("max_broad_market_weight must be within (0, 1]")
+        if (
+            isinstance(self.max_held_names, bool)
+            or not isinstance(self.max_held_names, int)
+            or not 0 < self.max_held_names <= 3
+        ):
+            raise ValueError("max_held_names cannot relax the 3-name hard cap")
+        if not 0 < self.max_global_position_weight <= 0.035:
+            raise ValueError("max_global_position_weight cannot relax the 3.5% hard cap")
+        if not 0 < self.max_sector_weight <= 0.07:
+            raise ValueError("max_sector_weight cannot relax the 7% hard cap")
         if not 0 <= self.min_cash_reserve_weight < 1:
             raise ValueError("min_cash_reserve_weight must be within [0, 1)")
         if not 0 < self.max_orders_per_day <= 8:
             raise ValueError("max_orders_per_day cannot relax the 8-order hard cap")
         if not 0 < self.max_daily_notional <= 800:
             raise ValueError("max_daily_notional cannot relax the $800 hard cap")
-        if not 0 < self.max_entry_orders_per_day <= min(self.max_orders_per_day, 6):
-            raise ValueError("entry orders cannot exceed 6 or the total cap")
-        if not 0 < self.max_entry_daily_notional <= min(self.max_daily_notional, 600):
-            raise ValueError("entry notional cannot exceed $600 or the total cap")
+        if not 0 < self.max_entry_orders_per_day <= min(self.max_orders_per_day, 2):
+            raise ValueError("entry orders cannot exceed 2 or the total cap")
+        if not 0 < self.max_entry_daily_notional <= min(self.max_daily_notional, 300):
+            raise ValueError("entry notional cannot exceed $300 or the total cap")
         if not 0 < self.max_daily_loss_weight <= 1:
             raise ValueError("max_daily_loss_weight must be within (0, 1]")
         if not 0 < self.max_drawdown_weight <= 1:
@@ -244,6 +263,10 @@ class AccountSnapshot:
     equity: float
     cash: float
     positions: dict[str, float] = field(default_factory=dict)
+    # Point-in-time sector metadata for both current holdings and proposed
+    # entries. A missing, blank, or explicitly unknown label fails new exposure
+    # closed because the aggregate sector cap otherwise cannot be calculated.
+    sector_by_symbol: dict[str, str] = field(default_factory=dict)
     high_water_mark: float | None = None
     prior_close_equity: float | None = None
     orders_today: int = 0
@@ -279,6 +302,25 @@ class AccountSnapshot:
 
     def position_value(self, symbol: str) -> float:
         return float(self.positions.get(symbol.upper(), 0.0))
+
+    def sector_for(self, symbol: str) -> str | None:
+        normalized_symbol = symbol.strip().upper()
+        raw_sector = next(
+            (
+                value
+                for raw_symbol, value in self.sector_by_symbol.items()
+                if str(raw_symbol).strip().upper() == normalized_symbol
+            ),
+            None,
+        )
+        if not isinstance(raw_sector, str):
+            return None
+        sector = " ".join(raw_sector.split())
+        if sector.casefold() in {"", "unknown", "unclassified", "n/a", "na", "none", "null"}:
+            return None
+        # Sector aggregation must not be bypassed by harmless differences in
+        # capitalization or repeated whitespace.
+        return sector.casefold()
 
     @property
     def effective_entry_orders_today(self) -> int:
@@ -554,13 +596,68 @@ def check_account_halts(
 
     prior_close = account.prior_close_equity
     prior_close_value = _finite_float(prior_close)
-    if prior_close is not None and prior_close_value is None:
+    if prior_close is None:
+        # The daily-loss circuit breaker cannot operate without its official
+        # prior-session anchor.  Treat that as an entry halt rather than
+        # silently trading with one of the advertised hard limits disabled.
+        reasons.append("prior_close_equity_missing")
+    elif prior_close_value is None:
         reasons.append("non_finite_prior_close_equity")
-    elif prior_close_value is not None and prior_close_value > 0 and equity is not None:
+    elif prior_close_value <= 0:
+        reasons.append("non_positive_prior_close_equity")
+    elif equity is not None:
         daily_loss = 1.0 - (equity / prior_close_value)
         if daily_loss >= limits.max_daily_loss_weight:
             reasons.append("daily_loss_halt")
 
+    return tuple(reasons)
+
+
+def _entry_portfolio_envelope_reasons(
+    order: ProposedOrder,
+    account: AccountSnapshot,
+    limits: ExecutionLimits,
+    notional: float,
+) -> tuple[str, ...]:
+    """Validate the complete projected risky portfolio before a buy.
+
+    The broker snapshot, rather than the proposed target set, defines existing
+    exposure. Cash equivalents are excluded consistently with ``position_cap_for``.
+    Every other positive position counts, including broad-market and sector ETFs.
+    """
+    if order.side != "buy" or notional <= 0:
+        return ()
+    equity = _finite_float(account.equity)
+    if equity is None or equity <= 0:
+        return ()
+
+    projected: dict[str, float] = {}
+    for raw_symbol, raw_value in account.positions.items():
+        symbol = str(raw_symbol).strip().upper()
+        value = _finite_float(raw_value)
+        if not symbol or value is None or value <= 0 or symbol in CASH_EQUIVALENTS:
+            continue
+        projected[symbol] = projected.get(symbol, 0.0) + value
+    if order.symbol not in CASH_EQUIVALENTS:
+        projected[order.symbol] = projected.get(order.symbol, 0.0) + notional
+
+    reasons: list[str] = []
+    if len(projected) > limits.max_held_names:
+        reasons.append("portfolio_held_name_count_exceeds_cap")
+    for symbol, value in sorted(projected.items()):
+        if value / equity > limits.max_global_position_weight + 1e-9:
+            reasons.append(f"portfolio_position_weight_exceeds_global_cap:{symbol}")
+
+    sector_values: dict[str, float] = {}
+    for symbol, value in sorted(projected.items()):
+        sector = account.sector_for(symbol)
+        if sector is None:
+            reasons.append(f"portfolio_sector_mapping_missing:{symbol}")
+            continue
+        sector_values[sector] = sector_values.get(sector, 0.0) + value
+    for sector, value in sorted(sector_values.items()):
+        if value / equity > limits.max_sector_weight + 1e-9:
+            reasons.append(f"portfolio_sector_weight_exceeds_cap:{sector}")
     return tuple(reasons)
 
 
@@ -591,6 +688,9 @@ def evaluate_order(
         entry_only_halts = {
             "capital_floor_breached",
             "daily_loss_halt",
+            "prior_close_equity_missing",
+            "non_finite_prior_close_equity",
+            "non_positive_prior_close_equity",
             "max_drawdown_halt",
             "no_drawdown_protection_available",
             "daily_order_count_limit_reached",
@@ -601,6 +701,7 @@ def evaluate_order(
         }
         entry_only_prefixes = (
             "picker_database_halt:",
+            "picker_prior_close_anchor_",
             "picker_target_exceeds_packet_weight:",
         )
         reasons = [
@@ -734,6 +835,7 @@ def evaluate_order(
             projected_weight = (current_value + notional) / equity if equity > 0 else 1.0
             if projected_weight > limits.position_cap_for(order.symbol) + 1e-9:
                 reasons.append("projected_position_weight_exceeds_cap")
+            reasons.extend(_entry_portfolio_envelope_reasons(order, account, limits, notional))
     else:
         if current_value <= 0:
             reasons.append("sell_without_existing_long_position")

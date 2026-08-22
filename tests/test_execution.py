@@ -37,6 +37,21 @@ TEST_QUOTE_SYMBOLS = (
     "OLD",
     "NEW",
 )
+TEST_SECTORS = {
+    "SPY": "Broad Market",
+    "QQQ": "Broad Market",
+    "IWM": "Broad Market",
+    "EFA": "International Equity",
+    "EEM": "Emerging Markets",
+    "VNQ": "Real Estate",
+    "DBC": "Commodities",
+    "IEF": "Fixed Income",
+    "TLT": "Fixed Income",
+    "BIL": "Cash Equivalent",
+    "AAPL": "Technology",
+    "OLD": "Legacy Sector",
+    "NEW": "New Sector",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +67,7 @@ def make_account(**overrides) -> AccountSnapshot:
         "equity": 750.0,
         "cash": 750.0,
         "positions": {},
+        "sector_by_symbol": TEST_SECTORS,
         "high_water_mark": 750.0,
         "prior_close_equity": 750.0,
         "orders_today": 0,
@@ -84,6 +100,9 @@ def test_default_limits_preserve_exit_capacity():
     assert limits.max_order_notional == 150.0
     assert limits.max_position_weight == 0.035
     assert limits.max_broad_market_weight == 0.035
+    assert limits.max_held_names == 3
+    assert limits.max_global_position_weight == 0.035
+    assert limits.max_sector_weight == 0.07
     assert limits.min_cash_reserve_weight == 0.895
     assert limits.max_orders_per_day == 8
     assert limits.max_daily_notional == 800.0
@@ -102,10 +121,16 @@ def test_daily_limits_cannot_be_relaxed_through_cli_style_overrides():
         ExecutionLimits(max_orders_per_day=9)
     with pytest.raises(ValueError, match="800"):
         ExecutionLimits(max_daily_notional=801)
-    with pytest.raises(ValueError, match="6"):
-        ExecutionLimits(max_entry_orders_per_day=7)
-    with pytest.raises(ValueError, match="600"):
-        ExecutionLimits(max_entry_daily_notional=601)
+    with pytest.raises(ValueError, match="2"):
+        ExecutionLimits(max_entry_orders_per_day=3)
+    with pytest.raises(ValueError, match="300"):
+        ExecutionLimits(max_entry_daily_notional=301)
+    with pytest.raises(ValueError, match="3-name"):
+        ExecutionLimits(max_held_names=4)
+    with pytest.raises(ValueError, match="3.5%"):
+        ExecutionLimits(max_global_position_weight=0.036)
+    with pytest.raises(ValueError, match="7%"):
+        ExecutionLimits(max_sector_weight=0.071)
 
 
 def test_clean_order_is_approved():
@@ -345,8 +370,98 @@ def test_single_name_keeps_the_tighter_cap():
 
 
 def test_cash_equivalent_is_not_concentration_capped():
-    account = make_account(positions={"BIL": 600.0}, cash=1_350.0, equity=1_350.0)
+    account = make_account(
+        positions={"BIL": 600.0},
+        sector_by_symbol={},
+        cash=1_350.0,
+        equity=1_350.0,
+    )
     decision = evaluate_order(make_order(symbol="BIL", notional=100.0), account)
+    assert decision.approved
+
+
+def test_entry_rejects_a_fourth_held_name_from_complete_broker_portfolio():
+    limits = ExecutionLimits(symbol_allowlist=("AAA", "BBB", "CCC", "DDD"))
+    account = make_account(
+        equity=10_000.0,
+        cash=10_000.0,
+        positions={"AAA": 100.0, "BBB": 100.0, "CCC": 100.0},
+        sector_by_symbol={
+            "AAA": "Technology",
+            "BBB": "Healthcare",
+            "CCC": "Industrials",
+            "DDD": "Consumer",
+        },
+    )
+    decision = evaluate_order(make_order(symbol="DDD", notional=100.0), account, limits)
+    assert "portfolio_held_name_count_exceeds_cap" in decision.reasons
+
+
+def test_entry_rejects_when_any_existing_name_is_above_global_cap():
+    limits = ExecutionLimits(symbol_allowlist=("AAA", "BBB"))
+    account = make_account(
+        equity=10_000.0,
+        cash=10_000.0,
+        positions={"AAA": 351.0},
+        sector_by_symbol={"AAA": "Technology", "BBB": "Healthcare"},
+    )
+    decision = evaluate_order(make_order(symbol="BBB", notional=100.0), account, limits)
+    assert "portfolio_position_weight_exceeds_global_cap:AAA" in decision.reasons
+
+
+def test_entry_rejects_when_projected_sector_exposure_exceeds_seven_percent():
+    limits = ExecutionLimits(symbol_allowlist=("AAA", "BBB", "CCC"))
+    account = make_account(
+        equity=10_000.0,
+        cash=10_000.0,
+        positions={"AAA": 350.0, "BBB": 250.0},
+        sector_by_symbol={"AAA": "Technology", "BBB": " technology ", "CCC": "TECHNOLOGY"},
+    )
+    decision = evaluate_order(make_order(symbol="CCC", notional=150.0), account, limits)
+    assert "portfolio_sector_weight_exceeds_cap:technology" in decision.reasons
+
+
+def test_entry_fails_closed_for_missing_or_unknown_sector_mapping():
+    limits = ExecutionLimits(symbol_allowlist=("AAA", "BBB"))
+    missing_existing = evaluate_order(
+        make_order(symbol="BBB", notional=100.0),
+        make_account(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={"AAA": 100.0},
+            sector_by_symbol={"BBB": "Healthcare"},
+        ),
+        limits,
+    )
+    unknown_candidate = evaluate_order(
+        make_order(symbol="BBB", notional=100.0),
+        make_account(
+            equity=10_000.0,
+            cash=10_000.0,
+            sector_by_symbol={"BBB": "Unknown"},
+        ),
+        limits,
+    )
+    assert "portfolio_sector_mapping_missing:AAA" in missing_existing.reasons
+    assert "portfolio_sector_mapping_missing:BBB" in unknown_candidate.reasons
+
+
+def test_reducing_mandatory_exit_bypasses_breached_portfolio_envelope():
+    account = make_account(
+        equity=1_000.0,
+        cash=300.0,
+        positions={"SPY": 400.0, "QQQ": 100.0, "IWM": 100.0, "EFA": 100.0},
+        sector_by_symbol={},
+    )
+    decision = evaluate_order(
+        make_order(
+            symbol="SPY",
+            side="sell",
+            notional=400.0,
+            intent_class="mandatory_exit",
+        ),
+        account,
+    )
     assert decision.approved
 
 
@@ -460,14 +575,14 @@ def test_refuses_to_trade_with_no_loss_limit_at_all():
     assert "no_drawdown_protection_available" in decision.reasons
 
 
-def test_configured_net_deposits_restores_protection(monkeypatch):
+def test_configured_net_deposits_does_not_replace_prior_close_protection(monkeypatch):
     monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "750")
     account = make_account(
         equity=730.0, cash=730.0, high_water_mark=None, prior_close_equity=None, net_deposits=None
     )
     decision = evaluate_order(make_order(), account)
     assert "no_drawdown_protection_available" not in decision.reasons
-    assert decision.approved
+    assert "prior_close_equity_missing" in decision.reasons
 
 
 def test_configured_net_deposits_also_enforces_the_floor(monkeypatch):
@@ -506,7 +621,7 @@ def test_malformed_net_deposits_does_not_silently_disable_protection(monkeypatch
 
 def test_capital_floor_allows_trading_above_the_floor():
     account = make_account(
-        equity=730.0, cash=730.0, net_deposits=750.0, high_water_mark=None, prior_close_equity=None
+        equity=730.0, cash=730.0, net_deposits=750.0, high_water_mark=None, prior_close_equity=730.0
     )
     assert evaluate_order(make_order(), account).approved
 
@@ -668,16 +783,29 @@ def test_mandatory_exit_bypasses_database_halt_but_not_identity_controls():
     assert decision.approved
 
 
-def test_batch_accumulates_position_weight():
+def test_all_scope_database_halt_blocks_mandatory_exit():
+    account = make_account(
+        positions={"SPY": 300.0},
+        external_halt_reasons=("picker_database_all_halt:reconciliation_breach",),
+    )
+    decision = evaluate_order(
+        make_order(side="sell", notional=300.0, intent_class="mandatory_exit"),
+        account,
+    )
+    assert not decision.approved
+    assert "picker_database_all_halt:reconciliation_breach" in decision.reasons
+
+
+def test_batch_accumulates_global_position_weight():
     limits = ExecutionLimits(
         max_position_weight=0.25,
         max_broad_market_weight=0.25,
         min_cash_reserve_weight=0.10,
     )
     orders = [make_order(notional=100.0) for _ in range(3)]
-    decisions = evaluate_batch(orders, make_account(equity=750.0, cash=750.0), limits)
-    assert decisions[0].approved
-    assert "projected_position_weight_exceeds_cap" in decisions[2].reasons
+    decisions = evaluate_batch(orders, make_account(equity=10_000.0, cash=10_000.0), limits)
+    assert all(decision.approved for decision in decisions[:2])
+    assert "entry_order_count_limit_reached" in decisions[2].reasons
 
 
 def test_planner_emits_capped_orders_from_targets():

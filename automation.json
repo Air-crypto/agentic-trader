@@ -1,6 +1,7 @@
 {
   "status": "live_research_and_order_review",
-  "broker_mutations_allowed": true,
+  "scheduled_broker_mutations_allowed": false,
+  "signed_resume_broker_mutations_allowed": true,
   "requires_per_order_confirmation": true,
   "new_option_openings_allowed": false,
   "tasks": [

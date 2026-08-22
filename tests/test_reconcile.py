@@ -153,6 +153,87 @@ def test_correct_ref_id_still_requires_symbol_and_side(tmp_path):
     assert wrong_side["unauthorized"][0]["reason"] == "ref_id_order_fingerprint_mismatch"
 
 
+def test_signed_broker_parameters_must_match_native_order_shape(tmp_path):
+    parameters = {
+        "symbol": "SPY",
+        "side": "buy",
+        "type": "limit",
+        "quantity": "1",
+        "limit_price": "500.00",
+        "time_in_force": "gfd",
+        "market_hours": "regular_hours",
+    }
+    approved = {
+        "symbol": "SPY",
+        "side": "buy",
+        "notional": 500.0,
+        "limit_price": 500.0,
+        "ref_id": "exact-ref",
+        "broker_parameters": parameters,
+    }
+    broker_order = {
+        "id": "broker-1",
+        "symbol": "SPY",
+        "side": "buy",
+        "state": "filled",
+        "type": "limit",
+        "trigger": "immediate",
+        "quantity": {"amount": "1"},
+        "cumulative_quantity": {"amount": "1"},
+        "price": {"amount": "500.00"},
+        "average_price": {"amount": "500.00"},
+        "time_in_force": "gfd",
+        "market_hours": "regular_hours",
+        "ref_id": "exact-ref",
+    }
+    assert reconcile([approved], [broker_order], root=tmp_path)["clean"]
+
+    wrong_session = {**broker_order, "market_hours": "all_day_hours"}
+    result = reconcile(
+        [approved],
+        [wrong_session],
+        root=tmp_path,
+        engage_on_breach=False,
+    )
+    assert "unauthorized_fill_detected" in result["breaches"]
+    assert result["unauthorized"][0]["reason"] == "ref_id_order_fingerprint_mismatch"
+
+
+def test_dollar_order_fingerprint_ignores_broker_derived_filled_quantity(tmp_path):
+    parameters = {
+        "symbol": "SPY",
+        "side": "buy",
+        "type": "market",
+        "dollar_amount": "100.00",
+        "time_in_force": "gfd",
+        "market_hours": "regular_hours",
+    }
+    approved = {
+        "symbol": "SPY",
+        "side": "buy",
+        "notional": 100.0,
+        "reference_price": 500.0,
+        "ref_id": "dollar-ref",
+        "broker_parameters": parameters,
+    }
+    broker_order = {
+        "id": "broker-dollar",
+        "symbol": "SPY",
+        "side": "buy",
+        "state": "filled",
+        "type": "market",
+        "trigger": "immediate",
+        "dollar_based_amount": {"amount": "100.00"},
+        "quantity": {"amount": "0.2"},
+        "cumulative_quantity": {"amount": "0.2"},
+        "average_price": {"amount": "500.00"},
+        "time_in_force": "gfd",
+        "market_hours": "regular_hours",
+        "ref_id": "dollar-ref",
+    }
+    assert reconcile([approved], [broker_order], root=tmp_path)["clean"]
+
+
 def test_fill_missing_planned_ref_id_is_rejected(tmp_path):
     approved = {**approval(), "ref_id": "abc-123"}
     result = reconcile([approved], [fill()], root=tmp_path)

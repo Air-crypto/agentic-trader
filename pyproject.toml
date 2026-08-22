@@ -1,10 +1,11 @@
 [project]
 name = "agentic-trader"
 version = "0.1.0"
-description = "Cost-aware research and paper-trading harness for a guarded momentum strategy"
+description = "Guarded research, learning, and human-confirmed live-trading canary"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=46.0.3",
     "numpy>=2.5.2",
     "pandas>=3.0.5",
     "pandas-market-calendars>=5.4.0",

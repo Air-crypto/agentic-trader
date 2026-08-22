@@ -8,4 +8,8 @@ artifacts/
 KILL_SWITCH
 .env
 .env.*
+*.pem
+*.key
+*.p12
+*.pfx
 .codex/

@@ -281,7 +281,7 @@ def test_live_reserve_classifies_only_position_reducing_sells_as_exits(
         "from_env",
         classmethod(lambda cls: ledger),
     )
-    today = datetime.now(UTC).date()
+    today = cli._nyse_session_date()
     ledger.stage_batch(
         "research-batch",
         today,
