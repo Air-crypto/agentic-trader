@@ -80,6 +80,7 @@ def test_option_authorizer_refuses_new_canary_openings(
     evidence,
     draft,
 ):
+    monkeypatch.setenv("AGENTIC_TRADER_ACCOUNT", "111111111")
     option_draft = OptionDraft(
         draft_id="option-open",
         run_id=draft.run_id,
@@ -201,6 +202,7 @@ def test_option_plan_requires_exact_batch_id():
 
 
 def test_option_reservation_refuses_tampered_opening_plan(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTIC_TRADER_ACCOUNT", "111111111")
     now = datetime.now(UTC)
     plan_path = tmp_path / "plan.json"
     snapshot_path = tmp_path / "snapshot.json"
@@ -249,6 +251,7 @@ def test_option_reservation_exact_binds_close_order_to_current_batch(
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setenv("AGENTIC_TRADER_ACCOUNT", "111111111")
     now = datetime.now(UTC)
     trade_date = cli._nyse_session_date(now)
     close_draft = OptionDraft(
