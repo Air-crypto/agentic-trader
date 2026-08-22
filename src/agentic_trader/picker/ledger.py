@@ -4,7 +4,7 @@ import hashlib
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from pathlib import Path
 from typing import Any, Protocol
@@ -20,6 +20,7 @@ from .models import (
 from .option_models import ActiveOptionPosition, OptionDecisionPacket
 
 DATABASE_URL_ENV = "DATABASE_URL"
+RESEARCH_CYCLE_TTL = timedelta(hours=6)
 
 
 def account_key(account_number: str) -> str:
@@ -75,16 +76,12 @@ def _validate_execution_reservation(
     if not orders or len({ref_id for ref_id, _, _, _ in orders}) != len(orders):
         raise ValueError("Execution reservations require unique ref_ids")
     if any(
-        not ref_id or not isfinite(notional) or notional <= 0
-        for ref_id, notional, _, _ in orders
+        not ref_id or not isfinite(notional) or notional <= 0 for ref_id, notional, _, _ in orders
     ):
         raise ValueError("Execution reservation notionals must be finite and positive")
     if not 0 < max_orders <= 8 or not 0 < max_entry_orders <= min(max_orders, 6):
         raise ValueError("Execution order caps cannot relax hard limits")
-    if (
-        not 0 < max_notional <= 800
-        or not 0 < max_entry_notional <= min(max_notional, 600)
-    ):
+    if not 0 < max_notional <= 800 or not 0 < max_entry_notional <= min(max_notional, 600):
         raise ValueError("Execution notional caps cannot relax hard limits")
 
 
@@ -138,9 +135,23 @@ class PickerLedger(Protocol):
 
     def record_equity_peak(self, account_hash: str, equity: float) -> float: ...
 
+    def record_prior_close(self, account_hash: str, equity: float, session_date: date) -> float: ...
+
     def halt(self, account_hash: str, reason: str) -> None: ...
 
     def put_outcome(self, outcome: OutcomeMark) -> None: ...
+
+    def append_equity_order_event(
+        self,
+        event_type: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        pick_id: str | None = None,
+        packet_id: str | None = None,
+        ref_id: str,
+        broker_order_id: str | None = None,
+    ) -> None: ...
 
     def stage_batch(
         self,
@@ -307,6 +318,7 @@ class InMemoryLedger:
         self.theses: dict[str, ActiveThesis] = {}
         self.controls: dict[str, dict[str, Any]] = {}
         self.outcomes: dict[tuple[str, int], OutcomeMark] = {}
+        self.equity_order_events: dict[tuple[str, str], dict[str, Any]] = {}
         self.batches: dict[str, dict[str, Any]] = {}
         self.pending_batches: dict[str, dict[str, Any]] = {}
         self.research_cycles: dict[str, dict[str, Any]] = {}
@@ -426,6 +438,8 @@ class InMemoryLedger:
                     "halted": False,
                     "halt_reason": None,
                     "high_water_mark": None,
+                    "prior_close_equity": None,
+                    "prior_close_date": None,
                     "cooldown_until": None,
                 },
             )
@@ -441,6 +455,23 @@ class InMemoryLedger:
         self.controls[account_hash] = state
         return peak
 
+    def record_prior_close(self, account_hash: str, equity: float, session_date: date) -> float:
+        if not isfinite(equity) or equity <= 0:
+            raise ValueError("Prior-close equity must be finite and positive")
+        state = self.control_state(account_hash)
+        previous_date = state.get("prior_close_date")
+        previous_equity = state.get("prior_close_equity")
+        if previous_date is not None and previous_date > session_date:
+            raise ValueError("Cannot move the prior-close session backward")
+        if previous_date == session_date:
+            if previous_equity is None or abs(float(previous_equity) - equity) > 1e-6:
+                raise ValueError("Prior-close equity is immutable within a session")
+            return float(previous_equity)
+        state["prior_close_equity"] = equity
+        state["prior_close_date"] = session_date
+        self.controls[account_hash] = state
+        return equity
+
     def halt(self, account_hash: str, reason: str) -> None:
         state = self.control_state(account_hash)
         state["halted"] = True
@@ -453,6 +484,34 @@ class InMemoryLedger:
         if existing is not None and existing != outcome:
             raise ValueError(f"Outcome {key} is immutable")
         self.outcomes[key] = outcome
+
+    def append_equity_order_event(
+        self,
+        event_type: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        pick_id: str | None = None,
+        packet_id: str | None = None,
+        ref_id: str,
+        broker_order_id: str | None = None,
+    ) -> None:
+        if not ref_id or not event_type:
+            raise ValueError("Equity order events require ref_id and event_type")
+        key = (ref_id, event_type)
+        record = {
+            "pick_id": pick_id,
+            "packet_id": packet_id,
+            "ref_id": ref_id,
+            "broker_order_id": broker_order_id,
+            "event_type": event_type,
+            "occurred_at": occurred_at,
+            "payload": dict(payload),
+        }
+        existing = self.equity_order_events.get(key)
+        if existing is not None and existing != record:
+            raise ValueError(f"Equity order event {key} is immutable")
+        self.equity_order_events[key] = record
 
     def stage_batch(
         self,
@@ -592,11 +651,18 @@ class InMemoryLedger:
         record["status"] = status
 
     def latest_unfinished_cycle(self, as_of: date) -> dict[str, Any] | None:
+        cutoff = datetime.now(UTC) - RESEARCH_CYCLE_TTL
+        for record in self.research_cycles.values():
+            if (
+                record["as_of"] == as_of
+                and record["status"] in {"running", "pending"}
+                and record["started_at"] < cutoff
+            ):
+                record["status"] = "failed"
         eligible = [
             record
             for record in self.research_cycles.values()
-            if record["as_of"] == as_of
-            and record["status"] in {"running", "pending"}
+            if record["as_of"] == as_of and record["status"] in {"running", "pending"}
         ]
         return max(eligible, key=lambda item: item["started_at"]) if eligible else None
 
@@ -679,9 +745,7 @@ class InMemoryLedger:
         if not position.verify_hash():
             raise ValueError("Cannot store an option position with an invalid hash")
         if position.packet_id not in self.option_packets:
-            raise ValueError(
-                f"Unknown option packet for position {position.position_id}"
-            )
+            raise ValueError(f"Unknown option packet for position {position.position_id}")
         existing = self.option_positions_by_id.get(position.position_id)
         if existing is not None and (
             existing.underlying != position.underlying or existing.strategy != position.strategy
@@ -720,8 +784,7 @@ class InMemoryLedger:
         packet_state = self._option_packet_state(packet_id)
         if packet_state["status"] != "authorized":
             raise ValueError(
-                f"Option packet {packet_id} cannot reserve collateral from "
-                f"{packet_state['status']}"
+                f"Option packet {packet_id} cannot reserve collateral from {packet_state['status']}"
             )
         normalized_shares = _validate_option_reservation(
             collateral_amount,
@@ -954,9 +1017,7 @@ class InMemoryLedger:
                 or latest_batch["batch_id"] != research_batch_id
                 or self.latest_unfinished_cycle(trade_date) is not None
             ):
-                raise RuntimeError(
-                    "Execution reservation references stale research"
-                )
+                raise RuntimeError("Execution reservation references stale research")
         new_orders: list[tuple[str, float, bool, bool]] = []
         for ref_id, notional, is_entry, is_option_open in orders:
             existing = self.execution_reservations.get(ref_id)
@@ -997,31 +1058,34 @@ class InMemoryLedger:
             observed_usage
         )
         projected = {
-            "total_orders": max(int(usage["total_orders"]), observed_orders)
-            + len(new_orders),
+            "total_orders": max(int(usage["total_orders"]), observed_orders) + len(new_orders),
             "total_notional": max(float(usage["total_notional"]), observed_notional)
             + sum(notional for _, notional, _, _ in new_orders),
             "entry_orders": max(int(usage["entry_orders"]), observed_entry_orders)
             + sum(is_entry for _, _, is_entry, _ in new_orders),
-            "entry_notional": max(
-                float(usage["entry_notional"]), observed_entry_notional
-            )
-            + sum(
-                notional
-                for _, notional, is_entry, _ in new_orders
-                if is_entry
-            ),
+            "entry_notional": max(float(usage["entry_notional"]), observed_entry_notional)
+            + sum(notional for _, notional, is_entry, _ in new_orders if is_entry),
             "option_openings": int(usage["option_openings"])
             + sum(is_option_open for _, _, _, is_option_open in new_orders),
         }
+        new_option_openings = sum(is_option_open for _, _, _, is_option_open in new_orders)
+        has_new_entry = any(is_entry for _, _, is_entry, _ in new_orders)
         if (
-            projected["total_orders"] > max_orders
-            or projected["total_notional"] > max_notional
+            (
+                has_new_entry
+                and (
+                    projected["total_orders"] > max_orders
+                    or projected["total_notional"] > max_notional
+                )
+            )
             or projected["entry_orders"] > max_entry_orders
             or projected["entry_notional"] > max_entry_notional
             or projected["option_openings"] > max_option_openings
-            or observed_open_option_positions + projected["option_openings"]
-            > max_option_openings
+            or (
+                new_option_openings > 0
+                and observed_open_option_positions + projected["option_openings"]
+                > max_option_openings
+            )
         ):
             raise RuntimeError("Durable execution budget would be exceeded")
         for ref_id, notional, is_entry, is_option_open in new_orders:
@@ -1278,7 +1342,8 @@ class PostgresLedger:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT halted, halt_reason, high_water_mark, cooldown_until
+                SELECT halted, halt_reason, high_water_mark,
+                       prior_close_equity, prior_close_date, cooldown_until
                 FROM picker_control_state
                 WHERE account_key = %s
                 """,
@@ -1290,13 +1355,17 @@ class PostgresLedger:
                     "halted": False,
                     "halt_reason": None,
                     "high_water_mark": None,
+                    "prior_close_equity": None,
+                    "prior_close_date": None,
                     "cooldown_until": None,
                 }
             return {
                 "halted": bool(row[0]),
                 "halt_reason": row[1],
                 "high_water_mark": row[2],
-                "cooldown_until": row[3],
+                "prior_close_equity": row[3],
+                "prior_close_date": row[4],
+                "cooldown_until": row[5],
             }
 
     def record_equity_peak(self, account_hash: str, equity: float) -> float:
@@ -1319,6 +1388,48 @@ class PostgresLedger:
                 RETURNING high_water_mark
                 """,
                 (account_hash, equity),
+            )
+            return float(cursor.fetchone()[0])
+
+    def record_prior_close(self, account_hash: str, equity: float, session_date: date) -> float:
+        if not isfinite(equity) or equity <= 0:
+            raise ValueError("Prior-close equity must be finite and positive")
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO picker_control_state
+                    (account_key, prior_close_equity, prior_close_date)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (account_key) DO NOTHING
+                """,
+                (account_hash, equity, session_date),
+            )
+            cursor.execute(
+                """
+                SELECT prior_close_equity, prior_close_date
+                FROM picker_control_state
+                WHERE account_key = %s
+                FOR UPDATE
+                """,
+                (account_hash,),
+            )
+            previous_equity, previous_date = cursor.fetchone()
+            if previous_date is not None and previous_date > session_date:
+                raise ValueError("Cannot move the prior-close session backward")
+            if previous_date == session_date:
+                if previous_equity is None or abs(float(previous_equity) - equity) > 1e-6:
+                    raise ValueError("Prior-close equity is immutable within a session")
+                return float(previous_equity)
+            cursor.execute(
+                """
+                UPDATE picker_control_state
+                SET prior_close_equity = %s,
+                    prior_close_date = %s,
+                    updated_at = now()
+                WHERE account_key = %s
+                RETURNING prior_close_equity
+                """,
+                (equity, session_date, account_hash),
             )
             return float(cursor.fetchone()[0])
 
@@ -1358,6 +1469,56 @@ class PostgresLedger:
                     Jsonb(outcome.to_dict()),
                 ),
             )
+
+    def append_equity_order_event(
+        self,
+        event_type: str,
+        occurred_at: datetime,
+        payload: dict[str, Any],
+        *,
+        pick_id: str | None = None,
+        packet_id: str | None = None,
+        ref_id: str,
+        broker_order_id: str | None = None,
+    ) -> None:
+        if not ref_id or not event_type:
+            raise ValueError("Equity order events require ref_id and event_type")
+        from psycopg.types.json import Jsonb
+
+        values = (
+            pick_id,
+            packet_id,
+            ref_id,
+            broker_order_id,
+            event_type,
+            occurred_at,
+            payload,
+        )
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO picker_order_events
+                    (pick_id, packet_id, ref_id, broker_order_id,
+                     event_type, occurred_at, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (*values[:-1], Jsonb(payload)),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT pick_id, packet_id, ref_id, broker_order_id,
+                       event_type, occurred_at, payload
+                FROM picker_order_events
+                WHERE ref_id = %s AND event_type = %s
+                """,
+                (ref_id, event_type),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != values:
+                raise ValueError(f"Equity order event {(ref_id, event_type)} is immutable")
 
     def stage_batch(
         self,
@@ -1571,8 +1732,7 @@ class PostgresLedger:
             if cursor.rowcount == 1:
                 return
             cursor.execute(
-                "SELECT status FROM picker_pending_research_batches "
-                "WHERE batch_id = %s",
+                "SELECT status FROM picker_pending_research_batches WHERE batch_id = %s",
                 (batch_id,),
             )
             row = cursor.fetchone()
@@ -1602,8 +1762,7 @@ class PostgresLedger:
             if cursor.rowcount == 1:
                 return
             cursor.execute(
-                "SELECT as_of, started_at FROM picker_research_cycles "
-                "WHERE cycle_id = %s",
+                "SELECT as_of, started_at FROM picker_research_cycles WHERE cycle_id = %s",
                 (cycle_id,),
             )
             row = cursor.fetchone()
@@ -1642,6 +1801,16 @@ class PostgresLedger:
 
     def latest_unfinished_cycle(self, as_of: date) -> dict[str, Any] | None:
         with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE picker_research_cycles
+                SET status = 'failed', updated_at = now()
+                WHERE as_of = %s
+                  AND status IN ('running', 'pending')
+                  AND started_at < now() - interval '6 hours'
+                """,
+                (as_of,),
+            )
             cursor.execute(
                 """
                 SELECT cycle_id, as_of, started_at, status, batch_id
@@ -2062,8 +2231,7 @@ class PostgresLedger:
         )
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT status FROM option_decision_packets "
-                "WHERE packet_id = %s FOR UPDATE",
+                "SELECT status FROM option_decision_packets WHERE packet_id = %s FOR UPDATE",
                 (position.packet_id,),
             )
             row = cursor.fetchone()
@@ -2171,8 +2339,7 @@ class PostgresLedger:
                 raise ValueError("Option position identity mismatch")
             if close_packet_id and close_packet_id != position.packet_id:
                 cursor.execute(
-                    "SELECT status FROM option_decision_packets "
-                    "WHERE packet_id = %s FOR UPDATE",
+                    "SELECT status FROM option_decision_packets WHERE packet_id = %s FOR UPDATE",
                     (close_packet_id,),
                 )
                 close_state = cursor.fetchone()
@@ -2253,9 +2420,7 @@ class PostgresLedger:
                 raise ValueError(f"Unknown option packet {packet_id}")
             if row[0] == "revoked":
                 if row[1] != reason:
-                    raise ValueError(
-                        f"Option packet {packet_id} was revoked for another reason"
-                    )
+                    raise ValueError(f"Option packet {packet_id} was revoked for another reason")
                 return
             if row[0] != "authorized":
                 raise ValueError(f"Option packet {packet_id} cannot be cancelled")
@@ -2337,9 +2502,7 @@ class PostgresLedger:
                     or str(latest_batch[0]) != research_batch_id
                     or unfinished is not None
                 ):
-                    raise RuntimeError(
-                        "Execution reservation references stale research"
-                    )
+                    raise RuntimeError("Execution reservation references stale research")
             cursor.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (f"execution-budget:{account_hash}:{trade_date.isoformat()}",),
@@ -2400,9 +2563,7 @@ class PostgresLedger:
                         bool(is_entry),
                         bool(is_option_open),
                     ):
-                        raise ValueError(
-                            f"Execution reservation {ref_id} is immutable"
-                        )
+                        raise ValueError(f"Execution reservation {ref_id} is immutable")
                 else:
                     new_orders.append(
                         (
@@ -2419,39 +2580,34 @@ class PostgresLedger:
                 observed_entry_notional,
             ) = observed_usage
             projected = {
-                "total_orders": max(usage["total_orders"], observed_orders)
-                + len(new_orders),
-                "total_notional": max(
-                    usage["total_notional"], observed_notional
-                )
+                "total_orders": max(usage["total_orders"], observed_orders) + len(new_orders),
+                "total_notional": max(usage["total_notional"], observed_notional)
                 + sum(notional for _, notional, _, _ in new_orders),
-                "entry_orders": max(
-                    usage["entry_orders"], observed_entry_orders
-                )
+                "entry_orders": max(usage["entry_orders"], observed_entry_orders)
                 + sum(is_entry for _, _, is_entry, _ in new_orders),
-                "entry_notional": max(
-                    usage["entry_notional"], observed_entry_notional
-                )
-                + sum(
-                    notional
-                    for _, notional, is_entry, _ in new_orders
-                    if is_entry
-                ),
+                "entry_notional": max(usage["entry_notional"], observed_entry_notional)
+                + sum(notional for _, notional, is_entry, _ in new_orders if is_entry),
                 "option_openings": usage["option_openings"]
-                + sum(
-                    is_option_open
-                    for _, _, _, is_option_open in new_orders
-                ),
+                + sum(is_option_open for _, _, _, is_option_open in new_orders),
             }
+            new_option_openings = sum(is_option_open for _, _, _, is_option_open in new_orders)
+            has_new_entry = any(is_entry for _, _, is_entry, _ in new_orders)
             if (
-                projected["total_orders"] > max_orders
-                or projected["total_notional"] > max_notional
+                (
+                    has_new_entry
+                    and (
+                        projected["total_orders"] > max_orders
+                        or projected["total_notional"] > max_notional
+                    )
+                )
                 or projected["entry_orders"] > max_entry_orders
                 or projected["entry_notional"] > max_entry_notional
                 or projected["option_openings"] > max_option_openings
-                or observed_open_option_positions
-                + projected["option_openings"]
-                > max_option_openings
+                or (
+                    new_option_openings > 0
+                    and observed_open_option_positions + projected["option_openings"]
+                    > max_option_openings
+                )
             ):
                 raise RuntimeError("Durable execution budget would be exceeded")
             cursor.execute(

@@ -131,7 +131,7 @@ def target_for_date(
 def build_daily_targets(
     prices: pd.DataFrame, config: StrategyConfig
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Build month-end targets and lag them one trading day to prevent lookahead."""
+    """Build month-end targets with a conservative close-to-close execution lag."""
     month_ends = prices.groupby(prices.index.to_period("M")).tail(1).index
     targets: dict[pd.Timestamp, pd.Series] = {}
     decisions: list[pd.DataFrame] = []
@@ -146,7 +146,7 @@ def build_daily_targets(
         raise ValueError("Price history is too short to produce a signal")
 
     monthly = pd.DataFrame(targets).T.reindex(columns=config.all_assets)
-    daily = monthly.reindex(prices.index).ffill().shift(1).fillna(0.0)
+    daily = monthly.reindex(prices.index).ffill().shift(config.signal_lag_trading_days).fillna(0.0)
     no_position = daily.sum(axis=1).eq(0.0)
     daily.loc[no_position, CASH_ASSET] = 1.0
     decision_frame = pd.concat(decisions, ignore_index=True)

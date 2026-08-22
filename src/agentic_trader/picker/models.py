@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any
@@ -18,6 +19,19 @@ CRITIC_SOFT_DIMENSIONS = {
 }
 PACKET_ACTIONS = {"buy", "close"}
 THESIS_STATUSES = {"pending_entry", "active", "expired", "invalidated", "closed", "cancelled"}
+EVIDENCE_SOURCE_ALIASES = {
+    "issuer_release": "issuer_primary",
+    "reputable_news": "reputable_reporting",
+}
+EVIDENCE_AUTHORITIES = {
+    "issuer_primary": "issuer",
+    "exchange_notice": "exchange",
+    "government_record": "government",
+    "reputable_reporting": "reporting",
+    "social_unverified": "social",
+    # Kept parseable for historical records, but no longer live-authoritative.
+    "sec_filing": "sec",
+}
 
 
 def parse_timestamp(value: str | datetime) -> datetime:
@@ -37,16 +51,36 @@ def parse_date(value: str | date) -> date:
 
 def unit_interval(name: str, value: Any) -> float:
     parsed = float(value)
-    if not 0.0 <= parsed <= 1.0:
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
         raise ValueError(f"{name} must be between 0 and 1")
     return parsed
 
 
 def positive(name: str, value: Any) -> float:
     parsed = float(value)
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ValueError(f"{name} must be positive")
     return parsed
+
+
+def finite_number(name: str, value: Any) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    return parsed
+
+
+def nonnegative(name: str, value: Any) -> float:
+    parsed = finite_number(name, value)
+    if parsed < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return parsed
+
+
+def strict_bool(name: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a JSON boolean")
+    return value
 
 
 def canonical_json(payload: dict[str, Any]) -> str:
@@ -109,17 +143,25 @@ class EvidenceVersion:
         cik = str(raw.get("cik", "")).strip()
         if cik and (not cik.isdigit() or len(cik) > 10):
             raise ValueError("Evidence CIK must contain at most 10 digits")
-        source_type = str(raw["source_type"])
+        source_type = EVIDENCE_SOURCE_ALIASES.get(
+            str(raw["source_type"]).strip().lower(),
+            str(raw["source_type"]).strip().lower(),
+        )
+        if source_type not in EVIDENCE_AUTHORITIES:
+            raise ValueError(f"Unsupported evidence source type: {source_type}")
         host = urlparse(url).hostname or ""
-        if (
-            (host == "sec.gov" or host.endswith(".sec.gov"))
-            and source_type == "sec_filing"
+        host = host.casefold()
+        derived_authority = EVIDENCE_AUTHORITIES[source_type]
+        if source_type == "sec_filing" and not (host == "sec.gov" or host.endswith(".sec.gov")):
+            raise ValueError("SEC evidence must use an sec.gov URL")
+        if source_type == "government_record" and (
+            not host.endswith(".gov") or host == "sec.gov" or host.endswith(".sec.gov")
         ):
-            derived_authority = "sec"
-        elif host.endswith(".gov") and source_type == "government_record":
-            derived_authority = "government"
-        else:
-            derived_authority = "reporting"
+            raise ValueError("Government evidence must use a non-SEC .gov URL")
+        if source_type in {"reputable_reporting", "social_unverified"} and primary:
+            raise ValueError(f"{source_type} cannot be declared a primary source")
+        if source_type in {"reputable_reporting", "social_unverified"} and issuer_verified:
+            raise ValueError(f"{source_type} cannot be declared issuer-verified")
         declared_authority = str(raw.get("authority", derived_authority)).lower()
         if declared_authority and declared_authority != derived_authority:
             raise ValueError("Evidence authority does not match source URL/type")
@@ -169,6 +211,9 @@ class QuantSnapshot:
     volatility_63d: float
     beta_252d: float
     atr_pct: float
+    data_snapshot_hash: str = ""
+    feature_version: str = ""
+    calculated_by: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> QuantSnapshot:
@@ -178,16 +223,19 @@ class QuantSnapshot:
             last_price=positive("last_price", raw["last_price"]),
             market_cap=positive("market_cap", raw["market_cap"]),
             average_dollar_volume=positive("average_dollar_volume", raw["average_dollar_volume"]),
-            spread_bps=max(0.0, float(raw["spread_bps"])),
+            spread_bps=nonnegative("spread_bps", raw["spread_bps"]),
             sector=str(raw["sector"]).strip() or "Unknown",
-            fractional_tradable=bool(raw["fractional_tradable"]),
-            sufficient_history=bool(raw["sufficient_history"]),
+            fractional_tradable=strict_bool("fractional_tradable", raw["fractional_tradable"]),
+            sufficient_history=strict_bool("sufficient_history", raw["sufficient_history"]),
             momentum_rank=unit_interval("momentum_rank", raw["momentum_rank"]),
             quality_rank=unit_interval("quality_rank", raw["quality_rank"]),
             revisions_rank=unit_interval("revisions_rank", raw["revisions_rank"]),
-            volatility_63d=max(0.0, float(raw["volatility_63d"])),
-            beta_252d=float(raw["beta_252d"]),
+            volatility_63d=nonnegative("volatility_63d", raw["volatility_63d"]),
+            beta_252d=finite_number("beta_252d", raw["beta_252d"]),
             atr_pct=positive("atr_pct", raw["atr_pct"]),
+            data_snapshot_hash=str(raw.get("data_snapshot_hash", "")),
+            feature_version=str(raw.get("feature_version", "")),
+            calculated_by=str(raw.get("calculated_by", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -283,22 +331,14 @@ class CriticVerdict:
         if isinstance(raw_soft_checks, dict):
             if any(not isinstance(value, bool) for value in raw_soft_checks.values()):
                 raise ValueError("Critic soft checks must be JSON booleans")
-            soft_checks = tuple(
-                sorted((str(key), value) for key, value in raw_soft_checks.items())
-            )
+            soft_checks = tuple(sorted((str(key), value) for key, value in raw_soft_checks.items()))
         else:
             if any(not isinstance(value, bool) for _, value in raw_soft_checks):
                 raise ValueError("Critic soft checks must be booleans")
-            soft_checks = tuple(
-                sorted((str(key), value) for key, value in raw_soft_checks)
-            )
-        unknown_soft_checks = {
-            key for key, _ in soft_checks
-        } - CRITIC_SOFT_DIMENSIONS
+            soft_checks = tuple(sorted((str(key), value) for key, value in raw_soft_checks))
+        unknown_soft_checks = {key for key, _ in soft_checks} - CRITIC_SOFT_DIMENSIONS
         if unknown_soft_checks:
-            raise ValueError(
-                f"Unknown critic soft checks: {sorted(unknown_soft_checks)}"
-            )
+            raise ValueError(f"Unknown critic soft checks: {sorted(unknown_soft_checks)}")
         return cls(
             draft_id=str(raw["draft_id"]),
             model_id=str(raw["model_id"]),

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from .critic_policy import evaluate_critic_policy
+from .features import FEATURE_VERSION
 from .models import (
     CriticVerdict,
     DecisionPacket,
@@ -30,13 +31,14 @@ class LivePickerPolicy:
     min_novelty: float = 0.40
     min_timing: float = 0.35
     max_speculation: float = 0.40
-    max_stock_weight: float = 0.15
+    max_stock_weight: float = 0.035
     risk_per_thesis: float = 0.01
     min_stop_loss_pct: float = 0.05
     max_stop_loss_pct: float = 0.12
     sector_relative_stop_pct: float = 0.05
     packet_ttl_minutes: int = 120
     max_quant_age_minutes: int = 180
+    require_deterministic_quant: bool = True
 
 
 @dataclass(frozen=True)
@@ -108,9 +110,8 @@ def validate_picker_draft(
             for item in evidence
             if item.primary
             and item.symbol == draft.symbol
-            and item.cik
             and item.issuer_verified
-            and item.authority in {"sec", "government"}
+            and item.authority in {"issuer", "exchange"}
         ]
         if not authoritative_primary:
             reasons.append("no_authoritative_primary_source")
@@ -126,8 +127,17 @@ def validate_picker_draft(
     else:
         if quant.symbol != draft.symbol:
             reasons.append("quant_symbol_mismatch")
+        if quant.as_of > now:
+            reasons.append("future_quant_snapshot")
         if now - quant.as_of > timedelta(minutes=policy.max_quant_age_minutes):
             reasons.append("stale_quant_snapshot")
+        if policy.require_deterministic_quant and (
+            quant.calculated_by != "agentic_trader.picker.features"
+            or quant.feature_version != FEATURE_VERSION
+            or len(quant.data_snapshot_hash) != 64
+            or any(character not in "0123456789abcdef" for character in quant.data_snapshot_hash)
+        ):
+            reasons.append("quant_not_deterministically_computed")
         if not quant.sufficient_history:
             reasons.append("insufficient_price_history")
         if not quant.fractional_tradable:

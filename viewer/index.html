@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Trading knowledge graph</title>
+  <link rel="stylesheet" href="/viewer/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="eyebrow">Agentic Trader</span>
+      <h1>Knowledge graph</h1>
+    </div>
+    <label class="search-wrap" for="search">
+      <span>Search</span>
+      <input id="search" type="search" autocomplete="off"
+             placeholder="ID, title, alias, type, or path">
+    </label>
+    <div class="top-actions">
+      <span id="counts" class="counts" aria-live="polite"></span>
+      <button id="reset" type="button">Reset view</button>
+      <button id="regen" type="button">Regenerate</button>
+    </div>
+  </header>
+
+  <main>
+    <aside class="sidebar" aria-label="Graph filters and node list">
+      <section>
+        <div class="section-heading">
+          <h2>Node types</h2>
+          <span>click to hide</span>
+        </div>
+        <div id="types" class="chips"></div>
+      </section>
+      <section>
+        <div class="section-heading">
+          <h2>Relations</h2>
+          <span>click to hide</span>
+        </div>
+        <div id="relations" class="chips"></div>
+      </section>
+      <section class="node-section">
+        <div class="section-heading">
+          <h2>Visible nodes</h2>
+          <span id="list-count"></span>
+        </div>
+        <div id="node-list" class="node-list"></div>
+      </section>
+    </aside>
+
+    <section id="stage" class="stage" aria-label="Interactive graph canvas">
+      <canvas id="canvas" tabindex="0" aria-label="Trading knowledge graph"></canvas>
+      <div class="stage-status">
+        <span id="layout-status">loading</span>
+        <span>all nodes shown by default</span>
+      </div>
+      <p class="hint">drag nodes · drag background to pan · scroll to zoom</p>
+    </section>
+
+    <article id="details" class="details" aria-live="polite">
+      <p class="muted">Select a node to inspect its Markdown and typed edges.</p>
+    </article>
+  </main>
+
+  <script src="/viewer/app.js"></script>
+</body>
+</html>

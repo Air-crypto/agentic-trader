@@ -29,9 +29,20 @@ def test_evidence_requires_strict_booleans_and_valid_issuer_identity(evidence):
     with pytest.raises(ValueError, match="CIK"):
         EvidenceVersion.from_dict(raw)
     raw = evidence[0].to_dict()
-    raw["url"] = "https://example.com/not-sec"
+    raw["authority"] = "reporting"
     with pytest.raises(ValueError, match="authority"):
         EvidenceVersion.from_dict(raw)
+
+
+def test_quant_snapshot_requires_real_booleans_and_finite_values(quant):
+    raw = quant.to_dict()
+    raw["fractional_tradable"] = "false"
+    with pytest.raises(ValueError, match="JSON boolean"):
+        type(quant).from_dict(raw)
+    raw = quant.to_dict()
+    raw["beta_252d"] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        type(quant).from_dict(raw)
 
 
 def test_critic_soft_checks_require_real_json_booleans(critic):
@@ -58,7 +69,7 @@ def test_decision_packet_hash_detects_any_change(now):
         sector="Industrials",
         rank_score=0.8,
         thesis_hash="a" * 64,
-        evidence_ids=("sec-1", "gov-1"),
+        evidence_ids=("issuer-1", "gov-1"),
         prompt_hash="b" * 64,
         model_id="analyst-model",
     ).with_hash()
@@ -84,7 +95,7 @@ def test_decision_packet_rejects_tampered_json(now):
         sector="Industrials",
         rank_score=0.8,
         thesis_hash="a" * 64,
-        evidence_ids=("sec-1", "gov-1"),
+        evidence_ids=("issuer-1", "gov-1"),
         prompt_hash="b" * 64,
         model_id="analyst-model",
     ).with_hash()

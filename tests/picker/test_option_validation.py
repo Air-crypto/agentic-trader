@@ -25,7 +25,7 @@ def option_draft(now, action: str = "long_call") -> OptionDraft:
         underlying="EXM",
         action=action,
         thesis=f"The {action} structure expresses the inherited evidence with bounded sizing.",
-        evidence_ids=("sec-1", "gov-1"),
+        evidence_ids=("issuer-1", "gov-1"),
         source_draft_id="draft-1",
     )
 
@@ -99,10 +99,7 @@ def test_selector_deterministically_prefers_target_delta_then_dte(now):
 def test_selector_accepts_exact_quote_and_spread_boundaries(now):
     boundary = snapshot(now, bid=0.95, ask=1.05, age_seconds=60, dte=21)
 
-    assert (
-        select_option_contract("long_call", [boundary], now=now, underlying="EXM")
-        == boundary
-    )
+    assert select_option_contract("long_call", [boundary], now=now, underlying="EXM") == boundary
 
 
 @pytest.mark.parametrize(
@@ -138,9 +135,7 @@ def test_selector_requires_otm_collateralized_contracts(now):
         )
 
 
-def test_grounded_long_call_authorizes_one_limit_contract(
-    now, evidence, critic, draft
-):
+def test_grounded_long_call_authorizes_one_limit_contract(now, evidence, critic, draft):
     result = authorize(option_draft(now), [snapshot(now)], evidence, critic, draft, now)
 
     assert result.accepted
@@ -153,13 +148,11 @@ def test_grounded_long_call_authorizes_one_limit_contract(
     assert result.packet.verify_hash()
 
 
-def test_one_inherited_primary_source_and_critic_pass_authorize(
-    now, evidence, critic, draft
-):
-    source_draft = replace(draft, evidence_ids=("sec-1",))
+def test_one_inherited_primary_source_and_critic_pass_authorize(now, evidence, critic, draft):
+    source_draft = replace(draft, evidence_ids=("issuer-1",))
     option = replace(
         option_draft(now),
-        evidence_ids=("sec-1",),
+        evidence_ids=("issuer-1",),
         draft_hash="",
     )
 
@@ -174,12 +167,10 @@ def test_one_inherited_primary_source_and_critic_pass_authorize(
 
     assert result.accepted
     assert result.packet is not None
-    assert result.packet.evidence_ids == ("sec-1",)
+    assert result.packet.evidence_ids == ("issuer-1",)
 
 
-def test_quantity_policy_cannot_expand_single_contract_authority(
-    now, evidence, critic, draft
-):
+def test_quantity_policy_cannot_expand_single_contract_authority(now, evidence, critic, draft):
     with pytest.raises(ValueError, match="quantity"):
         LiveOptionPolicy(quantity=2)
 
@@ -194,9 +185,7 @@ def test_packet_hash_and_id_are_deterministic(now, evidence, critic, draft):
     assert first.packet.packet_hash == second.packet.packet_hash
 
 
-def test_long_premium_trade_and_aggregate_caps_are_enforced(
-    now, evidence, critic, draft
-):
+def test_long_premium_trade_and_aggregate_caps_are_enforced(now, evidence, critic, draft):
     expensive = authorize(
         option_draft(now),
         [snapshot(now, bid=0.72, ask=0.78)],
@@ -222,9 +211,7 @@ def test_long_premium_trade_and_aggregate_caps_are_enforced(
     assert "aggregate_long_premium_risk_exceeds_cap" in aggregate.reasons
 
 
-def test_nonfinite_risk_inputs_and_policy_limits_fail_closed(
-    now, evidence, critic, draft
-):
+def test_nonfinite_risk_inputs_and_policy_limits_fail_closed(now, evidence, critic, draft):
     result = authorize(
         option_draft(now),
         [snapshot(now)],
@@ -240,9 +227,7 @@ def test_nonfinite_risk_inputs_and_policy_limits_fail_closed(
         LiveOptionPolicy(max_spread_pct_midpoint=float("nan"))
 
 
-def test_covered_call_requires_and_encumbers_100_free_shares(
-    now, evidence, critic, draft
-):
+def test_covered_call_requires_and_encumbers_100_free_shares(now, evidence, critic, draft):
     covered_call = option_draft(now, "covered_call")
     insufficient = authorize(
         covered_call,
@@ -271,9 +256,7 @@ def test_covered_call_requires_and_encumbers_100_free_shares(
     assert accepted.packet.shares_encumbered == 100
 
 
-def test_csp_requires_cash_and_both_collateral_and_assignment_caps(
-    now, evidence, critic, draft
-):
+def test_csp_requires_cash_and_both_collateral_and_assignment_caps(now, evidence, critic, draft):
     csp = option_draft(now, "cash_secured_put")
     contract = snapshot(
         now,
@@ -311,10 +294,8 @@ def test_csp_requires_cash_and_both_collateral_and_assignment_caps(
     assert "post_assignment_issuer_limit_exceeded" in rejected.reasons
 
 
-def test_source_evidence_and_critic_are_inherited_exactly(
-    now, evidence, critic, draft
-):
-    changed = replace(option_draft(now), evidence_ids=("sec-1",), draft_hash="")
+def test_source_evidence_and_critic_are_inherited_exactly(now, evidence, critic, draft):
+    changed = replace(option_draft(now), evidence_ids=("issuer-1",), draft_hash="")
     result = authorize(changed, [snapshot(now)], evidence, critic, draft, now)
 
     assert not result.accepted
@@ -330,10 +311,8 @@ def test_critic_veto_blocks_option_authorization(now, evidence, critic, draft):
     assert "critic_veto" in result.reasons
 
 
-def test_critic_contradiction_hard_vetoes_option_with_pass(
-    now, evidence, critic, draft
-):
-    contradicted = replace(critic, contradicted_evidence_ids=("sec-1",))
+def test_critic_contradiction_hard_vetoes_option_with_pass(now, evidence, critic, draft):
+    contradicted = replace(critic, contradicted_evidence_ids=("issuer-1",))
     result = authorize(
         option_draft(now),
         [snapshot(now)],
@@ -347,9 +326,7 @@ def test_critic_contradiction_hard_vetoes_option_with_pass(
     assert "critic_found_contradicted_evidence" in result.reasons
 
 
-def test_option_authorization_requires_independent_grok_critic(
-    now, evidence, critic, draft
-):
+def test_option_authorization_requires_an_approved_independent_critic(now, evidence, critic, draft):
     same_model = replace(critic, model_id="option-model")
     result = authorize(
         option_draft(now),
@@ -363,9 +340,7 @@ def test_option_authorization_requires_independent_grok_critic(
     assert "critic_model_not_independent" in result.reasons
 
 
-def test_close_uses_existing_contract_and_bypasses_entry_dte(
-    now, evidence, critic
-):
+def test_close_uses_existing_contract_and_bypasses_entry_dte(now, evidence, critic):
     open_contract = snapshot(now, dte=10)
     position = ActiveOptionPosition(
         position_id="position-1",

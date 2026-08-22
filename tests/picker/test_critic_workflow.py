@@ -32,13 +32,18 @@ def _critics_file(tmp_path, as_of, critics):
     return critics_path
 
 
-def test_pending_sonnet_batch_is_finalized_only_by_grok(
+@pytest.mark.parametrize(
+    "critic_model_id",
+    ("cursor-grok-4.5-high-fast", "gpt-5.5", "gpt-5.6-sol"),
+)
+def test_pending_sonnet_batch_is_finalized_by_an_approved_independent_critic(
     monkeypatch,
     tmp_path,
     now,
     evidence,
     draft,
     critic,
+    critic_model_id,
 ):
     ledger = InMemoryLedger()
     monkeypatch.setattr(
@@ -61,19 +66,18 @@ def test_pending_sonnet_batch_is_finalized_only_by_grok(
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_text(json.dumps(bundle))
     ledger.start_research_cycle("cycle-1", now.date(), now)
-    assert (
-        cli.command_picker_stage_pending(Namespace(bundle=str(bundle_path))) == 0
-    )
+    assert cli.command_picker_stage_pending(Namespace(bundle=str(bundle_path))) == 0
     assert ledger.latest_staged_batch(now.date()) is None
 
-    critics_path = _critics_file(tmp_path, now.date(), [critic])
+    approved_critic = replace(critic, model_id=critic_model_id)
+    critics_path = _critics_file(tmp_path, now.date(), [approved_critic])
     args = Namespace(
         critics=str(critics_path),
         as_of=now.date().isoformat(),
     )
     assert cli.command_picker_finalize_pending(args) == 0
     staged = ledger.latest_staged_batch(now.date())
-    assert staged["payload"]["critics"][0]["model_id"] == critic.model_id
+    assert staged["payload"]["critics"][0]["model_id"] == critic_model_id
     assert ledger.latest_pending_batch(now.date()) is None
 
 
@@ -97,7 +101,7 @@ def test_pending_batch_rejects_same_model_critic(
         "created_at": now.isoformat(),
         "as_of": now.date().isoformat(),
         "prompt_hash": "a" * 64,
-        "model_id": "claude-sonnet-5",
+        "model_id": "gpt-5.5",
         "run_id": draft.run_id,
         "evidence": [item.to_dict() for item in evidence],
         "drafts": [draft.to_dict()],
@@ -106,11 +110,10 @@ def test_pending_batch_rejects_same_model_critic(
     bundle_path = tmp_path / "bundle.json"
     bundle_path.write_text(json.dumps(bundle))
     ledger.start_research_cycle("cycle-2", now.date(), now)
-    cli.command_picker_stage_pending(Namespace(bundle=str(bundle_path))
-    )
-    self_critic = replace(critic, model_id="claude-sonnet-5")
+    cli.command_picker_stage_pending(Namespace(bundle=str(bundle_path)))
+    self_critic = replace(critic, model_id=" GPT-5.5 ")
     critics_path = _critics_file(tmp_path, now.date(), [self_critic])
-    with pytest.raises(ValueError, match="independent Grok"):
+    with pytest.raises(ValueError, match="approved independent critic"):
         cli.command_picker_finalize_pending(
             Namespace(
                 critics=str(critics_path),

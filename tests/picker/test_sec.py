@@ -6,6 +6,7 @@ from argparse import Namespace
 import pytest
 
 import agentic_trader.cli as cli
+from agentic_trader.sources.registry import SourceRegistry
 from agentic_trader.sources.sec import SECClient
 
 
@@ -45,7 +46,7 @@ def test_recent_filings_parses_legacy_and_iso_acceptance_datetime(monkeypatch, t
     assert filings[1].accepted_at.isoformat() == "2026-08-05T20:38:25+00:00"
 
 
-def test_evidence_verifier_binds_symbol_to_official_sec_cik(
+def test_evidence_verifier_binds_symbol_to_versioned_issuer_domain(
     monkeypatch,
     tmp_path,
     evidence,
@@ -59,16 +60,18 @@ def test_evidence_verifier_binds_symbol_to_official_sec_cik(
     documents.mkdir()
     (documents / f"{raw['evidence_id']}.txt").write_text(raw["quote"])
 
-    class FakeSECClient:
-        @staticmethod
-        def quote_is_grounded(document, quote):
-            return SECClient.quote_is_grounded(document, quote)
-
-        @staticmethod
-        def ticker_map():
-            return {"EXM": "0001234567"}
-
-    monkeypatch.setattr(cli, "SECClient", FakeSECClient)
+    registry = SourceRegistry(
+        schema_version=1,
+        reviewed_at="2026-08-21",
+        issuers={"EXM": ("example.com",)},
+        exchange_domains=(),
+        social_domains=("reddit.com", "x.com"),
+    )
+    monkeypatch.setattr(
+        cli.SourceRegistry,
+        "default",
+        classmethod(lambda cls: registry),
+    )
     output = tmp_path / "verified.json"
     assert (
         cli.command_picker_verify_evidence(
@@ -82,15 +85,19 @@ def test_evidence_verifier_binds_symbol_to_official_sec_cik(
     )
     verified = json.loads(output.read_text())["evidence"][0]
     assert verified["issuer_verified"] is True
-    assert verified["authority"] == "sec"
+    assert verified["authority"] == "issuer"
 
-    class WrongMapClient(FakeSECClient):
-        @staticmethod
-        def ticker_map():
-            return {"EXM": "0000000001"}
-
-    monkeypatch.setattr(cli, "SECClient", WrongMapClient)
-    with pytest.raises(ValueError, match="live SEC"):
-        cli._verify_official_issuer_mappings(
-            [cli.EvidenceVersion.from_dict(verified)]
-        )
+    wrong_registry = SourceRegistry(
+        schema_version=1,
+        reviewed_at="2026-08-21",
+        issuers={"EXM": ("wrong.example",)},
+        exchange_domains=(),
+        social_domains=("reddit.com", "x.com"),
+    )
+    monkeypatch.setattr(
+        cli.SourceRegistry,
+        "default",
+        classmethod(lambda cls: wrong_registry),
+    )
+    with pytest.raises(ValueError, match="registered-source"):
+        cli._verify_official_issuer_mappings([cli.EvidenceVersion.from_dict(verified)])

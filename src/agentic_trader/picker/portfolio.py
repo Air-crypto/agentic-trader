@@ -9,10 +9,10 @@ from .models import ActiveThesis, DecisionPacket
 
 @dataclass(frozen=True)
 class PickerPortfolioPolicy:
-    max_active_names: int = 6
-    max_stock_weight: float = 0.15
-    max_sector_weight: float = 0.30
-    min_cash_weight: float = 0.10
+    max_active_names: int = 3
+    max_stock_weight: float = 0.035
+    max_sector_weight: float = 0.07
+    min_cash_weight: float = 0.895
 
 
 @dataclass(frozen=True)

@@ -22,7 +22,7 @@ def now() -> datetime:
 def evidence(now: datetime) -> list[EvidenceVersion]:
     document = "The company raised annual revenue guidance by ten percent after new orders."
     common = {
-        "source_type": "sec_filing",
+        "source_type": "issuer_primary",
         "published_at": now - timedelta(hours=2),
         "first_seen_at": now - timedelta(hours=2),
         "retrieved_at": now - timedelta(hours=1),
@@ -35,12 +35,12 @@ def evidence(now: datetime) -> list[EvidenceVersion]:
     }
     return [
         EvidenceVersion(
-            evidence_id="sec-1",
-            title="8-K",
-            publisher="SEC",
-            url="https://www.sec.gov/example",
+            evidence_id="issuer-1",
+            title="Issuer results",
+            publisher="Example issuer",
+            url="https://investors.example.com/results",
             primary=True,
-            authority="sec",
+            authority="issuer",
             independence_group="issuer",
             **common,
         ),
@@ -52,7 +52,11 @@ def evidence(now: datetime) -> list[EvidenceVersion]:
             primary=False,
             authority="government",
             independence_group="government",
-            **{**common, "source_type": "government_record"},
+            **{
+                **common,
+                "source_type": "government_record",
+                "issuer_verified": False,
+            },
         ),
     ]
 
@@ -75,6 +79,9 @@ def quant(now: datetime) -> QuantSnapshot:
         volatility_63d=0.3,
         beta_252d=1.1,
         atr_pct=0.03,
+        data_snapshot_hash="f" * 64,
+        feature_version="picker_features_v1",
+        calculated_by="agentic_trader.picker.features",
     )
 
 
@@ -94,7 +101,7 @@ def draft(now: datetime) -> PickerDraft:
         priced_in_analysis="Shares moved less than one percent after filing",
         counter_thesis="Orders could pull revenue forward",
         invalidation="Guidance withdrawn or relative stop breached",
-        evidence_ids=("sec-1", "gov-1"),
+        evidence_ids=("issuer-1", "gov-1"),
         event_quality=0.9,
         materiality=0.7,
         novelty=0.8,

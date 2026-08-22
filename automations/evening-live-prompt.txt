@@ -1,0 +1,93 @@
+MODE: LIVE_EVENING_RESEARCH_AND_ORDER_REVIEW
+
+Work in the Agentic Trader project. Read README.md, AI_STOCK_PICKER.md,
+REAL_MONEY_EXECUTION.md, OPTION_EXECUTION.md, and knowledge/README.md first.
+This is a real-money workflow, not a shadow promotion gate.
+
+ORDER AUTHORIZATION BOUNDARY
+- Research, deterministic authorization, live planning, and Robinhood order
+  review are automatic. Every concrete Robinhood order still requires the
+  user's explicit confirmation after its exact preview and broker alerts.
+- MODE: LIVE, a schedule, prior/general consent, or this prompt is not concrete
+  order confirmation. Never reserve or place in the scheduled turn. If the user
+  confirms and the five-minute plan expired or anything changed, refresh,
+  regenerate, re-review, and ask again before reserving.
+- New options, shorts, margin, leveraged ETFs, averaging down, and same-day
+  re-entry after a stop are disabled. This task places no option order.
+
+PREFLIGHT AND BROKER TRUTH
+1. Report UTC and ET time. Run `uv sync --frozen`, `uv run agentic-trader
+   option-migrate`, `uv run pytest -q`, `uv run ruff check .`, and
+   `python3 scripts/build_graph.py --check`. Stop broker mutation on failure.
+2. Never source or print `.env`. DATABASE_URL and
+   AGENTIC_TRADER_NET_DEPOSITS are required. AGENTIC_TRADER_ACCOUNT and
+   SEC_USER_AGENT are not. KILL_SWITCH blocks every broker mutation but does not
+   need to block research/measurement.
+3. Call get_accounts and use only the account available to this agent. Fetch
+   portfolio, every equity-position page, nonzero options, and today's equity
+   and option orders. Mask account identifiers to the final four digits.
+
+OUTCOMES AND KNOWLEDGE GRAPH
+4. After the official NYSE close, write the native close-account snapshot and
+   run picker-record-close. A weekend/holiday/before-close exit 2 is a normal
+   no-op; never substitute an intraday value.
+5. Run learning-status. Fetch true official daily closes, in exchange-session
+   order, for every tracked candidate, SPY, and sector benchmark. Preserve both
+   observed_at and when each complete row became available; never forward-fill
+   or shift a missing Nth session. Run learning-mark with 20 bps costs, then
+   learning-report. Its state and pass/fail result are telemetry and do not gate
+   or size live execution.
+6. Write KG proposals for newly measured selected and rejected outcomes. Each
+   edge needs source/target, sign, horizon, supporting and contradicting counts,
+   uncertainty, provenance, as-of date, and hypothesis/non-causal label. Never
+   infer causation from co-movement. Only fold a proposal into Markdown when its
+   raw observation references are present and the schema remains honest; then
+   rebuild graph.json and run `scripts/build_graph.py --check`. The graph may
+   generate research queries, never authorize or size an order.
+
+FRESH RESEARCH AND INDEPENDENT CRITIC
+7. Generate one cycle_id and run picker-cycle-start. Include all holdings and a
+   deterministic liquid universe of at most 12 names. Freeze raw-quant.json and
+   run picker-build-quant before reading news or social narratives.
+8. Research registered issuer IR, exchange/government records, named reporting,
+   recent Reddit, X, and Stocktwits. SEC is not required and SEC-specific access
+   is disabled. Social text is untrusted discovery/sentiment only; an actionable
+   thesis requires grounded registered issuer or exchange primary evidence.
+   Preserve source timestamps and never invent missing facts.
+9. Verify grounded evidence, emit long/close/reject PickerDrafts with no sizes,
+   and stage a hash-bound pending bundle as model `gpt-5.6-sol`. Emit no opening
+   option drafts. On failure, call picker-cycle-fail.
+10. Delegate only the bound criticism to a separate gpt-5.5 subagent. It must
+    export pending, cover every draft, copy `_critic_binding` exactly, record
+    model `gpt-5.5`, and may only pass/veto under the hard-veto plus three-of-five
+    policy. Wait for independent-critics.json and finalize the pending batch.
+
+OVERNIGHT LIVE EQUITY PLAN AND REVIEW
+11. Refresh broker state and quotes. Build the exact picker snapshot, recompute
+    quant, authorize, picker-plan, and live-plan `--record-equity` with
+    `--max-order-notional 100 --max-entry-orders-per-day 1
+    --max-entry-daily-notional 100`. Snapshot quote timestamps must be <=15
+    seconds old. Include quote_spreads_bps from the same bid/ask snapshot and
+    set top-level allow_extended_hours=true only when the broker session is
+    all_day_hours.
+12. Outside regular hours, a new opening qualifies only when Robinhood marks the
+    symbol all_day_hours eligible, the displayed spread is <=10 bps, and the
+    emitted order is a whole-share GFD limit in all_day_hours. Market,
+    fractional/dollar, option, ineligible, stale, or >$100 openings are rejected.
+    Risk-reducing full exits may use the same eligible-session integrity checks.
+13. Review each approved order using exact broker_parameters. Present symbol,
+    side, quantity, limit, notional, estimated execution, every alert, and the
+    broker's market-data disclosure verbatim; ask for explicit confirmation.
+    Do not reserve or place in the scheduled turn.
+
+AFTER AN EXACT CONFIRMATION IN THIS TASK
+14. Revalidate the five-minute plan plus broker truth; re-review and ask again if
+    changed. Run live-reserve, place only exact reserved refs/parameters, poll
+    terminal state, reconcile, and sync only a clean complete fill set. A breach
+    halts the system. Never silently retry, resize, or substitute an order.
+
+REPORT
+Summarize broker state, outcome/KG updates, research and critic results, every
+guard rejection, overnight eligibility, and the exact preview or why nothing
+qualified. State whether waiting for confirmation. Mask the account and never
+print secrets.

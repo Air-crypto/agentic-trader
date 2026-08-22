@@ -51,10 +51,7 @@ def _number(value: Any) -> float | None:
 def _option_id(value: Any) -> str:
     if isinstance(value, dict):
         value = (
-            value.get("option_id")
-            or value.get("id")
-            or value.get("url")
-            or value.get("instrument")
+            value.get("option_id") or value.get("id") or value.get("url") or value.get("instrument")
         )
     text = str(value or "").strip()
     if not text:

@@ -30,6 +30,9 @@ class StrategyConfig:
     hard_drawdown: float = 0.10
     cooldown_days: int = 21
     one_way_cost_bps: float = 10.0
+    # Close-only data cannot model a next-open fill. Two close rows ensure the
+    # signal does not earn the decision-close to next-close return interval.
+    signal_lag_trading_days: int = 2
 
     @property
     def risk_assets(self) -> tuple[str, ...]:

@@ -1,0 +1,214 @@
+{
+  "edges": [
+    {
+      "as_of": null,
+      "causality": "non_causal",
+      "horizon": "1-trading-day",
+      "id": "event-example-guidance-revision--contradicts--thesis-example-relative-strength",
+      "observations": 0,
+      "provenance": "source-schema-example",
+      "relation": "contradicts",
+      "sign": "negative",
+      "source": "event-example-guidance-revision",
+      "target": "thesis-example-relative-strength",
+      "uncertainty": "unknown"
+    },
+    {
+      "as_of": null,
+      "causality": "hypothesis",
+      "horizon": "20-trading-days",
+      "id": "event-example-guidance-revision--invalidates--thesis-example-relative-strength",
+      "observations": 0,
+      "provenance": "source-schema-example",
+      "relation": "invalidates",
+      "sign": "negative",
+      "source": "event-example-guidance-revision",
+      "target": "thesis-example-relative-strength",
+      "uncertainty": "unknown"
+    },
+    {
+      "as_of": null,
+      "causality": "hypothesis",
+      "horizon": "structural",
+      "id": "issuer-example-company--benefits_from--macro-example-demand-regime",
+      "observations": 0,
+      "provenance": "source-schema-example",
+      "relation": "benefits_from",
+      "sign": "positive",
+      "source": "issuer-example-company",
+      "target": "macro-example-demand-regime",
+      "uncertainty": "unknown"
+    },
+    {
+      "as_of": null,
+      "causality": "hypothesis",
+      "horizon": "structural",
+      "id": "issuer-example-company--hurt_by--macro-example-demand-regime",
+      "observations": 0,
+      "provenance": "source-schema-example",
+      "relation": "hurt_by",
+      "sign": "negative",
+      "source": "issuer-example-company",
+      "target": "macro-example-demand-regime",
+      "uncertainty": "unknown"
+    },
+    {
+      "as_of": null,
+      "causality": "non_causal",
+      "horizon": "unspecified",
+      "id": "model-example-ranking--supports--thesis-example-relative-strength",
+      "observations": 0,
+      "provenance": "source-schema-example",
+      "relation": "supports",
+      "sign": "positive",
+      "source": "model-example-ranking",
+      "target": "thesis-example-relative-strength",
+      "uncertainty": "unknown"
+    },
+    {
+      "as_of": null,
+      "causality": "hypothesis",
+      "horizon": "20-trading-days",
+      "id": "security-example-share--affected_by--factor-example-momentum",
+      "observations": 0,
+      "provenance": "source-schema-example",
+      "relation": "affected_by",
+      "sign": "positive",
+      "source": "security-example-share",
+      "target": "factor-example-momentum",
+      "uncertainty": "unknown"
+    },
+    {
+      "as_of": null,
+      "causality": "non_causal",
+      "horizon": "unspecified",
+      "id": "security-example-share--co_moves_with--sector-example-industry",
+      "observations": 0,
+      "provenance": "source-schema-example",
+      "relation": "co_moves_with",
+      "sign": "positive",
+      "source": "security-example-share",
+      "target": "sector-example-industry",
+      "uncertainty": "unknown"
+    }
+  ],
+  "generated_by": "scripts/build_graph.py",
+  "meta": {
+    "edge_count": 7,
+    "node_count": 9,
+    "node_types": [
+      "security",
+      "issuer",
+      "sector",
+      "factor",
+      "macro",
+      "event_type",
+      "source",
+      "thesis",
+      "model"
+    ],
+    "relation_types": [
+      "supports",
+      "contradicts",
+      "affected_by",
+      "benefits_from",
+      "hurt_by",
+      "co_moves_with",
+      "invalidates"
+    ],
+    "source_of_truth": "knowledge/**/*.md"
+  },
+  "nodes": [
+    {
+      "aliases": [
+        "synthetic revision event"
+      ],
+      "id": "event-example-guidance-revision",
+      "path": "knowledge/event_types/event-example-guidance-revision.md",
+      "status": "example",
+      "title": "Example guidance-revision event",
+      "type": "event_type"
+    },
+    {
+      "aliases": [
+        "momentum schema example"
+      ],
+      "id": "factor-example-momentum",
+      "path": "knowledge/factors/factor-example-momentum.md",
+      "status": "example",
+      "title": "Example momentum factor",
+      "type": "factor"
+    },
+    {
+      "aliases": [
+        "synthetic issuer"
+      ],
+      "id": "issuer-example-company",
+      "path": "knowledge/issuers/issuer-example-company.md",
+      "status": "example",
+      "title": "Example issuer",
+      "type": "issuer"
+    },
+    {
+      "aliases": [
+        "synthetic macro regime"
+      ],
+      "id": "macro-example-demand-regime",
+      "path": "knowledge/macros/macro-example-demand-regime.md",
+      "status": "example",
+      "title": "Example demand regime",
+      "type": "macro"
+    },
+    {
+      "aliases": [
+        "synthetic ranking model"
+      ],
+      "id": "model-example-ranking",
+      "path": "knowledge/models/model-example-ranking.md",
+      "status": "example",
+      "title": "Example ranking model",
+      "type": "model"
+    },
+    {
+      "aliases": [
+        "synthetic sector"
+      ],
+      "id": "sector-example-industry",
+      "path": "knowledge/sectors/sector-example-industry.md",
+      "status": "example",
+      "title": "Example industry sector",
+      "type": "sector"
+    },
+    {
+      "aliases": [
+        "EXAMPLE"
+      ],
+      "id": "security-example-share",
+      "path": "knowledge/securities/security-example-share.md",
+      "status": "example",
+      "title": "Example listed security",
+      "type": "security"
+    },
+    {
+      "aliases": [
+        "synthetic schema source"
+      ],
+      "id": "source-schema-example",
+      "path": "knowledge/sources/source-schema-example.md",
+      "status": "reference",
+      "title": "Schema example provenance",
+      "type": "source"
+    },
+    {
+      "aliases": [
+        "synthetic thesis"
+      ],
+      "id": "thesis-example-relative-strength",
+      "path": "knowledge/theses/thesis-example-relative-strength.md",
+      "status": "example",
+      "title": "Example relative-strength thesis",
+      "type": "thesis"
+    }
+  ],
+  "schema_version": 1
+}

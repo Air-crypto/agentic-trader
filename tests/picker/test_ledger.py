@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -43,6 +43,19 @@ def populated_ledger(draft, evidence, critic, now):
     ledger.put_draft(draft)
     ledger.put_critic(critic)
     return ledger
+
+
+def test_prior_close_is_durable_and_immutable_within_session():
+    ledger = InMemoryLedger()
+    first = date(2026, 8, 20)
+    assert ledger.record_prior_close("account", 1000.0, first) == 1000.0
+    assert ledger.record_prior_close("account", 1000.0, first) == 1000.0
+    with pytest.raises(ValueError, match="immutable"):
+        ledger.record_prior_close("account", 999.0, first)
+    assert ledger.record_prior_close("account", 1010.0, date(2026, 8, 21)) == 1010.0
+    state = ledger.control_state("account")
+    assert state["prior_close_equity"] == 1010.0
+    assert state["prior_close_date"] == date(2026, 8, 21)
 
 
 def test_authorized_packet_round_trip(draft, evidence, quant, critic, now):
@@ -336,12 +349,26 @@ def test_pending_batch_requires_separate_finalization(now):
 
 def test_research_cycle_marker_blocks_until_finalized(now):
     ledger = InMemoryLedger()
-    ledger.start_research_cycle("cycle-1", now.date(), now)
-    assert ledger.latest_unfinished_cycle(now.date())["cycle_id"] == "cycle-1"
+    current = datetime.now(UTC)
+    ledger.start_research_cycle("cycle-1", current.date(), current)
+    assert ledger.latest_unfinished_cycle(current.date())["cycle_id"] == "cycle-1"
     ledger.bind_research_cycle("cycle-1", "batch-1")
-    assert ledger.latest_unfinished_cycle(now.date())["status"] == "pending"
+    assert ledger.latest_unfinished_cycle(current.date())["status"] == "pending"
     ledger.finish_research_cycle("cycle-1", "finalized")
-    assert ledger.latest_unfinished_cycle(now.date()) is None
+    assert ledger.latest_unfinished_cycle(current.date()) is None
+
+
+def test_stale_research_cycle_is_reaped_instead_of_deadlocking():
+    ledger = InMemoryLedger()
+    today = datetime.now(UTC).date()
+    ledger.start_research_cycle(
+        "stale-cycle",
+        today,
+        datetime.now(UTC) - timedelta(hours=7),
+    )
+
+    assert ledger.latest_unfinished_cycle(today) is None
+    assert ledger.research_cycles["stale-cycle"]["status"] == "failed"
 
 
 def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
@@ -373,16 +400,19 @@ def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
         "option_openings": 0,
     }
     # Exact retries are idempotent.
-    assert ledger.reserve_execution_budget(
-        account_hash,
-        now.date(),
-        [
-            ("entry-1", 100.0, True, False),
-            ("entry-2", 100.0, True, False),
-        ],
-        observed_usage=(4, 400.0, 4, 400.0),
-        research_batch_id="research-batch",
-    ) == usage
+    assert (
+        ledger.reserve_execution_budget(
+            account_hash,
+            now.date(),
+            [
+                ("entry-1", 100.0, True, False),
+                ("entry-2", 100.0, True, False),
+            ],
+            observed_usage=(4, 400.0, 4, 400.0),
+            research_batch_id="research-batch",
+        )
+        == usage
+    )
     exits = ledger.reserve_execution_budget(
         account_hash,
         now.date(),
@@ -395,11 +425,20 @@ def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
     assert exits["total_orders"] == 8
     assert exits["total_notional"] == 800.0
     assert exits["entry_orders"] == 6
+    over_cap_exit = ledger.reserve_execution_budget(
+        account_hash,
+        now.date(),
+        [("risk-reducing-exit", 250.0, False, False)],
+    )
+    assert over_cap_exit["total_orders"] == 9
+    assert over_cap_exit["total_notional"] == 1050.0
+
     with pytest.raises(RuntimeError, match="budget"):
         ledger.reserve_execution_budget(
             account_hash,
             now.date(),
-            [("too-much", 25.0, False, False)],
+            [("blocked-entry", 25.0, True, False)],
+            research_batch_id="research-batch",
         )
 
 
@@ -428,3 +467,23 @@ def test_durable_budget_atomically_limits_concurrent_option_openings(now):
             observed_open_option_positions=2,
             research_batch_id="option-research-batch",
         )
+
+
+def test_option_exit_reservation_is_not_blocked_by_opening_position_cap(now):
+    ledger = InMemoryLedger()
+    ledger.execution_usage[("account-hash", now.date())] = {
+        "total_orders": 1,
+        "total_notional": 50.0,
+        "entry_orders": 1,
+        "entry_notional": 50.0,
+        "option_openings": 1,
+    }
+
+    result = ledger.reserve_execution_budget(
+        "account-hash",
+        now.date(),
+        [("option-exit", 50.0, False, False)],
+        observed_open_option_positions=3,
+    )
+
+    assert result["total_orders"] == 2

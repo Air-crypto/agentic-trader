@@ -200,9 +200,7 @@ def select_option_contract(
 
 
 def _limit_price(snapshot: OptionContractSnapshot) -> float:
-    return float(
-        Decimal(str(snapshot.midpoint)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    )
+    return float(Decimal(str(snapshot.midpoint)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _packet_id(
@@ -250,9 +248,8 @@ def _append_evidence_reasons(
         if not any(
             item.primary
             and item.symbol == draft.underlying
-            and item.cik
             and item.issuer_verified
-            and item.authority in {"sec", "government"}
+            and item.authority in {"issuer", "exchange"}
             for item in evidence
         ):
             reasons.append("no_authoritative_primary_source")
@@ -299,9 +296,7 @@ def _open_positions(
     positions: Iterable[ActiveOptionPosition],
 ) -> tuple[ActiveOptionPosition, ...]:
     return tuple(
-        position
-        for position in positions
-        if position.status in {"pending_open", "open", "closing"}
+        position for position in positions if position.status in {"pending_open", "open", "closing"}
     )
 
 
@@ -478,9 +473,8 @@ def validate_option_draft(
         model_id=model_id,
         draft_hash=draft.draft_hash,
         horizon_trading_days=draft.horizon_trading_days,
-        invalidation=draft.invalidation or (
-            source_draft.invalidation if source_draft is not None else draft.thesis
-        ),
+        invalidation=draft.invalidation
+        or (source_draft.invalidation if source_draft is not None else draft.thesis),
     )
     return OptionValidationResult(True, (), packet)
 

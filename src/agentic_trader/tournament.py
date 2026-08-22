@@ -37,7 +37,7 @@ def _to_daily(
     config: StrategyConfig,
 ) -> pd.DataFrame:
     targets = pd.DataFrame(monthly).T.reindex(columns=config.all_assets)
-    daily = targets.reindex(prices.index).ffill().shift(1).fillna(0.0)
+    daily = targets.reindex(prices.index).ffill().shift(config.signal_lag_trading_days).fillna(0.0)
     no_position = daily.sum(axis=1).eq(0.0)
     daily.loc[no_position, CASH_ASSET] = 1.0
     return daily

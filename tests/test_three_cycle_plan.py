@@ -2,25 +2,27 @@ from __future__ import annotations
 
 import json
 from argparse import Namespace
+from datetime import UTC, datetime
 
 from agentic_trader.cli import command_live_plan
 from agentic_trader.execution import daily_consumption, daily_entry_consumption
 
 
-def test_three_plan_only_cycles_share_daily_entry_budget(monkeypatch, tmp_path):
+def test_repeated_plan_only_cycles_do_not_spend_daily_entry_budget(monkeypatch, tmp_path):
     account_number = "111111111"
     monkeypatch.setenv("AGENTIC_TRADER_ACCOUNT", account_number)
-    monkeypatch.setenv("AGENTIC_TRADER_NET_DEPOSITS", "5750")
+    monkeypatch.setenv("AGENTIC_TRADER_NET_DEPOSITS", "10000")
     request = {
         "account": {
             "account_number": account_number,
-            "equity": 5_750.0,
-            "cash": 5_750.0,
+            "equity": 10_000.0,
+            "cash": 10_000.0,
             "pending_deposits": 0.0,
             "broker_positions": [],
             "broker_orders": [],
             "broker_option_orders": [],
             "session_is_regular": True,
+            "quote_timestamps": {"SPY": datetime.now(UTC).isoformat()},
         },
         "prices": {"SPY": 500.0},
         "targets": {"SPY": 0.15},
@@ -43,11 +45,12 @@ def test_three_plan_only_cycles_share_daily_entry_budget(monkeypatch, tmp_path):
     )
 
     assert [command_live_plan(args) for _ in range(3)] == [0, 0, 0]
-    assert daily_consumption(tmp_path) == (3, 450.0)
-    assert daily_entry_consumption(tmp_path) == (3, 450.0)
+    assert daily_consumption(tmp_path) == (0, 0.0)
+    assert daily_entry_consumption(tmp_path) == (0, 0.0)
     plan = json.loads(output_path.read_text())
     assert len(plan["approved_orders"]) == 1
-    assert plan["entry_orders_already_used_today"] == 2
+    assert plan["entry_orders_already_used_today"] == 0
+    assert plan["planned_at"] < plan["expires_at"]
 
 
 def test_equity_plan_counts_prior_option_orders_in_shared_budget(
@@ -56,12 +59,12 @@ def test_equity_plan_counts_prior_option_orders_in_shared_budget(
 ):
     account_number = "111111111"
     monkeypatch.setenv("AGENTIC_TRADER_ACCOUNT", account_number)
-    monkeypatch.setenv("AGENTIC_TRADER_NET_DEPOSITS", "5750")
+    monkeypatch.setenv("AGENTIC_TRADER_NET_DEPOSITS", "10000")
     request = {
         "account": {
             "account_number": account_number,
-            "equity": 5_750.0,
-            "cash": 5_750.0,
+            "equity": 10_000.0,
+            "cash": 10_000.0,
             "pending_deposits": 0.0,
             "broker_positions": [],
             "broker_orders": [],
@@ -79,6 +82,7 @@ def test_equity_plan_counts_prior_option_orders_in_shared_budget(
                 }
             ],
             "session_is_regular": True,
+            "quote_timestamps": {"SPY": datetime.now(UTC).isoformat()},
         },
         "prices": {"SPY": 500.0},
         "targets": {"SPY": 0.15},

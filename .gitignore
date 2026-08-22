@@ -8,3 +8,4 @@ artifacts/
 KILL_SWITCH
 .env
 .env.*
+.codex/

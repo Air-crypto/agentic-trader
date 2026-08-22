@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -21,6 +22,21 @@ from agentic_trader.execution import (
 )
 
 TEST_ACCOUNT = "111111111"
+TEST_QUOTE_SYMBOLS = (
+    "SPY",
+    "QQQ",
+    "IWM",
+    "EFA",
+    "EEM",
+    "VNQ",
+    "DBC",
+    "IEF",
+    "TLT",
+    "BIL",
+    "AAPL",
+    "OLD",
+    "NEW",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -43,6 +59,7 @@ def make_account(**overrides) -> AccountSnapshot:
         "pending_deposits": 0.0,
         "orders_source": "broker",
         "session_is_regular": True,
+        "quote_timestamps": {symbol: datetime.now(UTC) for symbol in TEST_QUOTE_SYMBOLS},
     }
     defaults.update(overrides)
     return AccountSnapshot(**defaults)
@@ -52,10 +69,11 @@ def make_order(**overrides) -> ProposedOrder:
     defaults = {
         "symbol": "SPY",
         "side": "buy",
-        "notional": 100.0,
+        "notional": 25.0,
         "order_type": "market",
         "reference_price": 500.0,
         "rationale": "trend model target",
+        "quote_timestamp": datetime.now(UTC),
     }
     defaults.update(overrides)
     return ProposedOrder(**defaults)
@@ -64,10 +82,19 @@ def make_order(**overrides) -> ProposedOrder:
 def test_default_limits_preserve_exit_capacity():
     limits = ExecutionLimits()
     assert limits.max_order_notional == 150.0
+    assert limits.max_position_weight == 0.035
+    assert limits.max_broad_market_weight == 0.035
+    assert limits.min_cash_reserve_weight == 0.895
     assert limits.max_orders_per_day == 8
     assert limits.max_daily_notional == 800.0
-    assert limits.max_entry_orders_per_day == 6
-    assert limits.max_entry_daily_notional == 600.0
+    assert limits.max_entry_orders_per_day == 2
+    assert limits.max_entry_daily_notional == 300.0
+    assert limits.max_daily_loss_weight == 0.005
+    assert limits.max_drawdown_weight == 0.03
+    assert limits.max_loss_from_deposits_weight == 0.03
+    assert limits.require_fresh_quotes
+    assert limits.max_quote_age_seconds == 15
+    assert limits.max_extended_spread_bps == 10.0
 
 
 def test_daily_limits_cannot_be_relaxed_through_cli_style_overrides():
@@ -96,6 +123,12 @@ def test_rejects_everything_when_no_account_is_configured(monkeypatch):
     monkeypatch.delenv(ACCOUNT_ENV_VAR, raising=False)
     decision = evaluate_order(make_order(), make_account())
     assert "agentic_account_not_configured" in decision.reasons
+
+
+def test_paired_broker_identity_can_replace_copied_account_secret(monkeypatch):
+    monkeypatch.delenv(ACCOUNT_ENV_VAR, raising=False)
+    decision = evaluate_order(make_order(), make_account(broker_identity_verified=True))
+    assert decision.approved
 
 
 def test_blank_account_env_var_is_treated_as_unconfigured(monkeypatch):
@@ -174,14 +207,100 @@ def test_rejects_order_without_a_reference_price():
 
 
 def test_whole_share_limit_order_is_approved():
-    order = make_order(order_type="limit", limit_price=95.0, quantity=1.0, notional=93.0)
+    order = make_order(order_type="limit", limit_price=25.0, quantity=1.0, notional=25.0)
     assert evaluate_order(order, make_account()).approved
+
+
+def test_limit_order_notional_must_equal_emitted_quantity_times_limit():
+    order = make_order(
+        order_type="limit",
+        limit_price=100.0,
+        quantity=100.0,
+        notional=25.0,
+    )
+    decision = evaluate_order(order, make_account(equity=20_000.0, cash=20_000.0))
+    assert "order_notional_does_not_match_broker_parameters" in decision.reasons
+    assert order.broker_notional() == 10_000.0
+
+
+def test_market_order_notional_must_equal_emitted_dollar_amount():
+    decision = evaluate_order(make_order(notional=100.001), make_account())
+    assert "order_notional_does_not_match_broker_parameters" in decision.reasons
 
 
 def test_refuses_to_plan_outside_regular_hours():
     """A fractional order placed outside 9:30-16:00 ET is rejected by the broker."""
     decision = evaluate_order(make_order(), make_account(session_is_regular=False))
     assert "outside_regular_trading_session" in decision.reasons
+
+
+def test_overnight_equity_requires_fresh_eligible_whole_share_limit():
+    quote_at = datetime.now(UTC)
+    account = make_account(
+        equity=5_750.0,
+        cash=5_750.0,
+        session_is_regular=False,
+        market_hours="all_day_hours",
+        session_tradable_symbols=("SPY",),
+        quote_timestamps={"SPY": quote_at},
+        quote_spreads_bps={"SPY": 9.0},
+    )
+    limits = ExecutionLimits(
+        allow_extended_hours=True,
+        require_fresh_quotes=True,
+        max_quote_age_seconds=60,
+    )
+    order = make_order(
+        order_type="limit",
+        notional=100.0,
+        limit_price=100.0,
+        quantity=1.0,
+        reference_price=100.0,
+        market_hours="all_day_hours",
+        quote_timestamp=quote_at,
+    )
+
+    assert evaluate_order(order, account, limits).approved
+
+    market = make_order(
+        market_hours="all_day_hours",
+        quote_timestamp=quote_at,
+    )
+    assert "extended_hours_requires_limit_order" in evaluate_order(market, account, limits).reasons
+
+    stale = make_order(
+        order_type="limit",
+        notional=100.0,
+        limit_price=100.0,
+        quantity=1.0,
+        reference_price=100.0,
+        market_hours="all_day_hours",
+        quote_timestamp=quote_at - timedelta(seconds=61),
+    )
+    assert "equity_quote_stale" in evaluate_order(stale, account, limits).reasons
+
+    ineligible = make_account(
+        session_is_regular=False,
+        market_hours="all_day_hours",
+        session_tradable_symbols=(),
+        quote_timestamps={"SPY": quote_at},
+        quote_spreads_bps={"SPY": 9.0},
+    )
+    assert (
+        "symbol_not_tradable_in_selected_session"
+        in evaluate_order(order, ineligible, limits).reasons
+    )
+
+    wide = make_account(
+        equity=5_750.0,
+        cash=5_750.0,
+        session_is_regular=False,
+        market_hours="all_day_hours",
+        session_tradable_symbols=("SPY",),
+        quote_timestamps={"SPY": quote_at},
+        quote_spreads_bps={"SPY": 10.01},
+    )
+    assert "extended_hours_spread_above_cap" in evaluate_order(order, wide, limits).reasons
 
 
 def test_market_order_broker_parameters_are_dollar_denominated():
@@ -206,14 +325,14 @@ def test_rejects_missing_rationale():
     assert "missing_rationale" in decision.reasons
 
 
-def test_broad_market_fund_may_exceed_the_single_name_cap():
-    account = make_account(positions={"SPY": 300.0})
+def test_broad_market_fund_uses_the_live_canary_name_cap():
+    account = make_account(equity=5_750.0, cash=5_750.0, positions={"SPY": 100.0})
     decision = evaluate_order(make_order(notional=100.0), account)
     assert decision.approved
 
 
 def test_broad_market_fund_still_has_its_own_cap():
-    account = make_account(positions={"SPY": 400.0})
+    account = make_account(equity=5_750.0, cash=5_750.0, positions={"SPY": 150.0})
     decision = evaluate_order(make_order(notional=100.0), account)
     assert "projected_position_weight_exceeds_cap" in decision.reasons
 
@@ -226,9 +345,19 @@ def test_single_name_keeps_the_tighter_cap():
 
 
 def test_cash_equivalent_is_not_concentration_capped():
-    account = make_account(positions={"BIL": 600.0}, cash=750.0, equity=1_350.0)
+    account = make_account(positions={"BIL": 600.0}, cash=1_350.0, equity=1_350.0)
     decision = evaluate_order(make_order(symbol="BIL", notional=100.0), account)
     assert decision.approved
+
+
+def test_default_quote_gate_requires_a_quote_no_older_than_15_seconds():
+    missing = evaluate_order(make_order(quote_timestamp=None), make_account())
+    stale = evaluate_order(
+        make_order(quote_timestamp=datetime.now(UTC) - timedelta(seconds=16)),
+        make_account(),
+    )
+    assert "missing_or_invalid_equity_quote_timestamp" in missing.reasons
+    assert "equity_quote_stale" in stale.reasons
 
 
 def test_unsettled_deposits_are_not_spendable():
@@ -253,6 +382,55 @@ def test_daily_loss_halt_blocks_trading():
     account = make_account(equity=720.0, prior_close_equity=750.0, high_water_mark=750.0)
     decision = evaluate_order(make_order(), account)
     assert "daily_loss_halt" in decision.reasons
+
+
+def test_mandatory_reducing_sell_bypasses_loss_halts(monkeypatch):
+    monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "750")
+    account = make_account(
+        equity=600.0,
+        cash=300.0,
+        positions={"SPY": 300.0},
+        high_water_mark=750.0,
+        prior_close_equity=750.0,
+        net_deposits=750.0,
+    )
+    entry = evaluate_order(make_order(), account)
+    exit_decision = evaluate_order(
+        make_order(side="sell", notional=300.0, intent_class="mandatory_exit"),
+        account,
+    )
+    assert {"capital_floor_breached", "max_drawdown_halt", "daily_loss_halt"}.issubset(
+        entry.reasons
+    )
+    assert exit_decision.approved
+
+
+def test_mandatory_exit_still_requires_authenticated_account():
+    account = make_account(
+        account_number="999999999",
+        positions={"SPY": 300.0},
+    )
+    decision = evaluate_order(
+        make_order(side="sell", notional=300.0, intent_class="mandatory_exit"),
+        account,
+    )
+    assert "account_is_not_the_agentic_account" in decision.reasons
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_order_notional_is_rejected(bad_value):
+    decision = evaluate_order(make_order(notional=bad_value), make_account())
+    assert "non_finite_notional" in decision.reasons
+
+
+def test_nonfinite_account_value_is_rejected():
+    decision = evaluate_order(make_order(), make_account(cash=float("nan")))
+    assert "non_finite_cash" in decision.reasons
+
+
+def test_nonfinite_limit_is_rejected():
+    with pytest.raises(ValueError, match="finite"):
+        ExecutionLimits(max_daily_loss_weight=float("nan"))
 
 
 def test_unverified_order_count_is_rejected():
@@ -285,7 +463,7 @@ def test_refuses_to_trade_with_no_loss_limit_at_all():
 def test_configured_net_deposits_restores_protection(monkeypatch):
     monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "750")
     account = make_account(
-        equity=700.0, cash=700.0, high_water_mark=None, prior_close_equity=None, net_deposits=None
+        equity=730.0, cash=730.0, high_water_mark=None, prior_close_equity=None, net_deposits=None
     )
     decision = evaluate_order(make_order(), account)
     assert "no_drawdown_protection_available" not in decision.reasons
@@ -300,6 +478,26 @@ def test_configured_net_deposits_also_enforces_the_floor(monkeypatch):
     assert "capital_floor_breached" in evaluate_order(make_order(), account).reasons
 
 
+def test_configured_net_deposits_are_authoritative_over_request(monkeypatch):
+    monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "750")
+    account = make_account(
+        equity=700.0,
+        cash=700.0,
+        high_water_mark=None,
+        prior_close_equity=None,
+        net_deposits=500.0,
+    )
+    decision = evaluate_order(make_order(), account)
+    assert "net_deposits_mismatch" in decision.reasons
+    assert "no_drawdown_protection_available" not in decision.reasons
+
+
+def test_nonfinite_configured_net_deposits_fail_closed(monkeypatch):
+    monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "inf")
+    decision = evaluate_order(make_order(), make_account())
+    assert "configured_net_deposits_invalid" in decision.reasons
+
+
 def test_malformed_net_deposits_does_not_silently_disable_protection(monkeypatch):
     monkeypatch.setenv(NET_DEPOSITS_ENV_VAR, "not-a-number")
     account = make_account(high_water_mark=None, prior_close_equity=None, net_deposits=None)
@@ -308,7 +506,7 @@ def test_malformed_net_deposits_does_not_silently_disable_protection(monkeypatch
 
 def test_capital_floor_allows_trading_above_the_floor():
     account = make_account(
-        equity=700.0, cash=700.0, net_deposits=750.0, high_water_mark=None, prior_close_equity=None
+        equity=730.0, cash=730.0, net_deposits=750.0, high_water_mark=None, prior_close_equity=None
     )
     assert evaluate_order(make_order(), account).approved
 
@@ -353,8 +551,9 @@ def test_batch_consumes_daily_budget_sequentially():
         for symbol in ("SPY", "QQQ", "IWM", "EFA", "EEM")
     ]
     decisions = evaluate_batch(orders, make_account(equity=5_000.0, cash=5_000.0))
-    assert all(decision.approved for decision in decisions[:4])
-    assert "order_would_breach_entry_daily_notional" in decisions[4].reasons
+    assert all(decision.approved for decision in decisions[:2])
+    assert "entry_order_count_limit_reached" in decisions[2].reasons
+    assert "order_would_breach_entry_daily_notional" in decisions[2].reasons
 
 
 def test_entry_order_count_cap_preserves_two_slots_for_exits():
@@ -380,7 +579,7 @@ def test_entry_order_count_cap_preserves_two_slots_for_exits():
     assert exit_order.approved
 
 
-def test_mandatory_exits_use_reserve_but_never_exceed_total_caps():
+def test_mandatory_exits_are_not_deadlocked_by_exhausted_total_caps():
     account = make_account(
         equity=5_000.0,
         cash=4_700.0,
@@ -399,10 +598,7 @@ def test_mandatory_exits_use_reserve_but_never_exceed_total_caps():
         for _ in range(3)
     ]
     decisions = evaluate_batch(exits, account)
-    assert decisions[0].approved
-    assert decisions[1].approved
-    assert "daily_order_count_limit_reached" in decisions[2].reasons
-    assert "daily_notional_limit_reached" in decisions[2].reasons
+    assert all(decision.approved for decision in decisions)
 
 
 def test_close_intent_can_use_exit_reserve_case_insensitively():
@@ -438,7 +634,7 @@ def test_unknown_historical_intents_conservatively_consume_entry_capacity():
     assert "order_would_breach_entry_daily_notional" in decision.reasons
 
 
-def test_batch_enforces_total_budget_sequentially_for_mandatory_exits():
+def test_batch_allows_every_authenticated_mandatory_exit():
     symbols = ("SPY", "QQQ", "IWM", "EFA", "EEM", "VNQ", "DBC", "IEF", "TLT")
     orders = [
         make_order(
@@ -455,15 +651,28 @@ def test_batch_enforces_total_budget_sequentially_for_mandatory_exits():
         positions={symbol: 100.0 for symbol in symbols},
     )
     decisions = evaluate_batch(orders, account)
-    assert all(decision.approved for decision in decisions[:8])
-    assert "daily_order_count_limit_reached" in decisions[8].reasons
-    assert "daily_notional_limit_reached" in decisions[8].reasons
+    assert all(decision.approved for decision in decisions)
+
+
+def test_mandatory_exit_bypasses_database_halt_but_not_identity_controls():
+    account = make_account(
+        positions={"SPY": 300.0},
+        orders_today=8,
+        notional_today=800.0,
+        external_halt_reasons=("picker_database_halt:max_drawdown",),
+    )
+    decision = evaluate_order(
+        make_order(side="sell", notional=300.0, intent_class="mandatory_exit"),
+        account,
+    )
+    assert decision.approved
 
 
 def test_batch_accumulates_position_weight():
     limits = ExecutionLimits(
         max_position_weight=0.25,
         max_broad_market_weight=0.25,
+        min_cash_reserve_weight=0.10,
     )
     orders = [make_order(notional=100.0) for _ in range(3)]
     decisions = evaluate_batch(orders, make_account(equity=750.0, cash=750.0), limits)
@@ -472,27 +681,52 @@ def test_batch_accumulates_position_weight():
 
 
 def test_planner_emits_capped_orders_from_targets():
-    account = make_account(equity=750.0, cash=750.0)
+    account = make_account(equity=5_750.0, cash=5_750.0)
     decisions = plan_orders_from_targets(
-        {"SPY": 0.2, "IEF": 0.2}, account, prices={"SPY": 500.0, "IEF": 95.0}
+        {"SPY": 0.035, "IEF": 0.035},
+        account,
+        prices={"SPY": 500.0, "IEF": 95.0},
+        rebalance_threshold=0.0,
     )
     assert [decision.order.symbol for decision in decisions] == ["IEF", "SPY"]
     assert all(decision.approved for decision in decisions)
     assert all(decision.order.notional <= 150.0 for decision in decisions)
 
 
+def test_planner_notional_exactly_matches_emitted_limit_order():
+    account = make_account(equity=5_750.0, cash=5_750.0)
+    decision = plan_orders_from_targets(
+        {"IEF": 0.035},
+        account,
+        prices={"IEF": 95.0},
+        rebalance_threshold=0.0,
+    )[0]
+    assert decision.approved
+    assert decision.order.notional == decision.order.broker_notional()
+
+
 def test_planner_uses_a_limit_order_when_a_whole_share_fits():
-    account = make_account(equity=750.0, cash=750.0)
-    decision = plan_orders_from_targets({"IEF": 0.2}, account, prices={"IEF": 95.0})[0]
+    account = make_account(equity=5_750.0, cash=5_750.0)
+    decision = plan_orders_from_targets(
+        {"IEF": 0.035},
+        account,
+        prices={"IEF": 95.0},
+        rebalance_threshold=0.0,
+    )[0]
     assert decision.order.order_type == "limit"
     assert decision.order.quantity == 1.0
     assert decision.approved
 
 
 def test_planner_falls_back_to_a_dollar_market_order_below_one_share():
-    """A $750 account cannot buy a whole share of a $773 fund."""
-    account = make_account(equity=750.0, cash=750.0)
-    decision = plan_orders_from_targets({"SPY": 0.2}, account, prices={"SPY": 773.2})[0]
+    """The capped order cannot buy a whole share of a $773 fund."""
+    account = make_account(equity=5_750.0, cash=5_750.0)
+    decision = plan_orders_from_targets(
+        {"SPY": 0.035},
+        account,
+        prices={"SPY": 773.2},
+        rebalance_threshold=0.0,
+    )[0]
     assert decision.order.order_type == "market"
     assert decision.order.quantity is None
     assert decision.approved
@@ -524,6 +758,37 @@ def test_ref_id_does_not_depend_on_observed_daily_order_count():
     before_other_order = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day)
     after_other_order = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day)
     assert before_other_order == after_other_order
+
+
+def test_ref_id_uses_stable_logical_identity_without_quote_sensitive_fields():
+    from datetime import date
+
+    day = date(2026, 8, 10)
+    first = deterministic_ref_id(TEST_ACCOUNT, "SPY", "buy", day, "pick-1", "entry")
+    assert first == deterministic_ref_id(
+        TEST_ACCOUNT,
+        "SPY",
+        "buy",
+        day,
+        "pick-1",
+        "entry",
+    )
+    assert first != deterministic_ref_id(
+        TEST_ACCOUNT,
+        "SPY",
+        "buy",
+        day,
+        "pick-2",
+        "entry",
+    )
+    assert first != deterministic_ref_id(
+        TEST_ACCOUNT,
+        "SPY",
+        "buy",
+        day,
+        "pick-1",
+        "rebalance",
+    )
 
 
 def test_ref_id_differs_by_symbol_side_day_and_account():
@@ -579,6 +844,47 @@ def test_mandatory_exit_is_planned_before_new_entry():
     assert decisions[0].order.symbol == "OLD"
     assert decisions[0].order.intent_class == "mandatory_exit"
     assert decisions[1].order.symbol == "NEW"
+
+
+def test_full_position_mandatory_exit_is_not_limited_to_entry_cap():
+    account = make_account(
+        equity=1_000.0,
+        cash=700.0,
+        positions={"SPY": 300.0},
+    )
+    decision = plan_orders_from_targets(
+        {"SPY": 0.0},
+        account,
+        prices={"SPY": 100.0},
+        metadata_by_symbol={"SPY": {"intent_class": "mandatory_exit"}},
+    )[0]
+    assert decision.approved
+    assert decision.order.notional == 300.0
+    assert decision.order.broker_notional() == 300.0
+    assert decision.order.order_type == "market"
+
+
+def test_full_position_exit_rounds_down_to_a_broker_safe_dollar_amount():
+    account = make_account(
+        equity=1_000.0,
+        cash=699.991,
+        positions={"SPY": 300.009},
+    )
+    decision = plan_orders_from_targets(
+        {"SPY": 0.0},
+        account,
+        prices={"SPY": 100.0},
+        metadata_by_symbol={"SPY": {"intent_class": "mandatory_exit"}},
+    )[0]
+    assert decision.approved
+    assert decision.order.notional == 300.0
+
+
+def test_planner_rejects_nonfinite_market_data():
+    with pytest.raises(ValueError, match="finite"):
+        plan_orders_from_targets({"SPY": float("nan")}, make_account(), prices={})
+    with pytest.raises(ValueError, match="finite"):
+        plan_orders_from_targets({"SPY": 0.2}, make_account(), prices={"SPY": float("inf")})
 
 
 def test_exit_priority_gets_last_total_slot_before_entry():
@@ -657,8 +963,21 @@ def test_planner_rejects_targets_above_full_investment():
 
 
 def test_high_water_mark_only_ratchets_up(tmp_path):
-    record_live_state(750.0, root=tmp_path)
-    record_live_state(700.0, root=tmp_path)
-    state = record_live_state(720.0, root=tmp_path)
+    from datetime import date
+
+    record_live_state(
+        750.0,
+        root=tmp_path,
+        as_of=date(2026, 8, 20),
+        record_prior_close=True,
+    )
+    record_live_state(700.0, root=tmp_path, as_of=date(2026, 8, 21))
+    state = record_live_state(720.0, root=tmp_path, as_of=date(2026, 8, 21))
     assert state["high_water_mark"] == 750.0
-    assert state["prior_close_equity"] == 720.0
+    assert state["prior_close_equity"] == 750.0
+    assert state["prior_close_date"] == "2026-08-20"
+
+
+def test_intraday_state_does_not_invent_a_prior_close(tmp_path):
+    state = record_live_state(720.0, root=tmp_path)
+    assert "prior_close_equity" not in state

@@ -84,8 +84,7 @@ class OptionDraft:
                 for value in (self.catalyst, self.counter_thesis, self.invalidation)
             ):
                 raise ValueError(
-                    "Standalone option drafts require catalyst, counter-thesis, "
-                    "and invalidation"
+                    "Standalone option drafts require catalyst, counter-thesis, and invalidation"
                 )
         object.__setattr__(self, "created_at", created_at)
         object.__setattr__(self, "action", action)
@@ -259,9 +258,7 @@ class OptionContractSnapshot:
                 raw.get("underlying", raw.get("chain_symbol", raw.get("chainSymbol", "")))
             ),
             option_type=str(raw.get("option_type", raw.get("type", raw.get("kind", "")))),
-            expiration_date=parse_date(
-                raw.get("expiration_date", raw.get("expiration", ""))
-            ),
+            expiration_date=parse_date(raw.get("expiration_date", raw.get("expiration", ""))),
             strike=float(raw.get("strike", raw.get("strike_price"))),
             bid=float(raw.get("bid", raw.get("bid_price"))),
             ask=float(raw.get("ask", raw.get("ask_price"))),
@@ -434,8 +431,7 @@ class OptionDecisionPacket:
     def verify_hash(self) -> bool:
         return (
             self.contract.verify_hash()
-            and self.structure_fingerprint
-            == content_hash(canonical_json(self.structure_dict()))
+            and self.structure_fingerprint == content_hash(canonical_json(self.structure_dict()))
             and self.packet_hash == content_hash(canonical_json(self.unsigned_dict()))
         )
 

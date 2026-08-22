@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from agentic_trader.picker.invalidation import trading_day_expiry
 from agentic_trader.picker.models import ActiveThesis
-from agentic_trader.picker.portfolio import build_picker_portfolio
+from agentic_trader.picker.portfolio import PickerPortfolioPolicy, build_picker_portfolio
 from agentic_trader.picker.validation import validate_picker_draft
 
 
@@ -21,6 +21,14 @@ def packet(draft, evidence, quant, critic, now):
     )
     assert result.packet is not None
     return result.packet
+
+
+def test_live_canary_portfolio_defaults_bound_names_sectors_and_cash():
+    policy = PickerPortfolioPolicy()
+    assert policy.max_active_names == 3
+    assert policy.max_stock_weight == 0.035
+    assert policy.max_sector_weight == 0.07
+    assert policy.min_cash_weight == 0.895
 
 
 def test_no_valid_picks_means_cash(draft, evidence, quant, critic, now):
@@ -52,13 +60,11 @@ def test_sector_cap_scales_multiple_names(draft, evidence, quant, critic, now):
         item_critic = replace(critic, draft_id=item_draft.draft_id)
         item_quant = replace(quant, symbol=symbol, sector="Technology")
         item_evidence = [replace(item, symbol=symbol) for item in evidence]
-        packets.append(
-            packet(item_draft, item_evidence, item_quant, item_critic, now)
-        )
+        packets.append(packet(item_draft, item_evidence, item_quant, item_critic, now))
         prices[symbol] = 100.0
     plan = build_picker_portfolio(packets, [], prices, 500.0, now.date(), now)
-    assert abs(sum(plan.targets.values()) - 0.30) < 1e-12
-    assert all(weight <= 0.10 + 1e-12 for weight in plan.targets.values())
+    assert abs(sum(plan.targets.values()) - 0.07) < 1e-12
+    assert all(weight <= 0.035 + 1e-12 for weight in plan.targets.values())
 
 
 def test_expired_thesis_generates_zero_target_and_mandatory_exit(now):

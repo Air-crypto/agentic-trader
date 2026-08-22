@@ -5,7 +5,13 @@ from datetime import datetime
 
 from .models import CRITIC_SOFT_DIMENSIONS, CriticVerdict
 
-ALLOWED_CRITIC_MODELS = frozenset({"cursor-grok-4.5-high-fast"})
+ALLOWED_CRITIC_MODELS = frozenset(
+    {
+        "cursor-grok-4.5-high-fast",
+        "gpt-5.5",
+        "gpt-5.6-sol",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -49,8 +55,7 @@ def evaluate_critic_policy(
 
     critic_model = critic.model_id.strip()
     if (
-        critic_model.casefold()
-        not in {item.casefold() for item in ALLOWED_CRITIC_MODELS}
+        critic_model.casefold() not in {item.casefold() for item in ALLOWED_CRITIC_MODELS}
         or critic_model.casefold() == analyst_model_id.strip().casefold()
     ):
         hard_vetoes.append("critic_model_not_independent")

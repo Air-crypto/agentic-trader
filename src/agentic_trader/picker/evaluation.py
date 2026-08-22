@@ -112,8 +112,6 @@ def evaluation_summary(frame: pd.DataFrame) -> dict[str, float | int]:
         "selected_mean_sector_abnormal_return": (
             float(selected.mean()) if not selected.empty else float("nan")
         ),
-        "selected_hit_rate": (
-            float(selected.gt(0).mean()) if not selected.empty else float("nan")
-        ),
+        "selected_hit_rate": (float(selected.gt(0).mean()) if not selected.empty else float("nan")),
         "rank_ic_t_statistic": t_statistic,
     }

@@ -1,0 +1,11 @@
+{
+  "name": "Agentic Trader - Morning Live Research & Review",
+  "mode": "LIVE_MORNING_RESEARCH_AND_ORDER_REVIEW",
+  "schedule": "35 6 * * 1-5",
+  "timezone": "America/Los_Angeles",
+  "project": ".",
+  "prompt_file": "automations/morning-live-prompt.txt",
+  "broker_mutations_allowed": true,
+  "requires_per_order_confirmation": true,
+  "new_option_openings_allowed": false
+}

@@ -10,6 +10,7 @@ from agentic_trader.execution import (
     daily_entry_consumption,
     merge_broker_and_local_consumption,
     record_plan_consumption,
+    record_reservation_consumption,
     session_lock,
 )
 
@@ -56,6 +57,22 @@ def test_daily_consumption_accumulates_across_processes(tmp_path):
     assert daily_entry_consumption(tmp_path) == (3, 400.0)
 
 
+def test_reserved_consumption_is_idempotent_by_ref_id(tmp_path):
+    reservations = [
+        ("entry-1", 100.0, True),
+        ("exit-1", 250.0, False),
+    ]
+    assert record_reservation_consumption(reservations, root=tmp_path) == (2, 350.0)
+    assert record_reservation_consumption(reservations, root=tmp_path) == (2, 350.0)
+    assert daily_entry_consumption(tmp_path) == (1, 100.0)
+
+
+def test_reserved_ref_cannot_be_reused_for_different_economics(tmp_path):
+    record_reservation_consumption([("entry-1", 100.0, True)], root=tmp_path)
+    with pytest.raises(ValueError, match="immutable"):
+        record_reservation_consumption([("entry-1", 101.0, True)], root=tmp_path)
+
+
 def test_entry_and_exit_counters_accumulate_independently_across_runs(tmp_path):
     record_plan_consumption(
         4,
@@ -85,9 +102,7 @@ def test_entry_and_exit_counters_accumulate_independently_across_runs(tmp_path):
 def test_legacy_counters_are_treated_as_entry_usage(tmp_path):
     state = tmp_path / "artifacts/live/state.json"
     state.parent.mkdir(parents=True)
-    state.write_text(
-        '{"daily":{"2026-08-10":{"orders":3,"notional":250.0}}}\n'
-    )
+    state.write_text('{"daily":{"2026-08-10":{"orders":3,"notional":250.0}}}\n')
     from datetime import date
 
     assert daily_entry_consumption(tmp_path, day=date(2026, 8, 10)) == (3, 250.0)

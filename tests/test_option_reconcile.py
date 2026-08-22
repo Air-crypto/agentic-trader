@@ -67,14 +67,20 @@ def test_match_requires_ref_id_fingerprint_and_quantity(tmp_path):
             }
         ]
     )
-    assert "unauthorized_option_fill_detected" in reconcile_option_orders(
-        [approval()], [wrong_leg], root=tmp_path, engage_on_breach=False
-    )["breaches"]
+    assert (
+        "unauthorized_option_fill_detected"
+        in reconcile_option_orders(
+            [approval()], [wrong_leg], root=tmp_path, engage_on_breach=False
+        )["breaches"]
+    )
 
     wrong_quantity = broker_order(quantity="2", processed_quantity="2")
-    assert "unauthorized_option_fill_detected" in reconcile_option_orders(
-        [approval()], [wrong_quantity], root=tmp_path, engage_on_breach=False
-    )["breaches"]
+    assert (
+        "unauthorized_option_fill_detected"
+        in reconcile_option_orders(
+            [approval()], [wrong_quantity], root=tmp_path, engage_on_breach=False
+        )["breaches"]
+    )
 
 
 def test_partial_fill_is_a_breach_and_engages_kill_switch(tmp_path):
@@ -190,12 +196,15 @@ def test_unknown_fill_price_is_a_breach(tmp_path):
     assert "unknown_option_order_detected" in result["breaches"]
 
     nan_price = broker_order(average_price="NaN")
-    assert "unknown_option_order_detected" in reconcile_option_orders(
-        [approval()],
-        [nan_price],
-        root=tmp_path,
-        engage_on_breach=False,
-    )["breaches"]
+    assert (
+        "unknown_option_order_detected"
+        in reconcile_option_orders(
+            [approval()],
+            [nan_price],
+            root=tmp_path,
+            engage_on_breach=False,
+        )["breaches"]
+    )
 
 
 def test_cancelled_order_is_terminal_unfilled_and_safe_to_release(tmp_path):

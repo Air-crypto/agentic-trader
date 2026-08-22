@@ -30,15 +30,21 @@ def test_target_is_fully_invested_and_respects_stock_caps() -> None:
     assert target.reindex(LARGE_CAPS).fillna(0).sum() <= config.max_stock_sleeve + 1e-12
 
 
-def test_month_end_signal_is_applied_on_next_trading_day() -> None:
+def test_close_signal_does_not_earn_unavailable_next_day_return() -> None:
     config = StrategyConfig()
     prices = synthetic_prices(config)
     daily, _ = build_daily_targets(prices, config)
     month_end = prices.groupby(prices.index.to_period("M")).tail(1).index[-2]
     next_day = prices.index[prices.index.get_loc(month_end) + 1]
+    execution_close = prices.index[prices.index.get_loc(month_end) + 2]
     expected, _ = target_for_date(prices, month_end, config)
 
-    pd.testing.assert_series_equal(daily.loc[next_day], expected, check_names=False, atol=1e-12)
+    pd.testing.assert_series_equal(
+        daily.loc[next_day], daily.loc[month_end], check_names=False, atol=1e-12
+    )
+    pd.testing.assert_series_equal(
+        daily.loc[execution_close], expected, check_names=False, atol=1e-12
+    )
 
 
 def test_future_prices_do_not_change_historical_signal() -> None:

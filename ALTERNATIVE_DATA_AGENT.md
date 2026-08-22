@@ -40,19 +40,20 @@ social-media speculation, or a generic product catalog.
 
 Use news search for discovery, then navigate to the underlying source.
 
-1. SEC filings and exhibits.
+1. Issuer investor-relations releases and exchange notices from registered
+   domains.
 2. Government spending records, permits, agendas, court records, and regulatory
    decisions.
 3. Issuer or customer releases with a stable publication date.
 4. Reputable reporting that quotes named documents or people.
 5. Industry publications for corroboration only.
 
-Social posts, anonymous claims, search-result summaries, prediction markets,
-and generated text can suggest a query but cannot support a signal.
+Reddit, X/Twitter, Stocktwits, anonymous claims, search-result summaries,
+prediction markets, and generated text can suggest a query or become a
+versioned attention/sentiment feature, but cannot alone support a signal.
 
-For SEC access, identify the requester and stay below the SEC's published
-10-request-per-second fair-access ceiling. USAspending is preferred over
-SAM.gov when an API key is unavailable. GDELT can find coverage spikes, but its
+USAspending is preferred over SAM.gov when an API key is unavailable. GDELT can
+find coverage spikes, but its
 article list and tone are discovery data rather than proof.
 
 ## Browser procedure
@@ -64,8 +65,9 @@ For each candidate:
    publication timestamp, and a short verbatim quote.
 3. Open a second independent source when the first source does not name the
    customer, contract amount, capacity, or timing.
-4. Search the public company's filing for revenue concentration, segment size,
-   backlog, capital expenditure, and customer concentration.
+4. Search the issuer's registered IR documents and named reporting for revenue
+   concentration, segment size, backlog, capital expenditure, and customer
+   concentration.
 5. Record when the page was first observed. Never replace publication time with
    retrieval time.
 6. Save only claims supported by the captured quote.
@@ -106,7 +108,8 @@ Required safeguards:
 - every event references only evidence published at or before the event;
 - every URL is HTTPS;
 - quotes are verbatim and at least 20 characters;
-- tickers are verified against an SEC or exchange record;
+- symbols are verified against an exchange record or the registered issuer
+  domain;
 - subjective values stay between 0 and 1;
 - negative and rejected hypotheses are retained for bias analysis.
 

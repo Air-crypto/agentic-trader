@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pandas as pd
 import pytest
 
-from agentic_trader.picker.features import liquid_universe, rank_candidates
+from agentic_trader.picker.features import (
+    liquid_universe,
+    rank_candidates,
+    snapshots_from_ranked,
+)
 
 
 def candidates() -> pd.DataFrame:
@@ -64,3 +70,12 @@ def test_ranker_outputs_bounded_simple_factor_score():
 def test_missing_required_market_column_fails_closed():
     with pytest.raises(ValueError, match="required columns"):
         liquid_universe(candidates().drop(columns=["spread_bps"]))
+
+
+def test_snapshot_records_deterministic_feature_provenance():
+    ranked = rank_candidates(liquid_universe(candidates()))
+    snapshots = snapshots_from_ranked(ranked, datetime(2026, 8, 21, tzinfo=UTC))
+    snapshot = snapshots["GOOD"]
+    assert snapshot.calculated_by == "agentic_trader.picker.features"
+    assert snapshot.feature_version == "picker_features_v1"
+    assert len(snapshot.data_snapshot_hash) == 64

@@ -48,7 +48,7 @@ def packet(now) -> OptionDecisionPacket:
         max_risk=50.0,
         collateral_required=0.0,
         shares_encumbered=0,
-        evidence_ids=("sec-1", "gov-1"),
+        evidence_ids=("issuer-1", "gov-1"),
         prompt_hash="a" * 64,
         model_id="option-model",
         draft_hash="b" * 64,
@@ -65,7 +65,7 @@ def test_option_draft_is_immutable_hash_bound_and_round_trips(now):
         underlying="exm",
         action="long_call",
         thesis="A defined-risk call expresses the inherited bullish thesis.",
-        evidence_ids=("sec-1", "gov-1"),
+        evidence_ids=("issuer-1", "gov-1"),
         source_draft_id="draft-1",
     )
 
@@ -90,7 +90,7 @@ def test_standalone_option_draft_requires_horizon_and_falsifiable_fields(now):
             underlying="EXM",
             action="long_put",
             thesis="A bearish standalone option thesis with bounded premium risk.",
-            evidence_ids=("sec-1", "gov-1"),
+            evidence_ids=("issuer-1", "gov-1"),
         )
     with pytest.raises(ValueError, match="horizon"):
         OptionDraft(
@@ -100,7 +100,7 @@ def test_standalone_option_draft_requires_horizon_and_falsifiable_fields(now):
             underlying="EXM",
             action="long_put",
             thesis="A bearish standalone option thesis with bounded premium risk.",
-            evidence_ids=("sec-1", "gov-1"),
+            evidence_ids=("issuer-1", "gov-1"),
             source_draft_id="draft-1",
             horizon_trading_days=61,
         )

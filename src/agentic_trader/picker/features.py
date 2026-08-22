@@ -5,7 +5,9 @@ from datetime import datetime
 
 import pandas as pd
 
-from .models import QuantSnapshot
+from .models import QuantSnapshot, canonical_json, content_hash
+
+FEATURE_VERSION = "picker_features_v1"
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,25 @@ def snapshots_from_ranked(
 ) -> dict[str, QuantSnapshot]:
     snapshots: dict[str, QuantSnapshot] = {}
     for raw in ranked.to_dict(orient="records"):
+        frozen_input = {
+            key: raw.get(key)
+            for key in sorted(
+                REQUIRED_MARKET_COLUMNS
+                | {
+                    "return_12m",
+                    "return_6m",
+                    "return_3m",
+                    "distance_from_sma_200",
+                    "revenue_growth",
+                    "gross_margin_change",
+                    "net_income_growth",
+                    "return_on_equity",
+                    "earnings_surprise",
+                    "guidance_change",
+                    "cash_flow_revision",
+                }
+            )
+        }
         snapshot = QuantSnapshot.from_dict(
             {
                 "symbol": raw["symbol"],
@@ -138,6 +159,9 @@ def snapshots_from_ranked(
                 "volatility_63d": raw["volatility_63d"],
                 "beta_252d": raw["beta_252d"],
                 "atr_pct": raw["atr_pct"],
+                "data_snapshot_hash": content_hash(canonical_json(frozen_input)),
+                "feature_version": FEATURE_VERSION,
+                "calculated_by": "agentic_trader.picker.features",
             }
         )
         snapshots[snapshot.symbol] = snapshot

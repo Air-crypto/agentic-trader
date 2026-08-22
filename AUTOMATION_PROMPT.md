@@ -1,63 +1,71 @@
-# Automation Operating Prompts
+# Automation Runbook
 
-Stages 3 and 4 use two Cursor Automations. Keep these files in sync with
-`AI_STOCK_PICKER.md`, `OPTION_EXECUTION.md`, and
-`REAL_MONEY_EXECUTION.md`. Where they disagree, the contracts win and the run
-should stop and say so.
+## Canonical tasks
 
-Cursor Automation cron is **UTC only** (no timezone field). Schedules below are
-chosen so the live session is inside the US cash equity regular session
-(09:30–16:00 America/New_York) in both EDT and EST.
+The deployment uses two local-wall-clock tasks, both in `America/Los_Angeles`:
 
-| Automation | Cron (UTC) | Eastern time | Prompt source |
-| --- | --- | --- | --- |
-| AI Picker Research | `0 12 * * 1-5` | 08:00 EDT / 07:00 EST | `automations/research-prompt.txt` |
-| Independent Grok Critic | `0 14 * * 1-5` | 10:00 EDT / 09:00 EST | `automations/critic-prompt.txt` |
-| AI Picker Live Session | `0 15,17,19 * * 1-5` | 11:00/13:00/15:00 EDT; 10:00/12:00/14:00 EST | `automations/execution-prompt.txt` |
+| Task | Definition | Prompt | Schedule | Execution window |
+| --- | --- | --- | --- | --- |
+| Morning live | [`automations/morning-live.json`](automations/morning-live.json) | [`automations/morning-live-prompt.txt`](automations/morning-live-prompt.txt) | Weekdays at `06:35` | Regular hours |
+| Evening live | [`automations/evening-live.json`](automations/evening-live.json) | [`automations/evening-live-prompt.txt`](automations/evening-live-prompt.txt) | Sunday-Thursday at `18:15` | Robinhood all-day hours when eligible |
 
-All three Live UTC hours are inside regular trading hours year-round. Midday and
-late Live runs reuse the finalized morning batch while refreshing broker data,
-risk checks, invalidations, and mandatory exits.
+[`automation.json`](automation.json) is the root manifest. Research and criticism run inside the two canonical tasks; there is no separate execution task.
 
-Wire JSON for Cursor is in `automations/research.json`,
-`automations/critic.json`, and `automations/execution.json`. Root
-`automation.json` / `automation-prompt.txt` mirror execution. Repo JSON does not
-push schedules into the product UI by itself.
+## What each scheduled turn may do
 
-Disable the old static SPY/IEF/GLD automation in the Cursor UI so two live
-sessions do not compete for the shared daily $800 / 8-order budget.
+1. Load configuration and reconcile Robinhood account, positions, open orders, fills, buying power, and session.
+2. Fail closed on the kill switch, stale or missing data, broker uncertainty, risk breach, or account mismatch.
+3. Run point-in-time research and a separate independent critic.
+4. Treat social sources as discovery or sentiment only. Require a registered-issuer or exchange primary source for every actionable thesis. SEC ingestion is disabled.
+5. Apply deterministic allocation, loss, drawdown, and entry limits.
+6. Create an equity order plan that expires in five minutes.
+7. Request Robinhood's nonplacing order review.
+8. Show the exact reviewed order and ask the user to confirm it.
+9. Stop without reservation or placement.
 
-## Research
+No scheduled task opens an option or changes a current/manual holding without a separately authorized close.
 
-No Robinhood MCP. Requires `DATABASE_URL` set to the Supabase Shared Pooler URI
-from the Connect panel (`*.pooler.supabase.com`, user `postgres.<project-ref>`).
-Direct `db.*.supabase.co` hosts fail with `Network is unreachable` (IPv6-only);
-a pooler host with user `postgres` fails password auth. Stages verified
-evidence plus stock and option drafts via `picker-stage-pending`. Research never
-criticizes itself, chooses option contracts, or places orders.
+## Mandatory confirmation handoff
 
-## Independent critic
+The review message must include the exact symbol, side, share quantity or dollar amount, order type, limit price when applicable, time in force, session, notional, plan ID, and expiry. A schedule firing, `MODE=live`, standing consent, or a previous confirmation never counts as confirmation of the displayed order.
 
-Runs on Grok with no Robinhood tools. It exports the pending Sonnet batch,
-produces pass/veto verdicts, and calls `picker-finalize-pending`. Deterministic
-validation rejects any critic model ID that is not Grok or equals the analyst.
+If the user explicitly confirms that exact order, a resumed turn must first re-read the plan, broker state, account state, and quote. It may reserve and place only when every displayed field remains unchanged and the five-minute plan is still valid. Otherwise it must regenerate, re-review, show the replacement order, and ask again.
 
-## Execution
+After placement, reconcile by client order ID. An ambiguous timeout is a reconciliation problem, not permission to submit again.
 
-Robinhood MCP required. Requires `AGENTIC_TRADER_ACCOUNT`,
-`AGENTIC_TRADER_NET_DEPOSITS`, and `DATABASE_URL`. Flow:
+## Morning constraints
 
-1. Fresh equity quant plus option positions, orders, chains, instruments, and
-   quotes from the broker
-2. Consume only a batch finalized by the independent Grok critic
-3. `picker-authorize-batch` and `option-authorize-batch`
-4. `picker-plan` → `live-plan`; `option-plan` for exact Level 2 limit orders
-5. In `MODE: LIVE`, review and place only approved equity/option orders
-6. Reconcile both asset classes; sync either lifecycle only when both are clean
+- regular-hours equities only;
+- live-canary portfolio limits remain binding;
+- at most two total new entries and `$300` aggregate new-entry notional across the trading day;
+- exact confirmation required for every proposed entry or close.
 
-Change only the first `MODE:` line between `PLAN_ONLY` and `LIVE`. Options use
-their committed initial caps; do not create a temporary cap-bypass automation.
+## Evening constraints
 
-Across all three Live runs, broker and durable counters enforce one shared
-`$800 / 8-order` total. New entries may consume at most `$600 / 6 orders`; the
-remaining `$200 / 2 orders` is reserved for risk-reducing exits.
+- at most one new opening proposal;
+- at most `$100` notional;
+- Robinhood must report all-day-hours eligibility;
+- fresh quote and spread no wider than `10 bps`;
+- whole-share GFD limit order only;
+- no proposal when eligibility, spread, session, or quote freshness is uncertain.
+
+## Live-canary limits
+
+- `3` concurrent names;
+- `3.5%` per name;
+- `7%` per sector;
+- `89.5%` minimum cash;
+- `2` entries and `$300` new-entry notional per day;
+- `0.5%` daily-loss halt;
+- `3%` drawdown halt.
+
+## Telemetry
+
+Candidate, reject, critic, counterfactual-outcome, and knowledge-graph records are best-effort telemetry. A write failure should be logged, but it must not change authorization, expand exposure, or become a promotion requirement.
+
+## Required operations
+
+- Keep `DATABASE_URL` and `AGENTIC_TRADER_NET_DEPOSITS` configured.
+- Keep broker and model secrets out of prompts, logs, and source control.
+- Create a root-level `KILL_SWITCH` file to block new review, reservation, and placement.
+- Inspect both task definitions after any schedule or prompt change; the filenames above are the production task identities.

@@ -143,7 +143,7 @@ def test_option_premium_shares_total_and_reserved_entry_notional():
         ),
         now=NOW,
     ).approved
-    total_breach = evaluate_option_order(
+    exhausted_total = evaluate_option_order(
         close,
         account(
             notional_today=750.0,
@@ -151,7 +151,8 @@ def test_option_premium_shares_total_and_reserved_entry_notional():
         ),
         now=NOW,
     )
-    assert "option_order_would_breach_daily_notional" in total_breach.reasons
+    assert exhausted_total.approved
+    assert "option_order_would_breach_daily_notional" not in exhausted_total.reasons
 
 
 @pytest.mark.parametrize(
@@ -189,9 +190,10 @@ def test_strategy_shape_must_match_level_2_strategy():
     bad = order(strategy="covered_call", side="buy")
     assert "strategy_leg_mismatch" in evaluate_option_order(bad, account(), now=NOW).reasons
     unsupported = order(strategy="naked_call", side="sell")
-    assert "unsupported_option_strategy" in evaluate_option_order(
-        unsupported, account(), now=NOW
-    ).reasons
+    assert (
+        "unsupported_option_strategy"
+        in evaluate_option_order(unsupported, account(), now=NOW).reasons
+    )
 
 
 def test_long_debit_uses_lower_of_dollar_and_equity_caps():
@@ -220,9 +222,7 @@ def test_covered_call_needs_unencumbered_hundred_shares():
         side="sell",
         strike_price=700.0,
     )
-    assert evaluate_option_order(
-        covered, account(underlying_shares={"SPY": 100}), now=NOW
-    ).approved
+    assert evaluate_option_order(covered, account(underlying_shares={"SPY": 100}), now=NOW).approved
     denied = evaluate_option_order(
         covered,
         account(
@@ -370,7 +370,8 @@ def test_entry_cap_reserves_exit_slots_and_total_cap_still_applies():
         ),
         now=NOW,
     )
-    assert "daily_order_count_limit_reached" in total_exhausted.reasons
+    assert total_exhausted.approved
+    assert "daily_order_count_limit_reached" not in total_exhausted.reasons
 
 
 def test_kill_switch_blocks_option_orders(tmp_path):
@@ -398,16 +399,30 @@ def test_risk_reducing_close_remains_available_during_entry_halts(tmp_path):
     assert decision.approved
 
 
+def test_risk_reducing_close_bypasses_entry_daily_capacity():
+    close = order(
+        strategy="close",
+        side="sell",
+        position_effect="close",
+    )
+    exhausted = account(
+        orders_today=8,
+        notional_today=800.0,
+        entry_orders_today=6,
+        entry_notional_today=600.0,
+    )
+
+    decision = evaluate_option_order(close, exhausted, now=NOW)
+
+    assert decision.approved
+
+
 def test_ref_id_is_stable_and_changes_with_logical_identity():
     day = date(2026, 8, 10)
     first = deterministic_option_ref_id(ACCOUNT, OPTION_ID, "buy", "open", day, "long_call")
-    assert first == deterministic_option_ref_id(
-        ACCOUNT, OPTION_ID, "buy", "open", day, "long_call"
-    )
+    assert first == deterministic_option_ref_id(ACCOUNT, OPTION_ID, "buy", "open", day, "long_call")
     assert uuid.UUID(first).version == 5
-    assert first != deterministic_option_ref_id(
-        ACCOUNT, OPTION_ID, "sell", "close", day, "close"
-    )
+    assert first != deterministic_option_ref_id(ACCOUNT, OPTION_ID, "sell", "close", day, "close")
 
 
 def test_broker_parameters_exactly_match_review_and_place_schemas():

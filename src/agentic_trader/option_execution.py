@@ -116,9 +116,7 @@ class OptionExecutionLimits:
             raise ValueError("Opening, position, entry, or daily-order limit relaxes hard caps")
         if not 0 < self.max_daily_notional <= 800:
             raise ValueError("max_daily_notional cannot relax the $800 hard cap")
-        if not 0 < self.max_entry_daily_notional <= min(
-            self.max_daily_notional, 600
-        ):
+        if not 0 < self.max_entry_daily_notional <= min(self.max_daily_notional, 600):
             raise ValueError("entry notional cannot exceed $600 or the total cap")
         if (
             self.min_entry_dte < 21
@@ -133,11 +131,7 @@ class OptionExecutionLimits:
         ):
             raise ValueError("allowed_strategies must be a subset of the hard allowlist")
         max_long_debit = float(self.max_long_debit)
-        if (
-            not isfinite(max_long_debit)
-            or max_long_debit <= 0
-            or max_long_debit > 75
-        ):
+        if not isfinite(max_long_debit) or max_long_debit <= 0 or max_long_debit > 75:
             raise ValueError("max_long_debit cannot relax the $75 hard cap")
         for name in (
             "max_spread_fraction",
@@ -227,16 +221,13 @@ class OptionAccountSnapshot:
         if not str(self.account_number).strip():
             raise ValueError("account_number is required")
         normalized_shares = {
-            str(key).upper(): float(value)
-            for key, value in self.underlying_shares.items()
+            str(key).upper(): float(value) for key, value in self.underlying_shares.items()
         }
         normalized_values = {
-            str(key).upper(): float(value)
-            for key, value in self.underlying_values.items()
+            str(key).upper(): float(value) for key, value in self.underlying_values.items()
         }
         normalized_covered = {
-            str(key).upper(): int(value)
-            for key, value in self.covered_call_contracts.items()
+            str(key).upper(): int(value) for key, value in self.covered_call_contracts.items()
         }
         if any(not isfinite(value) or value < 0 for value in normalized_shares.values()):
             raise ValueError("underlying_shares must be finite and non-negative")
@@ -592,11 +583,11 @@ def evaluate_option_order(
         reasons.append("option_level_2_required")
     if account.equity <= 0:
         reasons.append("non_positive_equity")
-    if account.orders_today >= limits.max_orders_per_day:
+    if opening and account.orders_today >= limits.max_orders_per_day:
         reasons.append("daily_order_count_limit_reached")
     if opening and account.effective_entry_orders_today >= limits.max_entry_orders_per_day:
         reasons.append("daily_entry_order_count_limit_reached")
-    if account.notional_today + order.premium_notional > limits.max_daily_notional:
+    if opening and account.notional_today + order.premium_notional > limits.max_daily_notional:
         reasons.append("option_order_would_breach_daily_notional")
     if (
         opening

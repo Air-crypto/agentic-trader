@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "reviewed_at": "2026-08-21",
+  "issuers": {
+    "AMZN": ["aboutamazon.com", "amazon.com"],
+    "BIL": ["ssga.com"],
+    "FCX": ["fcx.com"],
+    "GLD": ["ssga.com", "spdrgoldshares.com"],
+    "IEF": ["ishares.com"],
+    "KO": ["coca-colacompany.com", "coca-cola.com"],
+    "LLY": ["lilly.com"],
+    "META": ["atmeta.com", "meta.com"],
+    "QQQ": ["invesco.com"],
+    "SPY": ["ssga.com"],
+    "TLT": ["ishares.com"],
+    "XLE": ["ssga.com"],
+    "XLV": ["ssga.com"]
+  },
+  "exchange_domains": [
+    "cboe.com",
+    "nasdaq.com",
+    "nyse.com"
+  ],
+  "social_domains": [
+    "reddit.com",
+    "stocktwits.com",
+    "twitter.com",
+    "x.com"
+  ]
+}
