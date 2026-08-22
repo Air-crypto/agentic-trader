@@ -16,7 +16,7 @@ from .learning import (
     PromotionReport,
 )
 from .ledger import DATABASE_URL_ENV
-from .models import QuantSnapshot
+from .models import QuantSnapshot, require_research_model_id
 
 
 def _date(value: Any) -> date:
@@ -113,10 +113,10 @@ def build_shadow_batch(
         raise ValueError("Learning research must cover the complete quant candidate universe")
     if any(item.as_of > decision_at for item in snapshots):
         raise ValueError("Learning quant data cannot postdate the decision")
-    model_id = str(research.get("model_id", "")).strip()
+    model_id = require_research_model_id(research.get("model_id"))
     prompt_version = str(research.get("prompt_version", "")).strip()
-    if not model_id or not prompt_version:
-        raise ValueError("Learning research requires model_id and prompt_version")
+    if not prompt_version:
+        raise ValueError("Learning research requires prompt_version")
 
     candidate_data: dict[str, dict[str, Any]] = {}
     for symbol, snapshot in quant_by_symbol.items():

@@ -8,14 +8,16 @@ This is an experimental system, not a promise of profit. The strategy's unvalida
 
 - Tasks: [`automations/morning-live.json`](automations/morning-live.json) and [`automations/evening-live.json`](automations/evening-live.json).
 - Cursor UI schedules, Runtime Secrets, MCP, and copy-ready instruction wrappers: [`automations/CURSOR_SETUP.md`](automations/CURSOR_SETUP.md).
+- Model: `gpt-5.6-sol` is the sole research and draft-generation model. No independent critic or self-critic run is configured. Deterministic guards do not detect semantic evidence conflicts or judge catalyst freshness, so the analyst must expose its counter-thesis and identified contradictions for human scrutiny.
 - Morning: regular-hours equity candidates only.
 - Evening: at most one new opening, at most `$100`, and only when Robinhood marks the equity eligible for all-day hours, the spread is at most `10 bps`, and a fresh whole-share GFD limit order can be formed.
-- The system may research, authorize, plan, and review an order automatically.
-- Before any reserve or place action, it must show the exact current order and ask the user to confirm that order.
+- The system may research, authorize, plan, and review an equity order automatically.
+- Before any reserve or place action, it must show the exact current equity order and ask the user to confirm that order.
 - A schedule, mode setting, earlier approval, or general instruction to trade is never order confirmation.
 - A plan expires five minutes after creation. Reservation revalidates the unchanged reviewed order against fresh broker state, durable usage, risk controls, and quotes no older than 15 seconds; failed revalidation requires a new plan, review, and signature.
-- No new option orders, shorts, margin, leveraged ETFs, averaging down, or same-day re-entry.
-- Existing and manually opened holdings are preserved unless the user separately authorizes a specific close.
+- Option positions and orders are read-only broker-truth inputs for these scheduled tasks. The tasks do not create option drafts or authorize, plan, review, or mutate options. The repository retains tested exact-batch close-only CLI primitives, but no option-close workflow is activated or supported by either scheduled automation.
+- No shorts, margin, leveraged ETFs, averaging down, or same-day re-entry.
+- Existing and manually opened equity holdings are preserved unless the user separately authorizes a specific equity close.
 
 ## Live-canary limits
 
@@ -40,7 +42,7 @@ The stricter of these portfolio limits and the execution engine's per-order limi
 2. Stop if the kill switch, loss limit, drawdown limit, data freshness, or broker-state checks fail.
 3. Research the candidate universe using point-in-time data.
 4. Use social sources only for discovery or sentiment. An actionable thesis must be supported by a registered issuer or exchange primary source. SEC ingestion is disabled in this deployment.
-5. Run a separate critic and deterministic portfolio authorization.
+5. Pass the analyst drafts directly through deterministic source, timestamp, quantitative, and portfolio authorization; no critic verdict is generated, and human review must scrutinize unresolved semantic conflicts.
 6. Build a five-minute equity plan and request a Robinhood order review.
 7. Show the exact symbol, side, quantity, order type, limit price, time in force, session, notional, and plan expiry.
 8. Wait for the user's local signature of that exact order. Only a fresh resumed run that verifies the signature may reserve and place it.
@@ -48,7 +50,7 @@ The stricter of these portfolio limits and the execution engine's per-order limi
 
 ## Learning and knowledge graph
 
-Predictions, rejected candidates, counterfactual outcomes, evidence, and knowledge-graph links are recorded in Supabase. Runtime KG nodes, relationships, and immutable supporting/contradicting observations survive fresh cloud VMs; checked-in Markdown is a curated schema/example export. This telemetry is **nonblocking**: it cannot change an authorization decision, expand risk, or become a promotion gate.
+Predictions, rejected candidates, counterfactual outcomes, evidence, and knowledge-graph links can be recorded in Supabase when their required inputs are available. Runtime KG nodes, relationships, and immutable supporting/contradicting observations survive fresh cloud VMs; checked-in Markdown is a curated schema/example export. This telemetry is **nonblocking**: it cannot change an authorization decision, expand risk, or become a promotion gate.
 
 ## Cloud runtime and recovery
 
@@ -58,7 +60,7 @@ Before a broker call, `live-reserve` persists an attempt and transactionally res
 
 ## Safety controls
 
-- A durable database halt survives cloud restarts. Reconciliation breaches use an all-order scope; ordinary risk halts block entries while still allowing a separately reviewed reducing exit. A root-level `KILL_SWITCH` remains an additional local stop only.
+- A durable database halt survives cloud restarts. Reconciliation breaches use an all-order scope; ordinary risk halts block entries while still allowing a separately reviewed reducing equity exit. A root-level `KILL_SWITCH` remains an additional local stop only.
 - `DATABASE_URL` is required for durable plans, reservations, idempotency, and audit history.
 - `AGENTIC_TRADER_NET_DEPOSITS` is required for loss-from-deposits and drawdown checks.
 - `AGENTIC_TRADER_CONFIRMATION_PUBLIC_KEY` verifies user confirmations; its private half stays only on the user's Mac.

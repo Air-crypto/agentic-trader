@@ -12,10 +12,10 @@ from typing import Any, Protocol
 from .evaluation import OutcomeMark
 from .models import (
     ActiveThesis,
-    CriticVerdict,
     DecisionPacket,
     EvidenceVersion,
     PickerDraft,
+    require_research_model_id,
 )
 from .option_models import ActiveOptionPosition, OptionDecisionPacket
 
@@ -176,8 +176,6 @@ class PickerLedger(Protocol):
 
     def put_draft(self, draft: PickerDraft) -> None: ...
 
-    def put_critic(self, verdict: CriticVerdict) -> None: ...
-
     def authorize_packet(self, packet: DecisionPacket) -> None: ...
 
     def authorized_packets(
@@ -241,32 +239,26 @@ class PickerLedger(Protocol):
         payload: dict[str, Any],
     ) -> None: ...
 
-    def latest_staged_batch(self, as_of: date) -> dict[str, Any] | None: ...
-
-    def latest_research_batch(self, as_of: date) -> dict[str, Any] | None: ...
-
-    def set_batch_status(self, batch_id: str, status: str) -> None: ...
-
-    def stage_pending_batch(
+    def stage_and_complete_research_cycle(
         self,
+        cycle_id: str,
         batch_id: str,
         as_of: date,
         created_at: datetime,
         prompt_hash: str,
-        analyst_model_id: str,
+        model_id: str,
         payload: dict[str, Any],
     ) -> None: ...
 
-    def latest_pending_batch(self, as_of: date) -> dict[str, Any] | None: ...
+    def latest_staged_batch(self, as_of: date) -> dict[str, Any] | None: ...
 
-    def pending_batch(self, batch_id: str) -> dict[str, Any] | None: ...
+    def research_batch(self, batch_id: str) -> dict[str, Any] | None: ...
 
-    def finalize_pending_batch(
-        self,
-        batch_id: str,
-        status: str,
-        finalized_at: datetime | None = None,
-    ) -> None: ...
+    def finalized_research_batch(self, batch_id: str) -> dict[str, Any] | None: ...
+
+    def latest_research_batch(self, as_of: date) -> dict[str, Any] | None: ...
+
+    def set_batch_status(self, batch_id: str, status: str) -> None: ...
 
     def start_research_cycle(
         self,
@@ -275,7 +267,7 @@ class PickerLedger(Protocol):
         started_at: datetime,
     ) -> None: ...
 
-    def bind_research_cycle(self, cycle_id: str, batch_id: str) -> None: ...
+    def complete_research_cycle(self, cycle_id: str, batch_id: str, as_of: date) -> None: ...
 
     def finish_research_cycle(self, cycle_id: str, status: str) -> None: ...
 
@@ -402,14 +394,12 @@ class InMemoryLedger:
         self.runs: dict[str, dict[str, Any]] = {}
         self.evidence: dict[tuple[str, str], EvidenceVersion] = {}
         self.drafts: dict[str, PickerDraft] = {}
-        self.critics: dict[str, CriticVerdict] = {}
         self.packets: dict[str, DecisionPacket] = {}
         self.theses: dict[str, ActiveThesis] = {}
         self.controls: dict[str, dict[str, Any]] = {}
         self.outcomes: dict[tuple[str, int], OutcomeMark] = {}
         self.equity_order_events: dict[tuple[str, str], dict[str, Any]] = {}
         self.batches: dict[str, dict[str, Any]] = {}
-        self.pending_batches: dict[str, dict[str, Any]] = {}
         self.research_cycles: dict[str, dict[str, Any]] = {}
         self.option_packets: dict[str, OptionDecisionPacket] = {}
         self.option_packet_states: dict[str, dict[str, Any]] = {}
@@ -430,6 +420,7 @@ class InMemoryLedger:
         status: str = "started",
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        model_id = require_research_model_id(model_id)
         payload = {
             "run_id": run_id,
             "account_key": account_hash,
@@ -460,19 +451,12 @@ class InMemoryLedger:
             raise ValueError(f"Draft {draft.draft_id} is immutable")
         self.drafts[draft.draft_id] = draft
 
-    def put_critic(self, verdict: CriticVerdict) -> None:
-        if verdict.draft_id not in self.drafts:
-            raise ValueError("Critic verdict references an unknown draft")
-        existing = self.critics.get(verdict.draft_id)
-        if existing is not None and existing != verdict:
-            raise ValueError(f"Critic verdict for {verdict.draft_id} is immutable")
-        self.critics[verdict.draft_id] = verdict
-
     def authorize_packet(self, packet: DecisionPacket) -> None:
         if not packet.verify_hash():
             raise ValueError("Cannot authorize a packet with an invalid hash")
-        if packet.draft_id not in self.drafts or packet.draft_id not in self.critics:
-            raise ValueError("Packet requires a known draft and critic verdict")
+        require_research_model_id(packet.model_id)
+        if packet.draft_id not in self.drafts:
+            raise ValueError("Packet requires a known draft")
         collision = next(
             (
                 item
@@ -676,6 +660,7 @@ class InMemoryLedger:
         model_id: str,
         payload: dict[str, Any],
     ) -> None:
+        model_id = require_research_model_id(model_id)
         record = {
             "batch_id": batch_id,
             "as_of": as_of,
@@ -690,6 +675,44 @@ class InMemoryLedger:
             raise ValueError(f"Research batch {batch_id} is immutable")
         self.batches[batch_id] = record
 
+    def stage_and_complete_research_cycle(
+        self,
+        cycle_id: str,
+        batch_id: str,
+        as_of: date,
+        created_at: datetime,
+        prompt_hash: str,
+        model_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        model_id = require_research_model_id(model_id)
+        batch_record = {
+            "batch_id": batch_id,
+            "as_of": as_of,
+            "created_at": created_at,
+            "prompt_hash": prompt_hash,
+            "model_id": model_id,
+            "status": "staged",
+            "payload": payload,
+        }
+        existing_batch = self.batches.get(batch_id)
+        if existing_batch is not None and existing_batch != batch_record:
+            raise ValueError(f"Research batch {batch_id} is immutable")
+        cycle = self.research_cycles.get(cycle_id)
+        if cycle is None:
+            raise ValueError(f"Unknown research cycle {cycle_id}")
+        if cycle["as_of"] != as_of:
+            raise ValueError("Research cycle date does not match the staged batch")
+        already_finalized = cycle["status"] == "finalized" and cycle["batch_id"] == batch_id
+        if not already_finalized:
+            if cycle["status"] not in {"running", "pending"}:
+                raise ValueError(f"Research cycle {cycle_id} cannot be completed")
+            if cycle["batch_id"] not in {None, batch_id}:
+                raise ValueError(f"Research cycle {cycle_id} is bound elsewhere")
+        self.batches[batch_id] = existing_batch or batch_record
+        cycle["batch_id"] = batch_id
+        cycle["status"] = "finalized"
+
     def latest_staged_batch(self, as_of: date) -> dict[str, Any] | None:
         eligible = [
             record
@@ -697,6 +720,21 @@ class InMemoryLedger:
             if record["as_of"] == as_of and record["status"] == "staged"
         ]
         return max(eligible, key=lambda item: item["created_at"]) if eligible else None
+
+    def research_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return self.batches.get(batch_id)
+
+    def finalized_research_batch(self, batch_id: str) -> dict[str, Any] | None:
+        batch = self.batches.get(batch_id)
+        if batch is None:
+            return None
+        bound = any(
+            cycle["batch_id"] == batch_id
+            and cycle["as_of"] == batch["as_of"]
+            and cycle["status"] == "finalized"
+            for cycle in self.research_cycles.values()
+        )
+        return batch if bound else None
 
     def latest_research_batch(self, as_of: date) -> dict[str, Any] | None:
         eligible = [
@@ -712,62 +750,6 @@ class InMemoryLedger:
         if batch_id not in self.batches:
             raise ValueError(f"Unknown research batch {batch_id}")
         self.batches[batch_id]["status"] = status
-
-    def stage_pending_batch(
-        self,
-        batch_id: str,
-        as_of: date,
-        created_at: datetime,
-        prompt_hash: str,
-        analyst_model_id: str,
-        payload: dict[str, Any],
-    ) -> None:
-        record = {
-            "batch_id": batch_id,
-            "as_of": as_of,
-            "created_at": created_at,
-            "prompt_hash": prompt_hash,
-            "analyst_model_id": analyst_model_id,
-            "status": "pending",
-            "payload": payload,
-            "finalized_at": None,
-        }
-        existing = self.pending_batches.get(batch_id)
-        if existing is not None:
-            comparable = {**existing, "status": "pending", "finalized_at": None}
-            if comparable != record:
-                raise ValueError(f"Pending research batch {batch_id} is immutable")
-            return
-        self.pending_batches[batch_id] = record
-
-    def latest_pending_batch(self, as_of: date) -> dict[str, Any] | None:
-        eligible = [
-            record
-            for record in self.pending_batches.values()
-            if record["as_of"] == as_of and record["status"] == "pending"
-        ]
-        return max(eligible, key=lambda item: item["created_at"]) if eligible else None
-
-    def pending_batch(self, batch_id: str) -> dict[str, Any] | None:
-        return self.pending_batches.get(batch_id)
-
-    def finalize_pending_batch(
-        self,
-        batch_id: str,
-        status: str,
-        finalized_at: datetime | None = None,
-    ) -> None:
-        if status not in {"finalized", "rejected"}:
-            raise ValueError("Pending batch status must be finalized or rejected")
-        record = self.pending_batches.get(batch_id)
-        if record is None:
-            raise ValueError(f"Unknown pending research batch {batch_id}")
-        if record["status"] == status:
-            return
-        if record["status"] != "pending":
-            raise ValueError(f"Pending batch {batch_id} is already {record['status']}")
-        record["status"] = status
-        record["finalized_at"] = finalized_at or datetime.now(UTC)
 
     def start_research_cycle(
         self,
@@ -787,21 +769,31 @@ class InMemoryLedger:
             raise ValueError(f"Research cycle {cycle_id} is immutable")
         self.research_cycles[cycle_id] = existing or record
 
-    def bind_research_cycle(self, cycle_id: str, batch_id: str) -> None:
-        record = self.research_cycles.get(cycle_id)
-        if record is None or record["status"] not in {"running", "pending"}:
-            raise ValueError(f"Research cycle {cycle_id} is not running")
-        if record["batch_id"] not in {None, batch_id}:
-            raise ValueError(f"Research cycle {cycle_id} is bound elsewhere")
-        record["batch_id"] = batch_id
-        record["status"] = "pending"
-
-    def finish_research_cycle(self, cycle_id: str, status: str) -> None:
-        if status not in {"finalized", "failed"}:
-            raise ValueError("Research cycle must finish finalized or failed")
+    def complete_research_cycle(self, cycle_id: str, batch_id: str, as_of: date) -> None:
         record = self.research_cycles.get(cycle_id)
         if record is None:
             raise ValueError(f"Unknown research cycle {cycle_id}")
+        if record["as_of"] != as_of:
+            raise ValueError("Research cycle date does not match the staged batch")
+        if record["status"] == "finalized" and record["batch_id"] == batch_id:
+            return
+        if record["status"] not in {"running", "pending"}:
+            raise ValueError(f"Research cycle {cycle_id} cannot be completed")
+        if record["batch_id"] not in {None, batch_id}:
+            raise ValueError(f"Research cycle {cycle_id} is bound elsewhere")
+        record["batch_id"] = batch_id
+        record["status"] = "finalized"
+
+    def finish_research_cycle(self, cycle_id: str, status: str) -> None:
+        if status != "failed":
+            raise ValueError("Research cycle failure must use failed status")
+        record = self.research_cycles.get(cycle_id)
+        if record is None:
+            raise ValueError(f"Unknown research cycle {cycle_id}")
+        if record["status"] == "failed":
+            return
+        if record["status"] not in {"running", "pending"}:
+            raise ValueError(f"Research cycle {cycle_id} cannot fail from {record['status']}")
         record["status"] = status
 
     def latest_unfinished_cycle(self, as_of: date) -> dict[str, Any] | None:
@@ -823,6 +815,7 @@ class InMemoryLedger:
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
         if not packet.verify_hash():
             raise ValueError("Cannot authorize an option packet with an invalid hash")
+        require_research_model_id(packet.model_id)
         existing = self.option_packets.get(packet.packet_id)
         if existing is not None and existing != packet:
             raise ValueError(f"Option packet {packet.packet_id} is immutable")
@@ -1420,8 +1413,20 @@ class PostgresLedger:
         status: str = "started",
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        model_id = require_research_model_id(model_id)
         from psycopg.types.json import Jsonb
 
+        metadata = metadata or {}
+        values = (
+            run_id,
+            account_hash,
+            started_at,
+            as_of,
+            model_id,
+            prompt_hash,
+            status,
+            metadata,
+        )
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1431,17 +1436,22 @@ class PostgresLedger:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (run_id) DO NOTHING
                 """,
-                (
-                    run_id,
-                    account_hash,
-                    started_at,
-                    as_of,
-                    model_id,
-                    prompt_hash,
-                    status,
-                    Jsonb(metadata or {}),
-                ),
+                (*values[:-1], Jsonb(metadata)),
             )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT run_id, account_key, started_at, as_of, model_id,
+                       prompt_hash, status, metadata
+                FROM picker_runs
+                WHERE run_id = %s
+                """,
+                (run_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != values:
+                raise ValueError(f"Run {run_id} already exists with different data")
 
     def put_evidence(self, evidence: EvidenceVersion) -> None:
         from psycopg.types.json import Jsonb
@@ -1467,6 +1477,8 @@ class PostgresLedger:
     def put_draft(self, draft: PickerDraft) -> None:
         from psycopg.types.json import Jsonb
 
+        payload = draft.to_dict()
+        values = (draft.draft_id, draft.run_id, draft.symbol, draft.created_at, payload)
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1474,38 +1486,40 @@ class PostgresLedger:
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (draft_id) DO NOTHING
                 """,
-                (
-                    draft.draft_id,
-                    draft.run_id,
-                    draft.symbol,
-                    draft.created_at,
-                    Jsonb(draft.to_dict()),
-                ),
+                (*values[:-1], Jsonb(payload)),
             )
-
-    def put_critic(self, verdict: CriticVerdict) -> None:
-        from psycopg.types.json import Jsonb
-
-        with self._connect() as connection, connection.cursor() as cursor:
+            if cursor.rowcount == 1:
+                return
             cursor.execute(
                 """
-                INSERT INTO critic_verdicts (draft_id, created_at, verdict, payload)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (draft_id) DO NOTHING
+                SELECT draft_id, run_id, symbol, created_at, payload
+                FROM picker_drafts
+                WHERE draft_id = %s
                 """,
-                (
-                    verdict.draft_id,
-                    verdict.created_at,
-                    verdict.verdict,
-                    Jsonb(verdict.to_dict()),
-                ),
+                (draft.draft_id,),
             )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != values:
+                raise ValueError(f"Draft {draft.draft_id} is immutable")
 
     def authorize_packet(self, packet: DecisionPacket) -> None:
         if not packet.verify_hash():
             raise ValueError("Cannot authorize a packet with an invalid hash")
+        require_research_model_id(packet.model_id)
         from psycopg.types.json import Jsonb
 
+        payload = packet.to_dict()
+        values = (
+            packet.packet_id,
+            packet.run_id,
+            packet.draft_id,
+            packet.symbol,
+            packet.action,
+            packet.valid_for_date,
+            packet.expires_at,
+            packet.packet_hash,
+            payload,
+        )
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1515,18 +1529,24 @@ class PostgresLedger:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (packet_id) DO NOTHING
                 """,
-                (
-                    packet.packet_id,
-                    packet.run_id,
-                    packet.draft_id,
-                    packet.symbol,
-                    packet.action,
-                    packet.valid_for_date,
-                    packet.expires_at,
-                    packet.packet_hash,
-                    Jsonb(packet.to_dict()),
-                ),
+                (*values[:-1], Jsonb(payload)),
             )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT packet_id, run_id, draft_id, symbol, action,
+                       valid_for_date, expires_at, packet_hash, payload
+                FROM decision_packets
+                WHERE packet_id = %s
+                """,
+                (packet.packet_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError("An authorized packet already exists for symbol/action/day")
+            if tuple(row) != values:
+                raise ValueError(f"Packet {packet.packet_id} is immutable")
 
     def authorized_packets(
         self, valid_for: date, now: datetime | None = None
@@ -1931,8 +1951,10 @@ class PostgresLedger:
         model_id: str,
         payload: dict[str, Any],
     ) -> None:
+        model_id = require_research_model_id(model_id)
         from psycopg.types.json import Jsonb
 
+        values = (batch_id, as_of, created_at, prompt_hash, model_id, payload)
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -1941,15 +1963,82 @@ class PostgresLedger:
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (batch_id) DO NOTHING
                 """,
-                (
-                    batch_id,
-                    as_of,
-                    created_at,
-                    prompt_hash,
-                    model_id,
-                    Jsonb(payload),
-                ),
+                (*values[:-1], Jsonb(payload)),
             )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                """
+                SELECT batch_id, as_of, created_at, prompt_hash, model_id, payload
+                FROM picker_research_batches
+                WHERE batch_id = %s
+                """,
+                (batch_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != values:
+                raise ValueError(f"Research batch {batch_id} is immutable")
+
+    def stage_and_complete_research_cycle(
+        self,
+        cycle_id: str,
+        batch_id: str,
+        as_of: date,
+        created_at: datetime,
+        prompt_hash: str,
+        model_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        model_id = require_research_model_id(model_id)
+        from psycopg.types.json import Jsonb
+
+        values = (batch_id, as_of, created_at, prompt_hash, model_id, payload)
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"research-execution-cycle:{as_of.isoformat()}",),
+            )
+            cursor.execute(
+                """
+                INSERT INTO picker_research_batches
+                    (batch_id, as_of, created_at, prompt_hash, model_id, payload)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (batch_id) DO NOTHING
+                """,
+                (*values[:-1], Jsonb(payload)),
+            )
+            if cursor.rowcount != 1:
+                cursor.execute(
+                    """
+                    SELECT batch_id, as_of, created_at, prompt_hash, model_id, payload
+                    FROM picker_research_batches
+                    WHERE batch_id = %s
+                    """,
+                    (batch_id,),
+                )
+                row = cursor.fetchone()
+                if row is None or tuple(row) != values:
+                    raise ValueError(f"Research batch {batch_id} is immutable")
+            cursor.execute(
+                """
+                UPDATE picker_research_cycles
+                SET status = 'finalized', batch_id = %s, updated_at = now()
+                WHERE cycle_id = %s
+                  AND as_of = %s
+                  AND status IN ('running', 'pending')
+                  AND (batch_id IS NULL OR batch_id = %s)
+                """,
+                (batch_id, cycle_id, as_of, batch_id),
+            )
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                "SELECT status, batch_id, as_of FROM picker_research_cycles WHERE cycle_id = %s",
+                (cycle_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != ("finalized", batch_id, as_of):
+                raise ValueError(f"Research cycle {cycle_id} cannot complete {batch_id}")
 
     def latest_staged_batch(self, as_of: date) -> dict[str, Any] | None:
         with self._connect() as connection, connection.cursor() as cursor:
@@ -1962,6 +2051,60 @@ class PostgresLedger:
                 LIMIT 1
                 """,
                 (as_of,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "batch_id": row[0],
+                "as_of": row[1],
+                "created_at": row[2],
+                "prompt_hash": row[3],
+                "model_id": row[4],
+                "status": row[5],
+                "payload": row[6],
+            }
+
+    def research_batch(self, batch_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT batch_id, as_of, created_at, prompt_hash, model_id, status, payload
+                FROM picker_research_batches
+                WHERE batch_id = %s
+                """,
+                (batch_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "batch_id": row[0],
+                "as_of": row[1],
+                "created_at": row[2],
+                "prompt_hash": row[3],
+                "model_id": row[4],
+                "status": row[5],
+                "payload": row[6],
+            }
+
+    def finalized_research_batch(self, batch_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT b.batch_id, b.as_of, b.created_at, b.prompt_hash,
+                       b.model_id, b.status, b.payload
+                FROM picker_research_batches AS b
+                WHERE b.batch_id = %s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM picker_research_cycles AS c
+                      WHERE c.batch_id = b.batch_id
+                        AND c.as_of = b.as_of
+                        AND c.status = 'finalized'
+                  )
+                """,
+                (batch_id,),
             )
             row = cursor.fetchone()
             if row is None:
@@ -2016,131 +2159,6 @@ class PostgresLedger:
             if cursor.rowcount != 1:
                 raise ValueError(f"Unknown research batch {batch_id}")
 
-    def stage_pending_batch(
-        self,
-        batch_id: str,
-        as_of: date,
-        created_at: datetime,
-        prompt_hash: str,
-        analyst_model_id: str,
-        payload: dict[str, Any],
-    ) -> None:
-        from psycopg.types.json import Jsonb
-
-        values = (
-            batch_id,
-            as_of,
-            created_at,
-            prompt_hash,
-            analyst_model_id,
-            payload,
-        )
-        with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO picker_pending_research_batches
-                    (batch_id, as_of, created_at, prompt_hash,
-                     analyst_model_id, payload)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (batch_id) DO NOTHING
-                """,
-                (*values[:-1], Jsonb(payload)),
-            )
-            if cursor.rowcount == 1:
-                return
-            cursor.execute(
-                """
-                SELECT batch_id, as_of, created_at, prompt_hash,
-                       analyst_model_id, payload
-                FROM picker_pending_research_batches
-                WHERE batch_id = %s
-                """,
-                (batch_id,),
-            )
-            row = cursor.fetchone()
-            if row is None or tuple(row) != values:
-                raise ValueError(f"Pending research batch {batch_id} is immutable")
-
-    def latest_pending_batch(self, as_of: date) -> dict[str, Any] | None:
-        with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT batch_id, as_of, created_at, prompt_hash,
-                       analyst_model_id, status, payload, finalized_at
-                FROM picker_pending_research_batches
-                WHERE as_of = %s AND status = 'pending'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (as_of,),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return {
-                "batch_id": row[0],
-                "as_of": row[1],
-                "created_at": row[2],
-                "prompt_hash": row[3],
-                "analyst_model_id": row[4],
-                "status": row[5],
-                "payload": row[6],
-                "finalized_at": row[7],
-            }
-
-    def pending_batch(self, batch_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT batch_id, as_of, created_at, prompt_hash,
-                       analyst_model_id, status, payload, finalized_at
-                FROM picker_pending_research_batches
-                WHERE batch_id = %s
-                """,
-                (batch_id,),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return {
-                "batch_id": row[0],
-                "as_of": row[1],
-                "created_at": row[2],
-                "prompt_hash": row[3],
-                "analyst_model_id": row[4],
-                "status": row[5],
-                "payload": row[6],
-                "finalized_at": row[7],
-            }
-
-    def finalize_pending_batch(
-        self,
-        batch_id: str,
-        status: str,
-        finalized_at: datetime | None = None,
-    ) -> None:
-        if status not in {"finalized", "rejected"}:
-            raise ValueError("Pending batch status must be finalized or rejected")
-        finalized_at = finalized_at or datetime.now(UTC)
-        with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE picker_pending_research_batches
-                SET status = %s, finalized_at = %s
-                WHERE batch_id = %s AND status = 'pending'
-                """,
-                (status, finalized_at, batch_id),
-            )
-            if cursor.rowcount == 1:
-                return
-            cursor.execute(
-                "SELECT status FROM picker_pending_research_batches WHERE batch_id = %s",
-                (batch_id,),
-            )
-            row = cursor.fetchone()
-            if row is None or row[0] != status:
-                raise ValueError(f"Pending batch {batch_id} cannot become {status}")
-
     def start_research_cycle(
         self,
         cycle_id: str,
@@ -2171,35 +2189,54 @@ class PostgresLedger:
             if row is None or tuple(row) != (as_of, started_at):
                 raise ValueError(f"Research cycle {cycle_id} is immutable")
 
-    def bind_research_cycle(self, cycle_id: str, batch_id: str) -> None:
+    def complete_research_cycle(self, cycle_id: str, batch_id: str, as_of: date) -> None:
         with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"research-execution-cycle:{as_of.isoformat()}",),
+            )
             cursor.execute(
                 """
                 UPDATE picker_research_cycles
-                SET status = 'pending', batch_id = %s, updated_at = now()
+                SET status = 'finalized', batch_id = %s, updated_at = now()
                 WHERE cycle_id = %s
+                  AND as_of = %s
                   AND status IN ('running', 'pending')
                   AND (batch_id IS NULL OR batch_id = %s)
                 """,
-                (batch_id, cycle_id, batch_id),
+                (batch_id, cycle_id, as_of, batch_id),
             )
-            if cursor.rowcount != 1:
-                raise ValueError(f"Research cycle {cycle_id} cannot bind {batch_id}")
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                "SELECT status, batch_id, as_of FROM picker_research_cycles WHERE cycle_id = %s",
+                (cycle_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or tuple(row) != ("finalized", batch_id, as_of):
+                raise ValueError(f"Research cycle {cycle_id} cannot complete {batch_id}")
 
     def finish_research_cycle(self, cycle_id: str, status: str) -> None:
-        if status not in {"finalized", "failed"}:
-            raise ValueError("Research cycle must finish finalized or failed")
+        if status != "failed":
+            raise ValueError("Research cycle failure must use failed status")
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE picker_research_cycles
                 SET status = %s, updated_at = now()
-                WHERE cycle_id = %s
+                WHERE cycle_id = %s AND status IN ('running', 'pending')
                 """,
                 (status, cycle_id),
             )
-            if cursor.rowcount != 1:
-                raise ValueError(f"Unknown research cycle {cycle_id}")
+            if cursor.rowcount == 1:
+                return
+            cursor.execute(
+                "SELECT status FROM picker_research_cycles WHERE cycle_id = %s",
+                (cycle_id,),
+            )
+            row = cursor.fetchone()
+            if row is None or row[0] != "failed":
+                raise ValueError(f"Research cycle {cycle_id} cannot fail")
 
     def latest_unfinished_cycle(self, as_of: date) -> dict[str, Any] | None:
         with self._connect() as connection, connection.cursor() as cursor:
@@ -2237,6 +2274,7 @@ class PostgresLedger:
     def authorize_option_packet(self, packet: OptionDecisionPacket) -> None:
         if not packet.verify_hash():
             raise ValueError("Cannot authorize an option packet with an invalid hash")
+        require_research_model_id(packet.model_id)
         from psycopg.types.json import Jsonb
 
         with self._connect() as connection, connection.cursor() as cursor:
@@ -2879,6 +2917,16 @@ class PostgresLedger:
                 (f"research-execution-cycle:{trade_date.isoformat()}",),
             )
             if any(is_entry for _, _, is_entry, _ in orders):
+                cursor.execute(
+                    """
+                    UPDATE picker_research_cycles
+                    SET status = 'failed', updated_at = now()
+                    WHERE as_of = %s
+                      AND status IN ('running', 'pending')
+                      AND started_at < now() - interval '6 hours'
+                    """,
+                    (trade_date,),
+                )
                 cursor.execute(
                     """
                     SELECT batch_id

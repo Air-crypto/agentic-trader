@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from agentic_trader.picker.ledger import InMemoryLedger
+from agentic_trader.picker.ledger import InMemoryLedger, PostgresLedger
 from agentic_trader.picker.option_models import (
     ActiveOptionPosition,
     OptionContractSnapshot,
@@ -14,34 +14,64 @@ from agentic_trader.picker.option_models import (
 from agentic_trader.picker.validation import validate_picker_draft
 
 
-def authorized_packet(draft, evidence, quant, critic, now):
+def authorized_packet(draft, evidence, quant, now):
     result = validate_picker_draft(
         draft,
         {item.evidence_id: item for item in evidence},
         quant,
-        critic,
         prompt_hash="a" * 64,
-        model_id="analyst-model",
         now=now,
     )
     assert result.packet is not None
     return result.packet
 
 
-def populated_ledger(draft, evidence, critic, now):
+def populated_ledger(draft, evidence, now):
     ledger = InMemoryLedger()
     ledger.put_run(
         draft.run_id,
         "account-hash",
         draft.created_at,
         now.date(),
-        "analyst-model",
+        "gpt-5.6-sol",
         "a" * 64,
     )
     for item in evidence:
         ledger.put_evidence(item)
     ledger.put_draft(draft)
-    ledger.put_critic(critic)
+    return ledger
+
+
+def postgres_conflict_ledger(monkeypatch, existing_row):
+    class Cursor:
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=()):
+            self.rowcount = 0
+
+        def fetchone(self):
+            return existing_row
+
+    cursor = Cursor()
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def cursor(self):
+            return cursor
+
+    ledger = PostgresLedger("postgresql://unused")
+    monkeypatch.setattr(ledger, "_connect", lambda: Connection())
     return ledger
 
 
@@ -62,30 +92,94 @@ def test_prior_close_write_fails_closed_without_verified_reconstruction():
     assert ledger.control_state("account")["prior_close_equity"] is None
 
 
-def test_authorized_packet_round_trip(draft, evidence, quant, critic, now):
-    ledger = populated_ledger(draft, evidence, critic, now)
-    packet = authorized_packet(draft, evidence, quant, critic, now)
+def test_authorized_packet_round_trip(draft, evidence, quant, now):
+    ledger = populated_ledger(draft, evidence, now)
+    packet = authorized_packet(draft, evidence, quant, now)
     ledger.authorize_packet(packet)
     assert ledger.authorized_packets(now.date(), now) == [packet]
 
 
-def test_packet_requires_draft_and_critic(draft, evidence, quant, critic, now):
+def test_packet_requires_known_draft(draft, evidence, quant, now):
     ledger = InMemoryLedger()
-    packet = authorized_packet(draft, evidence, quant, critic, now)
-    with pytest.raises(ValueError, match="known draft and critic"):
+    packet = authorized_packet(draft, evidence, quant, now)
+    with pytest.raises(ValueError, match="known draft"):
         ledger.authorize_packet(packet)
 
 
-def test_duplicate_symbol_action_day_is_rejected(draft, evidence, quant, critic, now):
-    ledger = populated_ledger(draft, evidence, critic, now)
-    first = authorized_packet(draft, evidence, quant, critic, now)
+def test_postgres_run_conflict_rejects_cross_batch_id_reuse(monkeypatch, now):
+    existing = (
+        "run-1",
+        "account-hash",
+        now,
+        now.date(),
+        "gpt-5.6-sol",
+        "a" * 64,
+        "started",
+        {"batch_id": "older-batch"},
+    )
+    ledger = postgres_conflict_ledger(monkeypatch, existing)
+
+    with pytest.raises(ValueError, match="different data"):
+        ledger.put_run(
+            "run-1",
+            "account-hash",
+            now,
+            now.date(),
+            "gpt-5.6-sol",
+            "a" * 64,
+            metadata={"batch_id": "newer-batch"},
+        )
+
+
+def test_postgres_draft_conflict_is_not_silently_reused(monkeypatch, draft):
+    existing = (
+        draft.draft_id,
+        draft.run_id,
+        draft.symbol,
+        draft.created_at,
+        draft.to_dict(),
+    )
+    ledger = postgres_conflict_ledger(monkeypatch, existing)
+    changed = replace(draft, thesis="A different falsifiable thesis cannot reuse this draft ID.")
+
+    with pytest.raises(ValueError, match="immutable"):
+        ledger.put_draft(changed)
+
+
+def test_postgres_packet_conflict_is_not_silently_reused(
+    monkeypatch,
+    draft,
+    evidence,
+    quant,
+    now,
+):
+    packet = authorized_packet(draft, evidence, quant, now)
+    existing = (
+        packet.packet_id,
+        packet.run_id,
+        packet.draft_id,
+        packet.symbol,
+        packet.action,
+        packet.valid_for_date,
+        packet.expires_at,
+        packet.packet_hash,
+        packet.to_dict(),
+    )
+    ledger = postgres_conflict_ledger(monkeypatch, existing)
+    changed = replace(packet, target_weight=packet.target_weight / 2).with_hash()
+
+    with pytest.raises(ValueError, match="immutable"):
+        ledger.authorize_packet(changed)
+
+
+def test_duplicate_symbol_action_day_is_rejected(draft, evidence, quant, now):
+    ledger = populated_ledger(draft, evidence, now)
+    first = authorized_packet(draft, evidence, quant, now)
     ledger.authorize_packet(first)
 
     second_draft = replace(draft, draft_id="draft-2")
-    second_critic = replace(critic, draft_id="draft-2")
     ledger.put_draft(second_draft)
-    ledger.put_critic(second_critic)
-    second = authorized_packet(second_draft, evidence, quant, second_critic, now)
+    second = authorized_packet(second_draft, evidence, quant, now)
     with pytest.raises(ValueError, match="already exists"):
         ledger.authorize_packet(second)
 
@@ -122,7 +216,7 @@ def option_packet(now, packet_id="option-packet-1", strike=100.0):
         shares_encumbered=0,
         evidence_ids=("evidence-1",),
         prompt_hash="p" * 64,
-        model_id="option-model",
+        model_id="gpt-5.6-sol",
         draft_hash="d" * 64,
         horizon_trading_days=20,
         invalidation="Close if the option thesis is invalidated.",
@@ -325,7 +419,7 @@ def test_latest_research_batch_remains_available_after_stock_authorization(now):
         now.date(),
         now,
         "a" * 64,
-        "model",
+        "gpt-5.6-sol",
         payload,
     )
     ledger.set_batch_status("batch-1", "authorized")
@@ -334,32 +428,64 @@ def test_latest_research_batch_remains_available_after_stock_authorization(now):
     assert ledger.latest_research_batch(now.date())["batch_id"] == "batch-1"
 
 
-def test_pending_batch_requires_separate_finalization(now):
-    ledger = InMemoryLedger()
-    payload = {"drafts": [{"draft_id": "draft-1"}], "option_drafts": []}
-    ledger.stage_pending_batch(
-        "pending-1",
-        now.date(),
-        now,
-        "a" * 64,
-        "claude-sonnet",
-        payload,
-    )
-    assert ledger.latest_pending_batch(now.date())["batch_id"] == "pending-1"
-    ledger.finalize_pending_batch("pending-1", "finalized", now)
-    assert ledger.latest_pending_batch(now.date()) is None
-    ledger.finalize_pending_batch("pending-1", "finalized", now)
-
-
 def test_research_cycle_marker_blocks_until_finalized(now):
     ledger = InMemoryLedger()
     current = datetime.now(UTC)
     ledger.start_research_cycle("cycle-1", current.date(), current)
     assert ledger.latest_unfinished_cycle(current.date())["cycle_id"] == "cycle-1"
-    ledger.bind_research_cycle("cycle-1", "batch-1")
-    assert ledger.latest_unfinished_cycle(current.date())["status"] == "pending"
-    ledger.finish_research_cycle("cycle-1", "finalized")
+    ledger.complete_research_cycle("cycle-1", "batch-1", current.date())
     assert ledger.latest_unfinished_cycle(current.date()) is None
+    assert ledger.research_cycles["cycle-1"]["batch_id"] == "batch-1"
+
+
+def test_research_cycle_cannot_complete_for_another_session(now):
+    ledger = InMemoryLedger()
+    ledger.start_research_cycle("cycle-1", now.date(), now)
+    with pytest.raises(ValueError, match="date does not match"):
+        ledger.complete_research_cycle("cycle-1", "batch-1", now.date() + timedelta(days=1))
+
+
+def test_postgres_cycle_completion_takes_date_lock_before_finalizing(monkeypatch, now):
+    calls = []
+
+    class Cursor:
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=()):
+            calls.append((" ".join(str(query).split()), params))
+            self.rowcount = 1 if "UPDATE picker_research_cycles" in str(query) else 0
+
+        def fetchone(self):
+            raise AssertionError("Successful completion must not need a fallback read")
+
+    cursor = Cursor()
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def cursor(self):
+            return cursor
+
+    ledger = PostgresLedger("postgresql://unused")
+    monkeypatch.setattr(ledger, "_connect", lambda: Connection())
+
+    ledger.complete_research_cycle("cycle-1", "batch-1", now.date())
+
+    assert calls[0] == (
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"research-execution-cycle:{now.date().isoformat()}",),
+    )
+    assert calls[1][0].startswith("UPDATE picker_research_cycles")
 
 
 def test_stale_research_cycle_is_reaped_instead_of_deadlocking():
@@ -383,8 +509,8 @@ def test_durable_execution_budget_reserves_entry_and_exit_capacity(now):
         now.date(),
         now,
         "a" * 64,
-        "claude-sonnet",
-        {"drafts": [], "option_drafts": [], "critics": []},
+        "gpt-5.6-sol",
+        {"drafts": [], "option_drafts": []},
     )
     usage = ledger.reserve_execution_budget(
         account_hash,
@@ -464,8 +590,8 @@ def test_cloud_reservation_binding_grants_one_placement_claim(now):
         now.date(),
         now,
         "a" * 64,
-        "gpt-5.5",
-        {"drafts": [], "option_drafts": [], "critics": []},
+        "gpt-5.6-sol",
+        {"drafts": [], "option_drafts": []},
     )
     order = [("ref-1", 100.0, True, False)]
     bindings = {
@@ -552,8 +678,8 @@ def test_durable_budget_atomically_limits_concurrent_option_openings(now):
         now.date(),
         now,
         "a" * 64,
-        "claude-sonnet",
-        {"drafts": [], "option_drafts": [], "critics": []},
+        "gpt-5.6-sol",
+        {"drafts": [], "option_drafts": []},
     )
     ledger.reserve_execution_budget(
         "account-hash",

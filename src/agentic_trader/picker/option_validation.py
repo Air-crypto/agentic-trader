@@ -8,8 +8,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from math import isfinite
 from typing import Any
 
-from .critic_policy import evaluate_critic_policy
-from .models import CriticVerdict, EvidenceVersion, PickerDraft
+from .models import RESEARCH_MODEL_ID, EvidenceVersion, PickerDraft
 from .option_models import (
     OPTION_ACTIONS,
     ActiveOptionPosition,
@@ -258,19 +257,12 @@ def _append_evidence_reasons(
 def _append_inheritance_reasons(
     reasons: list[str],
     draft: OptionDraft,
-    critic: CriticVerdict,
     source_draft: PickerDraft | None,
-    analyst_model_id: str,
-    now: datetime,
 ) -> None:
-    critic_target = draft.draft_id
-    earliest_critic_time = draft.created_at
     if draft.source_draft_id is not None:
         if source_draft is None:
             reasons.append("missing_source_picker_draft")
         else:
-            critic_target = source_draft.draft_id
-            earliest_critic_time = source_draft.created_at
             if source_draft.draft_id != draft.source_draft_id:
                 reasons.append("source_draft_id_mismatch")
             if source_draft.symbol != draft.underlying:
@@ -281,15 +273,6 @@ def _append_inheritance_reasons(
                 reasons.append("option_draft_predates_source")
     elif source_draft is not None:
         reasons.append("unexpected_source_picker_draft")
-
-    critic_policy = evaluate_critic_policy(
-        critic,
-        draft_id=critic_target,
-        draft_created_at=earliest_critic_time,
-        analyst_model_id=analyst_model_id,
-        now=now,
-    )
-    reasons.extend(critic_policy.reasons)
 
 
 def _open_positions(
@@ -304,9 +287,7 @@ def validate_option_draft(
     draft: OptionDraft,
     evidence_by_id: dict[str, EvidenceVersion],
     contracts: Iterable[OptionContractSnapshot | dict[str, Any]],
-    critic: CriticVerdict,
     prompt_hash: str,
-    model_id: str,
     account_equity: float,
     *,
     available_cash: float = 0.0,
@@ -346,10 +327,7 @@ def validate_option_draft(
     _append_inheritance_reasons(
         reasons,
         draft,
-        critic,
         source_draft,
-        model_id,
-        now,
     )
     _append_evidence_reasons(reasons, draft, evidence_by_id, now)
 
@@ -470,7 +448,7 @@ def validate_option_draft(
         shares_encumbered=shares_encumbered,
         evidence_ids=draft.evidence_ids,
         prompt_hash=prompt_hash,
-        model_id=model_id,
+        model_id=RESEARCH_MODEL_ID,
         draft_hash=draft.draft_hash,
         horizon_trading_days=draft.horizon_trading_days,
         invalidation=draft.invalidation

@@ -1,8 +1,9 @@
 """Evidence-grounded AI stock-picker components."""
 
 from .models import (
+    RESEARCH_MODEL_ID,
+    RESEARCH_REVIEW_MODE,
     ActiveThesis,
-    CriticVerdict,
     DecisionPacket,
     EvidenceVersion,
     PickerDraft,
@@ -18,7 +19,6 @@ from .option_models import (
 __all__ = [
     "ActiveOptionPosition",
     "ActiveThesis",
-    "CriticVerdict",
     "DecisionPacket",
     "EvidenceVersion",
     "OptionContractSnapshot",
@@ -26,4 +26,6 @@ __all__ = [
     "OptionDraft",
     "PickerDraft",
     "QuantSnapshot",
+    "RESEARCH_MODEL_ID",
+    "RESEARCH_REVIEW_MODE",
 ]

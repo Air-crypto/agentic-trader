@@ -6,7 +6,6 @@ from datetime import timedelta
 import pytest
 
 from agentic_trader.picker.models import (
-    CriticVerdict,
     DecisionPacket,
     EvidenceVersion,
 )
@@ -45,13 +44,6 @@ def test_quant_snapshot_requires_real_booleans_and_finite_values(quant):
         type(quant).from_dict(raw)
 
 
-def test_critic_soft_checks_require_real_json_booleans(critic):
-    raw = critic.to_dict()
-    raw["soft_checks"]["freshness"] = "false"
-    with pytest.raises(ValueError, match="JSON booleans"):
-        CriticVerdict.from_dict(raw)
-
-
 def test_decision_packet_hash_detects_any_change(now):
     packet = DecisionPacket(
         packet_id="packet-1",
@@ -71,7 +63,7 @@ def test_decision_packet_hash_detects_any_change(now):
         thesis_hash="a" * 64,
         evidence_ids=("issuer-1", "gov-1"),
         prompt_hash="b" * 64,
-        model_id="analyst-model",
+        model_id="gpt-5.6-sol",
     ).with_hash()
     assert packet.verify_hash()
     assert not replace(packet, target_weight=0.11).verify_hash()
@@ -97,7 +89,7 @@ def test_decision_packet_rejects_tampered_json(now):
         thesis_hash="a" * 64,
         evidence_ids=("issuer-1", "gov-1"),
         prompt_hash="b" * 64,
-        model_id="analyst-model",
+        model_id="gpt-5.6-sol",
     ).with_hash()
     raw = packet.to_dict()
     raw["symbol"] = "EVIL"

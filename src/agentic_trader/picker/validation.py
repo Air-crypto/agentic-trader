@@ -4,10 +4,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from .critic_policy import evaluate_critic_policy
 from .features import FEATURE_VERSION
 from .models import (
-    CriticVerdict,
+    RESEARCH_MODEL_ID,
     DecisionPacket,
     EvidenceVersion,
     PickerDraft,
@@ -26,7 +25,6 @@ class LivePickerPolicy:
     min_average_dollar_volume: float = 50_000_000.0
     max_spread_bps: float = 25.0
     min_event_quality: float = 0.60
-    # Retained as critic calibration references; these are soft-majority inputs.
     min_materiality: float = 0.20
     min_novelty: float = 0.40
     min_timing: float = 0.35
@@ -64,9 +62,7 @@ def validate_picker_draft(
     draft: PickerDraft,
     evidence_by_id: dict[str, EvidenceVersion],
     quant: QuantSnapshot | None,
-    critic: CriticVerdict,
     prompt_hash: str,
-    model_id: str,
     now: datetime | None = None,
     policy: LivePickerPolicy | None = None,
 ) -> PickerValidationResult:
@@ -81,14 +77,6 @@ def validate_picker_draft(
         reasons.append("draft_timestamp_in_future")
     if draft.horizon_trading_days > policy.max_horizon_days:
         reasons.append("horizon_exceeds_live_limit")
-    critic_policy = evaluate_critic_policy(
-        critic,
-        draft_id=draft.draft_id,
-        draft_created_at=draft.created_at,
-        analyst_model_id=model_id,
-        now=now,
-    )
-    reasons.extend(critic_policy.reasons)
 
     evidence: list[EvidenceVersion] = []
     for evidence_id in draft.evidence_ids:
@@ -117,10 +105,25 @@ def validate_picker_draft(
             reasons.append("no_authoritative_primary_source")
     if draft.event_quality < policy.min_event_quality:
         reasons.append("event_quality_below_gate")
+    if draft.materiality < policy.min_materiality:
+        reasons.append("materiality_below_gate")
+    if draft.novelty < policy.min_novelty:
+        reasons.append("novelty_below_gate")
     if draft.timing < policy.min_timing:
         reasons.append("timing_below_gate")
     if draft.speculation > policy.max_speculation:
         reasons.append("speculation_above_gate")
+    required_analysis = {
+        "catalyst": draft.catalyst,
+        "materiality_basis": draft.materiality_basis,
+        "novelty_basis": draft.novelty_basis,
+        "priced_in_analysis": draft.priced_in_analysis,
+        "counter_thesis": draft.counter_thesis,
+        "invalidation": draft.invalidation,
+    }
+    reasons.extend(
+        f"missing_{name}" for name, value in required_analysis.items() if not value.strip()
+    )
 
     if quant is None:
         reasons.append("missing_quant_snapshot")
@@ -191,6 +194,6 @@ def validate_picker_draft(
         thesis_hash=content_hash(draft.thesis),
         evidence_ids=draft.evidence_ids,
         prompt_hash=prompt_hash,
-        model_id=model_id,
+        model_id=RESEARCH_MODEL_ID,
     ).with_hash()
     return PickerValidationResult(True, (), packet)

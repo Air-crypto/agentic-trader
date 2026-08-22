@@ -9,14 +9,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 PICK_ACTIONS = {"long", "reject", "close"}
-CRITIC_VERDICTS = {"pass", "veto"}
-CRITIC_SOFT_DIMENSIONS = {
-    "source_breadth",
-    "freshness",
-    "materiality",
-    "novelty",
-    "not_priced_in",
-}
+RESEARCH_MODEL_ID = "gpt-5.6-sol"
+RESEARCH_REVIEW_MODE = "single_model_direct"
 PACKET_ACTIONS = {"buy", "close"}
 THESIS_STATUSES = {"pending_entry", "active", "expired", "invalidated", "closed", "cancelled"}
 EVIDENCE_SOURCE_ALIASES = {
@@ -89,6 +83,13 @@ def canonical_json(payload: dict[str, Any]) -> str:
 
 def content_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def require_research_model_id(value: Any) -> str:
+    """Return the sole supported research model ID or fail closed."""
+    if value != RESEARCH_MODEL_ID:
+        raise ValueError(f"model_id must be exactly {RESEARCH_MODEL_ID}")
+    return RESEARCH_MODEL_ID
 
 
 @dataclass(frozen=True)
@@ -305,61 +306,6 @@ class PickerDraft:
             **asdict(self),
             "created_at": self.created_at.isoformat(),
             "evidence_ids": list(self.evidence_ids),
-        }
-
-
-@dataclass(frozen=True)
-class CriticVerdict:
-    draft_id: str
-    model_id: str
-    created_at: datetime
-    verdict: str
-    reasons: tuple[str, ...]
-    contradicted_evidence_ids: tuple[str, ...]
-    hard_vetoes: tuple[str, ...] = ()
-    soft_checks: tuple[tuple[str, bool], ...] = ()
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> CriticVerdict:
-        verdict = str(raw["verdict"]).lower()
-        if verdict not in CRITIC_VERDICTS:
-            raise ValueError(f"Unsupported critic verdict: {verdict}")
-        reasons = tuple(str(item) for item in raw.get("reasons", ()))
-        if verdict == "veto" and not reasons:
-            raise ValueError("A critic veto requires at least one reason")
-        raw_soft_checks = raw.get("soft_checks", {})
-        if isinstance(raw_soft_checks, dict):
-            if any(not isinstance(value, bool) for value in raw_soft_checks.values()):
-                raise ValueError("Critic soft checks must be JSON booleans")
-            soft_checks = tuple(sorted((str(key), value) for key, value in raw_soft_checks.items()))
-        else:
-            if any(not isinstance(value, bool) for _, value in raw_soft_checks):
-                raise ValueError("Critic soft checks must be booleans")
-            soft_checks = tuple(sorted((str(key), value) for key, value in raw_soft_checks))
-        unknown_soft_checks = {key for key, _ in soft_checks} - CRITIC_SOFT_DIMENSIONS
-        if unknown_soft_checks:
-            raise ValueError(f"Unknown critic soft checks: {sorted(unknown_soft_checks)}")
-        return cls(
-            draft_id=str(raw["draft_id"]),
-            model_id=str(raw["model_id"]),
-            created_at=parse_timestamp(raw["created_at"]),
-            verdict=verdict,
-            reasons=reasons,
-            contradicted_evidence_ids=tuple(
-                str(item) for item in raw.get("contradicted_evidence_ids", ())
-            ),
-            hard_vetoes=tuple(str(item) for item in raw.get("hard_vetoes", ())),
-            soft_checks=soft_checks,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            **asdict(self),
-            "created_at": self.created_at.isoformat(),
-            "reasons": list(self.reasons),
-            "contradicted_evidence_ids": list(self.contradicted_evidence_ids),
-            "hard_vetoes": list(self.hard_vetoes),
-            "soft_checks": dict(self.soft_checks),
         }
 
 

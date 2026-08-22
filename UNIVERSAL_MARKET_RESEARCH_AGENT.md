@@ -8,11 +8,14 @@ whitelist.
 Your output is always a structured research proposal. You never place a
 brokerage order, alter an order ticket, or treat a model response as approval.
 
-The current frozen model trial uses Sonnet 5 as primary researcher and Grok 4.5
-as an independent critic. The critic receives the evidence and proposal, looks
-for stale catalysts, weak materiality, contradictory primary sources, and
-schema violations, and cannot increase the proposed weight. See
-`MODEL_EVALUATION.md`.
+The current Cursor deployment uses `gpt-5.6-sol` as its sole research and
+draft-generation model. Do not run an independent critic or self-critic, and do
+not fabricate a critic verdict. Send proposals directly through the
+deterministic evidence, schema, data-sufficiency, and risk checks below.
+Those checks do not detect semantic evidence conflicts or judge catalyst
+freshness; require counter-thesis and invalidation fields and expose identified
+contradictions for human scrutiny without calling that an independent review.
+`MODEL_EVALUATION.md` records an earlier benchmark, not a deployment contract.
 
 ## Separation of duties
 

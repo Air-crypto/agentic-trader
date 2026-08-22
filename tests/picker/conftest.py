@@ -5,7 +5,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from agentic_trader.picker.models import (
-    CriticVerdict,
     EvidenceVersion,
     PickerDraft,
     QuantSnapshot,
@@ -107,24 +106,4 @@ def draft(now: datetime) -> PickerDraft:
         novelty=0.8,
         timing=0.9,
         speculation=0.1,
-    )
-
-
-@pytest.fixture
-def critic(now: datetime) -> CriticVerdict:
-    return CriticVerdict(
-        draft_id="draft-1",
-        model_id="cursor-grok-4.5-high-fast",
-        created_at=now - timedelta(minutes=5),
-        verdict="pass",
-        reasons=(),
-        contradicted_evidence_ids=(),
-        hard_vetoes=(),
-        soft_checks=(
-            ("freshness", True),
-            ("materiality", True),
-            ("not_priced_in", True),
-            ("novelty", True),
-            ("source_breadth", True),
-        ),
     )

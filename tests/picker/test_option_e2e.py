@@ -17,14 +17,14 @@ from agentic_trader.picker.option_models import (
 from agentic_trader.picker.option_validation import validate_option_draft
 
 
-def test_authorize_plan_reconcile_and_sync_fixture(now, evidence, critic, draft, tmp_path):
+def test_authorize_plan_reconcile_and_sync_fixture(now, evidence, draft, tmp_path):
     option_draft = OptionDraft(
         draft_id="option-draft-1",
         run_id=draft.run_id,
         created_at=now - timedelta(minutes=1),
         underlying=draft.symbol,
         action="long_call",
-        thesis="A bounded long-call expression of the independently criticized equity thesis.",
+        thesis="A bounded long-call expression of the evidence-grounded equity thesis.",
         evidence_ids=draft.evidence_ids,
         source_draft_id=draft.draft_id,
     )
@@ -46,9 +46,7 @@ def test_authorize_plan_reconcile_and_sync_fixture(now, evidence, critic, draft,
         option_draft,
         {item.evidence_id: item for item in evidence},
         [contract],
-        critic,
         prompt_hash="a" * 64,
-        model_id="option-model",
         account_equity=2_000.0,
         available_cash=1_500.0,
         source_draft=draft,

@@ -16,7 +16,7 @@ For every eligible candidate, including rejects, the research packet records the
 - If primary evidence is missing, stale, contradictory, or unavailable, reject the candidate.
 - The do-nothing result is always valid and should win when evidence or expected value is weak.
 
-A separate critic reviews the analyst's evidence and reasoning. The critic is independent of the analyst role and is not tied to any single model vendor.
+`gpt-5.6-sol` is the sole model for research and draft generation. There is no independent critic or self-critic step, and the workflow must not fabricate a critic verdict. Model output is untrusted input to deterministic guards for issuer/exchange authority, not-in-future timestamps, quote grounding, quantitative freshness, portfolio limits, and execution constraints. Those guards do not detect semantically conflicting evidence or judge catalyst freshness. That independent challenge is intentionally absent: the sole analyst must still record a counter-thesis, invalidation conditions, and contradictions it identifies, and the human should scrutinize unresolved conflicts before confirming an order. Model output may not bypass a primary-source requirement or any deterministic fail-closed guard.
 
 ## Twice-daily behavior
 
@@ -28,7 +28,7 @@ The morning task researches and ranks candidates for regular-hours execution. Su
 
 The evening task applies the same evidence and risk process, then may surface at most one opening proposal. It must be a whole-share GFD limit order, no more than `$100`, explicitly eligible for all-day hours, and based on a fresh quote with a spread no wider than `10 bps`.
 
-The picker may not convert an equity idea into an option order.
+The picker may not convert an equity idea into an option order. Existing option positions and orders are read-only broker-truth inputs; the scheduled picker must not create option drafts or authorize, plan, review, or mutate an option. The repository retains tested exact-batch close-only CLI primitives, but no option-close workflow is activated or supported by the scheduled picker.
 
 ## Deterministic portfolio envelope
 
@@ -41,7 +41,7 @@ Picker scores cannot override these live-canary ceilings:
 - at most `2` new entries and `$300` aggregate new-entry notional per day;
 - stop new entries at a `0.5%` daily loss or `3%` drawdown.
 
-Current and manually opened holdings are preserved unless the user explicitly authorizes a specific close. The picker can recommend a close, but that recommendation has no execution authority.
+Current and manually opened equity holdings are preserved unless the user explicitly authorizes a specific equity close. The picker can recommend an equity close, but that recommendation has no execution authority.
 
 ## Execution boundary
 
@@ -59,4 +59,4 @@ These records are diagnostic telemetry, not an execution dependency or promotion
 
 ## Knowledge graph
 
-The graph may link candidates, issuers, sectors, evidence, theses, critics, decisions, plans, fills, and later outcomes. It supports traceability and counterfactual analysis. It is not an authorization engine and may never supply missing primary evidence on its own.
+The graph may link candidates, issuers, sectors, evidence, theses, decisions, plans, fills, and later outcomes. It supports traceability and counterfactual analysis. It is not an authorization engine and may never supply missing primary evidence on its own.

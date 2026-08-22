@@ -217,7 +217,7 @@ def test_shadow_batch_builder_creates_complete_bounded_arms() -> None:
         for index, symbol in enumerate(SYMBOLS)
     ]
     research = {
-        "model_id": "shadow-model-v1",
+        "model_id": "gpt-5.6-sol",
         "prompt_version": "morning-shadow-v1",
         "benchmark_prices": {"SPY": 500, "XLK": 250},
         "candidates": [

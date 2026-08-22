@@ -85,9 +85,15 @@ def build_picker_portfolio(
     buy_symbols: set[str] = set()
     sell_symbols: set[str] = set()
 
-    close_symbols = {
-        packet.symbol for packet in packets if packet.action == "close" and packet.verify_hash()
+    close_packets = {
+        packet.symbol: packet
+        for packet in packets
+        if packet.action == "close"
+        and packet.verify_hash()
+        and packet.valid_for_date == as_of
+        and packet.expires_at > now
     }
+    close_symbols = set(close_packets)
     surviving: list[ActiveThesis] = []
     for thesis in active_theses:
         if thesis.status not in {"pending_entry", "active"}:
@@ -95,6 +101,7 @@ def build_picker_portfolio(
         sell_symbols.add(thesis.symbol)
         if thesis.symbol in close_symbols:
             exits.append(ExitIntent(thesis.symbol, thesis.pick_id, "authorized_close_packet"))
+            accepted.append(close_packets[thesis.symbol].packet_id)
             continue
         current = prices.get(thesis.symbol)
         if current is None:
@@ -103,7 +110,6 @@ def build_picker_portfolio(
             surviving.append(thesis)
             weights[thesis.symbol] = min(thesis.target_weight, policy.max_stock_weight)
             sectors[thesis.symbol] = thesis.sector
-            buy_symbols.add(thesis.symbol)
             continue
         invalidation = evaluate_invalidation(thesis, current, spy_price, as_of)
         if invalidation.invalidated:
@@ -114,7 +120,6 @@ def build_picker_portfolio(
         surviving.append(thesis)
         weights[thesis.symbol] = min(thesis.target_weight, policy.max_stock_weight)
         sectors[thesis.symbol] = thesis.sector
-        buy_symbols.add(thesis.symbol)
 
     active_symbols = {thesis.symbol for thesis in surviving}
     available_slots = max(0, policy.max_active_names - len(active_symbols))
@@ -145,7 +150,6 @@ def build_picker_portfolio(
         )
         sectors[packet.symbol] = packet.sector
         buy_symbols.add(packet.symbol)
-        sell_symbols.add(packet.symbol)
         accepted.append(packet.packet_id)
 
     weights = _apply_sector_caps(weights, sectors, policy.max_sector_weight)

@@ -9,13 +9,13 @@ The deployment uses two local-wall-clock tasks, both in `America/Los_Angeles`:
 | Morning live | [`automations/morning-live.json`](automations/morning-live.json) | [`automations/morning-live-prompt.txt`](automations/morning-live-prompt.txt) | Weekdays at `06:35` | Regular hours |
 | Evening live | [`automations/evening-live.json`](automations/evening-live.json) | [`automations/evening-live-prompt.txt`](automations/evening-live-prompt.txt) | Sunday-Thursday at `18:15` | Robinhood all-day hours when eligible |
 
-[`automation.json`](automation.json) is the root manifest. Research and criticism run inside the two canonical tasks; there is no separate execution task.
+[`automation.json`](automation.json) is the root manifest. Both tasks use `gpt-5.6-sol` as the sole research and draft-generation model; no critic or self-critic run is configured, and there is no separate execution task.
 
 ## What each scheduled turn may do
 
 1. Load configuration and reconcile Robinhood account, positions, open orders, fills, buying power, and session.
 2. Fail closed on the kill switch, stale or missing data, broker uncertainty, risk breach, or account mismatch.
-3. Run point-in-time research and a separate independent critic.
+3. Run point-in-time research, then pass the analyst drafts directly through deterministic source, timestamp, quote, quantitative, and portfolio validation. Do not generate a critic verdict. These guards do not detect semantic evidence conflicts or judge catalyst freshness, so the sole analyst records its counter-thesis and identified contradictions for human scrutiny.
 4. Treat social sources as discovery or sentiment only. Require a registered-issuer or exchange primary source for every actionable thesis. SEC ingestion is disabled.
 5. Apply deterministic allocation, loss, drawdown, and entry limits.
 6. Create an equity order plan that expires in five minutes.
@@ -23,7 +23,7 @@ The deployment uses two local-wall-clock tasks, both in `America/Los_Angeles`:
 8. Show the exact reviewed order and ask the user to confirm it.
 9. Stop without reservation or placement.
 
-No scheduled task opens an option or changes a current/manual holding without a separately authorized close.
+Option positions and orders are read-only broker-truth inputs. No scheduled task creates option drafts or authorizes, plans, reviews, or mutates an option. The repository retains tested exact-batch close-only CLI primitives, but no option-close workflow is activated or supported by these scheduled tasks. Current/manual equity holdings change only through a separately authorized equity close.
 
 ## Mandatory confirmation handoff
 
@@ -38,7 +38,7 @@ After placement, reconcile by client order ID. An ambiguous timeout is a reconci
 - regular-hours equities only;
 - live-canary portfolio limits remain binding;
 - at most two total new entries and `$300` aggregate new-entry notional across the trading day;
-- exact confirmation required for every proposed entry or close.
+- exact confirmation required for every proposed equity entry or close.
 
 ## Evening constraints
 
@@ -61,7 +61,7 @@ After placement, reconcile by client order ID. An ambiguous timeout is a reconci
 
 ## Telemetry
 
-Candidate, reject, critic, counterfactual-outcome, and knowledge-graph records are best-effort telemetry. A write failure should be logged, but it must not change authorization, expand exposure, or become a promotion requirement.
+Candidate, reject, counterfactual-outcome, and knowledge-graph records are best-effort telemetry. A write failure should be logged, but it must not change authorization, expand exposure, or become a promotion requirement.
 
 ## Required operations
 

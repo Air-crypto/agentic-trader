@@ -3,6 +3,14 @@
 Two models received the same frozen broad-market research task, repository
 contracts, tool access, and paper-only constraints on August 9, 2026.
 
+This is a historical benchmark record, not the current deployment contract.
+The current Cursor deployment uses only `gpt-5.6-sol` for research and draft
+generation, with no independent critic or self-critic. Analyst drafts pass
+directly through deterministic validation, and no critic verdict is fabricated.
+That validation does not detect semantic evidence conflicts or judge catalyst
+freshness; counter-thesis, invalidation, and identified contradictions remain
+single-analyst fields for human scrutiny, not an equivalent independent review.
+
 ## Result
 
 Claude Sonnet 5 scored **94/100**. Grok 4.5 scored **84/100**.
@@ -88,8 +96,10 @@ Still missing:
 - execution-quality NBBO and borrow data; and
 - a sufficiently broad labeled event corpus for economic validation.
 
-## Operating choice
+## Current operating choice
 
-Use Sonnet 5 as the primary research model for the next forward trial and Grok
-4.5 as an independent challenger or critic. Model identity is not permanent:
-rerun the frozen benchmark after material prompt, tool, model, or data changes.
+Use `gpt-5.6-sol` as the single Cursor model. Do not configure Sonnet, Grok, or
+another model as a critic or challenger, and do not substitute self-critique for
+independence. Rerun a frozen benchmark after material prompt, tool, model, or
+data changes, but keep benchmark comparison separate from the deployed
+authorization path.

@@ -55,7 +55,7 @@ def test_cloud_cli_persists_review_confirmation_attempt_and_blocks_duplicate_pla
         datetime.now(UTC),
         "a" * 64,
         "gpt-5.6-sol",
-        {"drafts": [], "option_drafts": [], "critics": []},
+        {"drafts": [], "option_drafts": []},
     )
     monkeypatch.setattr(
         cli.PostgresLedger,

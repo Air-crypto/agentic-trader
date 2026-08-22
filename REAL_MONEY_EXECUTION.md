@@ -60,9 +60,9 @@ If any condition is absent or uncertain, the evening result is research-only and
 
 ## Holdings and exits
 
-Current holdings, including positions opened manually, are preserved by default. Research, a risk flag, or a model recommendation does not authorize a close. A close needs a fresh deterministic plan, broker review, and explicit confirmation of the exact close order.
+Current equity holdings, including positions opened manually, are preserved by default. Research, a risk flag, or a model recommendation does not authorize an equity close. An equity close needs a fresh deterministic plan, broker review, and explicit confirmation of the exact close order.
 
-The scheduled tasks do not open options. They also do not close, cancel, roll, or exercise an existing option automatically.
+Option positions and orders are read-only broker-truth inputs for reconciliation and equity risk checks. The scheduled tasks do not create option drafts or authorize, plan, review, close, cancel, roll, exercise, or otherwise mutate an option. The repository retains tested exact-batch close-only CLI primitives, but no option-close workflow is activated or supported by these scheduled tasks.
 
 ## Transactional lifecycle
 
@@ -82,7 +82,7 @@ The database, not a local artifact, carries the plan/confirmation/attempt handsh
 
 Social feeds may identify a candidate or measure sentiment, but they cannot substantiate an actionable thesis. A trade thesis needs a registered-issuer or exchange primary source, current enough for the decision time. SEC ingestion is disabled, so lack of an alternate qualifying primary source means no actionable candidate.
 
-The analyst and separate critic may rank or reject candidates. Neither may change quantities, override deterministic limits, or authorize broker action.
+`gpt-5.6-sol` is the only configured research and draft-generation model. There is no independent critic or self-critic step, and no critic verdict should be fabricated. Its output passes directly to deterministic guards for issuer/exchange authority, not-in-future timestamps, quote grounding, quantitative freshness, portfolio limits, and execution constraints. Those guards do not detect semantically conflicting evidence or judge catalyst freshness. That independent challenge is intentionally absent: the sole analyst records its counter-thesis and identified contradictions, and the human should scrutinize unresolved conflicts. The model may rank or reject candidates, but it may not change quantities, override deterministic limits, or authorize broker action.
 
 Counterfactual learning and knowledge-graph writes are best-effort, nonblocking telemetry. They do not decide whether an order is allowed and are not a promotion condition.
 

@@ -55,7 +55,7 @@ def _packet(now: datetime) -> OptionDecisionPacket:
         shares_encumbered=0,
         evidence_ids=("evidence-1",),
         prompt_hash="a" * 64,
-        model_id="model",
+        model_id="gpt-5.6-sol",
         draft_hash="b" * 64,
         horizon_trading_days=20,
         invalidation="Close if the catalyst is disproven.",
@@ -287,8 +287,8 @@ def test_live_reserve_classifies_only_position_reducing_sells_as_exits(
         today,
         datetime.now(UTC),
         "a" * 64,
-        "claude-sonnet",
-        {"drafts": [], "option_drafts": [], "critics": []},
+        "gpt-5.6-sol",
+        {"drafts": [], "option_drafts": []},
     )
     planned_at = datetime.now(UTC)
     plan = {

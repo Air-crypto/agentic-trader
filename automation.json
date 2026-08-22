@@ -1,9 +1,14 @@
 {
   "status": "live_research_and_order_review",
+  "model": "gpt-5.6-sol",
+  "independent_critic_required": false,
   "scheduled_broker_mutations_allowed": false,
   "signed_resume_broker_mutations_allowed": true,
   "requires_per_order_confirmation": true,
   "new_option_openings_allowed": false,
+  "scheduled_option_authorization_allowed": false,
+  "scheduled_option_planning_allowed": false,
+  "option_positions_and_orders_read_only": true,
   "tasks": [
     "automations/morning-live.json",
     "automations/evening-live.json"

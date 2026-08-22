@@ -65,7 +65,6 @@ from .option_execution import (
 )
 from .option_reconcile import reconcile_option_orders
 from .options import OptionStructure, analyze_option_structure
-from .picker.critic_policy import ALLOWED_CRITIC_MODELS
 from .picker.features import liquid_universe, rank_candidates, snapshots_from_ranked
 from .picker.invalidation import trading_day_expiry, trading_days_until
 from .picker.learning import (
@@ -81,15 +80,17 @@ from .picker.learning_store import (
 )
 from .picker.ledger import OFFICIAL_CLOSE_SOURCE, PostgresLedger, account_key
 from .picker.models import (
-    CRITIC_SOFT_DIMENSIONS,
+    RESEARCH_MODEL_ID,
+    RESEARCH_REVIEW_MODE,
     ActiveThesis,
-    CriticVerdict,
     DecisionPacket,
     EvidenceVersion,
     PickerDraft,
     QuantSnapshot,
     canonical_json,
     content_hash,
+    parse_timestamp,
+    require_research_model_id,
 )
 from .picker.option_models import (
     ActiveOptionPosition,
@@ -110,6 +111,8 @@ from .sources.registry import SourceRegistry, quote_is_grounded
 from .strategy import target_for_date
 from .tournament import STRATEGIES, run_tournament
 from .validation import validate_strategy
+
+NEW_OPTION_OPENINGS_ALLOWED = False
 
 
 def _paired_broker_account(raw_account: dict[str, object]) -> str:
@@ -1541,6 +1544,16 @@ def _union_broker_and_reservation_usage(
     )
 
 
+def _live_buy_symbol_allowlist(
+    requested: set[str],
+    *,
+    picker_mode: bool,
+) -> tuple[str, ...]:
+    if picker_mode:
+        return tuple(sorted(requested))
+    return tuple(sorted(requested or frozenset(DEFAULT_SYMBOL_ALLOWLIST)))
+
+
 def _live_plan(args: argparse.Namespace) -> int:
     request = json.loads(Path(args.request).read_text())
     if bool(request.get("picker_mode", False)) and not bool(getattr(args, "persist", False)):
@@ -1608,6 +1621,7 @@ def _live_plan(args: argparse.Namespace) -> int:
     )
     picker_halts: list[str] = []
     packet_trade_dates: dict[str, str] = {}
+    verified_sell_allowlist: tuple[str, ...] | None = None
     raw_broker_option_positions = raw_account.get("broker_option_positions")
     if not isinstance(raw_broker_option_positions, list):
         picker_halts.append("broker_option_positions_missing")
@@ -1678,25 +1692,35 @@ def _live_plan(args: argparse.Namespace) -> int:
     if bool(request.get("picker_mode", False)):
         if durable_ledger is None:  # guarded above; retained for type narrowing
             raise RuntimeError("Picker live plans require the durable ledger")
+        research_batch_id = str(request.get("research_batch_id", "")).strip()
+        batch = durable_ledger.finalized_research_batch(research_batch_id)
+        if batch is None:
+            raise ValueError("Picker request research batch is not finalized or does not exist")
+        batch_payload = _single_model_batch_payload(
+            batch,
+            as_of=session_date,
+            allowed_statuses={"authorized", "rejected"},
+        )
         valid_packets = {
-            packet.packet_id: packet for packet in durable_ledger.authorized_packets(session_date)
-        }
-        packet_trade_dates = {
-            packet_id: packet.valid_for_date.isoformat()
-            for packet_id, packet in valid_packets.items()
+            packet.packet_id: packet
+            for packet in _exact_batch_stock_packets(
+                durable_ledger,
+                batch,
+                batch_payload,
+                session_date,
+            )
         }
         requested_ids = set(str(item) for item in request.get("authorization_packet_ids", []))
+        packet_trade_dates = {
+            packet_id: valid_packets[packet_id].valid_for_date.isoformat()
+            for packet_id in requested_ids & set(valid_packets)
+        }
         if not requested_ids.issubset(valid_packets):
             picker_halts.append("picker_authorization_packet_missing_or_expired")
-        active_theses = durable_ledger.active_theses()
         permitted_buys = {
             packet.symbol
             for packet_id, packet in valid_packets.items()
             if packet_id in requested_ids and packet.action == "buy"
-        } | {
-            thesis.symbol
-            for thesis in active_theses
-            if thesis.status in {"pending_entry", "active"}
         }
         requested_buys = {str(item).upper() for item in request.get("buy_symbol_allowlist", [])}
         if not requested_buys.issubset(permitted_buys):
@@ -1705,6 +1729,17 @@ def _live_plan(args: argparse.Namespace) -> int:
             str(symbol).upper(): float(weight)
             for symbol, weight in request.get("targets", {}).items()
         }
+        requested_sells = {str(item).upper() for item in request.get("sell_symbol_allowlist", [])}
+        verified_sell_allowlist, sell_authority_halts = _picker_sell_authority(
+            valid_packets,
+            requested_ids,
+            durable_ledger.active_theses(),
+            prices,
+            session_date,
+            targets,
+            requested_sells,
+        )
+        picker_halts.extend(sell_authority_halts)
         for packet_id in requested_ids:
             packet = valid_packets.get(packet_id)
             if (
@@ -1852,14 +1887,14 @@ def _live_plan(args: argparse.Namespace) -> int:
         require_fresh_quotes=True,
         max_quote_age_seconds=min(int(request.get("max_quote_age_seconds", 15)), 15),
         allow_extended_hours=bool(request.get("allow_extended_hours", False)),
-        buy_symbol_allowlist=(tuple(sorted(requested_buy_allowlist or code_owned_buy_allowlist))),
+        buy_symbol_allowlist=_live_buy_symbol_allowlist(
+            requested_buy_allowlist,
+            picker_mode=bool(request.get("picker_mode", False)),
+        ),
         sell_symbol_allowlist=(
-            tuple(
-                sorted(
-                    set(str(item).upper() for item in request["sell_symbol_allowlist"])
-                    | set(positions)
-                )
-            )
+            verified_sell_allowlist
+            if bool(request.get("picker_mode", False))
+            else tuple(sorted(str(item).upper() for item in request["sell_symbol_allowlist"]))
             if "sell_symbol_allowlist" in request
             else None
         ),
@@ -2698,7 +2733,6 @@ _verify_official_issuer_mappings = _verify_registered_sources
 def command_picker_validate(args: argparse.Namespace) -> int:
     """Validate an AI draft and emit an immutable live DecisionPacket."""
     draft = PickerDraft.from_dict(json.loads(Path(args.draft).read_text()))
-    critic = CriticVerdict.from_dict(json.loads(Path(args.critic).read_text()))
     evidence = [EvidenceVersion.from_dict(item) for item in _json_items(args.evidence, "evidence")]
     _verify_official_issuer_mappings(evidence)
     evidence_by_id = {item.evidence_id: item for item in evidence}
@@ -2724,9 +2758,7 @@ def command_picker_validate(args: argparse.Namespace) -> int:
         draft,
         evidence_by_id,
         snapshots.get(draft.symbol),
-        critic,
         prompt_hash=prompt_hash,
-        model_id=args.model_id,
     )
     payload = result.to_dict()
     output = Path(args.output)
@@ -2743,14 +2775,16 @@ def command_picker_validate(args: argparse.Namespace) -> int:
             account_key(account_number),
             draft.created_at,
             draft.created_at.date(),
-            args.model_id,
+            RESEARCH_MODEL_ID,
             prompt_hash,
-            metadata={"schema": "ai_picker_v1_unvalidated"},
+            metadata={
+                "schema": "ai_picker_v2_single_model",
+                "review_mode": RESEARCH_REVIEW_MODE,
+            },
         )
         for item in evidence:
             ledger.put_evidence(item)
         ledger.put_draft(draft)
-        ledger.put_critic(critic)
         assert result.packet is not None
         ledger.authorize_packet(result.packet)
 
@@ -2759,41 +2793,55 @@ def command_picker_validate(args: argparse.Namespace) -> int:
 
 
 def command_picker_stage(args: argparse.Namespace) -> int:
-    """Validate research schemas and stage an immutable batch without broker access."""
+    """Validate and directly stage one single-model research batch."""
     payload = json.loads(Path(args.bundle).read_text())
-    created_at = datetime.fromisoformat(
-        str(payload["created_at"]).replace("Z", "+00:00")
-    ).astimezone(UTC)
-    as_of = date.fromisoformat(str(payload["as_of"]))
+    if not isinstance(payload, dict):
+        raise ValueError("Research bundle must be a JSON object")
+    if "critics" in payload or "_critic_binding" in payload:
+        raise ValueError("Legacy multi-model review fields are not allowed")
+    model_id = require_research_model_id(payload.get("model_id"))
+    if payload.get("review_mode") != RESEARCH_REVIEW_MODE:
+        raise ValueError(f"review_mode must be exactly {RESEARCH_REVIEW_MODE}")
+    created_at = parse_timestamp(payload["created_at"])
+    raw_as_of = payload["as_of"]
+    if not isinstance(raw_as_of, str):
+        raise ValueError("Research as_of must be an ISO date string")
+    as_of = date.fromisoformat(raw_as_of)
+    if raw_as_of != as_of.isoformat():
+        raise ValueError("Research as_of must be a canonical ISO date")
     evidence = [EvidenceVersion.from_dict(item) for item in payload["evidence"]]
+    _verify_official_issuer_mappings(evidence)
     drafts = [PickerDraft.from_dict(item) for item in payload["drafts"]]
     option_drafts = [OptionDraft.from_dict(item) for item in payload.get("option_drafts", [])]
-    all_draft_ids = [item.draft_id for item in [*drafts, *option_drafts]]
-    if len(set(all_draft_ids)) != len(all_draft_ids):
-        raise ValueError("Every staged draft_id must be globally unique")
+    all_drafts = [*drafts, *option_drafts]
+    if not all_drafts or len({item.run_id for item in all_drafts}) != 1:
+        raise ValueError("A research batch requires drafts from exactly one run_id")
+    if len({item.draft_id for item in all_drafts}) != len(all_drafts):
+        raise ValueError("Research draft IDs must be globally unique")
     if len({item.evidence_id for item in evidence}) != len(evidence):
-        raise ValueError("Every staged evidence_id must be unique")
-    critics = [CriticVerdict.from_dict(item) for item in payload["critics"]]
-    critic_ids = {item.draft_id for item in critics}
-    required_critic_ids = {item.source_draft_id or item.draft_id for item in option_drafts} | {
-        item.draft_id for item in drafts
-    }
-    if required_critic_ids != critic_ids:
-        raise ValueError("Every staged draft requires exactly one critic verdict")
-    if any(item.created_at.date() != as_of for item in drafts):
-        raise ValueError("Every draft must be created on the batch as_of date")
-    if any(item.created_at.date() != as_of for item in option_drafts):
-        raise ValueError("Every option draft must be created on the batch as_of date")
-    prompt_hash = str(payload["prompt_hash"])
-    if len(prompt_hash) != 64:
+        raise ValueError("Research evidence IDs must be unique")
+    if any(item.created_at.date() != as_of for item in all_drafts):
+        raise ValueError("Every research draft must be created on the as_of date")
+    prompt_hash = payload["prompt_hash"]
+    if (
+        not isinstance(prompt_hash, str)
+        or len(prompt_hash) != 64
+        or any(character not in "0123456789abcdef" for character in prompt_hash)
+    ):
         raise ValueError("prompt_hash must be a SHA-256 digest")
-    model_id = str(payload["model_id"])
-    batch_id = str(payload["batch_id"])
+    batch_id = payload.get("batch_id")
+    cycle_id = payload.get("cycle_id")
+    if (
+        not isinstance(batch_id, str)
+        or not batch_id
+        or batch_id != batch_id.strip()
+        or not isinstance(cycle_id, str)
+        or not cycle_id
+        or cycle_id != cycle_id.strip()
+    ):
+        raise ValueError("Research bundle requires batch_id and cycle_id")
     ledger = PostgresLedger.from_env()
-    run_ids = {item.run_id for item in [*drafts, *option_drafts]}
-    if len(run_ids) != 1:
-        raise ValueError("A research batch must contain exactly one run_id")
-    run_id = next(iter(run_ids))
+    run_id = all_drafts[0].run_id
     ledger.put_run(
         run_id,
         content_hash("ai-picker-research"),
@@ -2801,20 +2849,25 @@ def command_picker_stage(args: argparse.Namespace) -> int:
         as_of,
         model_id,
         prompt_hash,
-        metadata={"batch_id": batch_id, "schema": "ai_picker_v1_unvalidated"},
+        metadata={
+            "batch_id": batch_id,
+            "schema": "ai_picker_v2_single_model",
+            "review_mode": RESEARCH_REVIEW_MODE,
+        },
     )
     for item in evidence:
         ledger.put_evidence(item)
     for item in drafts:
         ledger.put_draft(item)
-    stock_draft_ids = {item.draft_id for item in drafts}
-    for item in critics:
-        # The normalized critic table currently references stock drafts. Option
-        # critics remain immutable in the staged payload and inherit the stock
-        # critic when source_draft_id is set.
-        if item.draft_id in stock_draft_ids:
-            ledger.put_critic(item)
-    ledger.stage_batch(batch_id, as_of, created_at, prompt_hash, model_id, payload)
+    ledger.stage_and_complete_research_cycle(
+        cycle_id,
+        batch_id,
+        as_of,
+        created_at,
+        prompt_hash,
+        model_id,
+        payload,
+    )
     print(
         json.dumps(
             {
@@ -2828,92 +2881,6 @@ def command_picker_stage(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_pending_research_payload(
-    payload: dict[str, object],
-) -> tuple[datetime, date, list[EvidenceVersion], list[PickerDraft], list[OptionDraft]]:
-    created_at = datetime.fromisoformat(
-        str(payload["created_at"]).replace("Z", "+00:00")
-    ).astimezone(UTC)
-    as_of = date.fromisoformat(str(payload["as_of"]))
-    evidence = [EvidenceVersion.from_dict(item) for item in payload["evidence"]]
-    drafts = [PickerDraft.from_dict(item) for item in payload["drafts"]]
-    option_drafts = [OptionDraft.from_dict(item) for item in payload.get("option_drafts", [])]
-    all_drafts = [*drafts, *option_drafts]
-    if not all_drafts or len({item.run_id for item in all_drafts}) != 1:
-        raise ValueError("A pending research batch requires exactly one run_id")
-    draft_ids = [item.draft_id for item in all_drafts]
-    if len(set(draft_ids)) != len(draft_ids):
-        raise ValueError("Pending research draft IDs must be globally unique")
-    evidence_ids = [item.evidence_id for item in evidence]
-    if len(set(evidence_ids)) != len(evidence_ids):
-        raise ValueError("Pending evidence IDs must be unique")
-    if any(item.created_at.date() != as_of for item in all_drafts):
-        raise ValueError("Every pending draft must be created on the as_of date")
-    if len(str(payload["prompt_hash"])) != 64:
-        raise ValueError("prompt_hash must be a SHA-256 digest")
-    if not str(payload.get("cycle_id", "")).strip():
-        raise ValueError("Pending research bundle requires cycle_id")
-    return created_at, as_of, evidence, drafts, option_drafts
-
-
-def _pending_draft_hashes(
-    drafts: list[PickerDraft],
-    option_drafts: list[OptionDraft],
-) -> dict[str, str]:
-    return {
-        item.draft_id: content_hash(canonical_json(item.to_dict()))
-        for item in [*drafts, *option_drafts]
-    }
-
-
-def command_picker_stage_pending(args: argparse.Namespace) -> int:
-    """Stage analyst output for a separate independent critic automation."""
-    payload = json.loads(Path(args.bundle).read_text())
-    created_at, as_of, _, drafts, option_drafts = _validate_pending_research_payload(payload)
-    batch_id = str(payload["batch_id"])
-    ledger = PostgresLedger.from_env()
-    ledger.stage_pending_batch(
-        batch_id,
-        as_of,
-        created_at,
-        str(payload["prompt_hash"]),
-        str(payload["model_id"]),
-        payload,
-    )
-    ledger.bind_research_cycle(str(payload["cycle_id"]), batch_id)
-    result = {
-        "pending": True,
-        "batch_id": batch_id,
-        "drafts": len(drafts),
-        "option_drafts": len(option_drafts),
-    }
-    print(json.dumps(result))
-    return 0
-
-
-def command_picker_export_pending(args: argparse.Namespace) -> int:
-    """Export today's latest pending batch for independent criticism."""
-    as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.now(UTC).date()
-    batch = PostgresLedger.from_env().latest_pending_batch(as_of)
-    if batch is None:
-        print(json.dumps({"exported": False, "reason": "no_pending_batch"}))
-        return 2
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    payload = dict(batch["payload"])
-    _, _, _, drafts, option_drafts = _validate_pending_research_payload(payload)
-    payload["_critic_binding"] = {
-        "batch_id": batch["batch_id"],
-        "prompt_hash": batch["prompt_hash"],
-        "analyst_model_id": batch["analyst_model_id"],
-        "draft_hashes": _pending_draft_hashes(drafts, option_drafts),
-        "payload_hash": content_hash(canonical_json(batch["payload"])),
-    }
-    output.write_text(json.dumps(payload, indent=2) + "\n")
-    print(json.dumps({"exported": True, "batch_id": batch["batch_id"]}))
-    return 0
-
-
 def command_picker_cycle_start(args: argparse.Namespace) -> int:
     """Create a durable marker before an analyst cycle begins."""
     now = datetime.now(UTC)
@@ -2924,95 +2891,9 @@ def command_picker_cycle_start(args: argparse.Namespace) -> int:
 
 
 def command_picker_cycle_fail(args: argparse.Namespace) -> int:
-    """Explicitly release a failed analyst/critic cycle marker."""
+    """Explicitly release a failed research cycle marker."""
     PostgresLedger.from_env().finish_research_cycle(args.cycle_id, "failed")
     print(json.dumps({"failed": True, "cycle_id": args.cycle_id}))
-    return 0
-
-
-def command_picker_finalize_pending(args: argparse.Namespace) -> int:
-    """Attach independent critic verdicts and promote a pending batch to staged."""
-    now = datetime.now(UTC)
-    ledger = PostgresLedger.from_env()
-    critic_payload = json.loads(Path(args.critics).read_text())
-    binding = critic_payload.get("_critic_binding")
-    if not isinstance(binding, dict) or not binding.get("batch_id"):
-        raise ValueError("Critic output must bind an exact pending batch")
-    pending = ledger.pending_batch(str(binding["batch_id"]))
-    if pending is None:
-        print(json.dumps({"finalized": False, "reason": "no_pending_batch"}))
-        return 2
-    if pending["status"] != "pending":
-        raise ValueError("Critic batch is no longer pending")
-    payload = dict(pending["payload"])
-    created_at, as_of, evidence, drafts, option_drafts = _validate_pending_research_payload(payload)
-    if args.as_of and date.fromisoformat(args.as_of) != as_of:
-        raise ValueError("Critic as_of does not match the bound batch")
-    expected_binding = {
-        "batch_id": pending["batch_id"],
-        "prompt_hash": pending["prompt_hash"],
-        "analyst_model_id": pending["analyst_model_id"],
-        "draft_hashes": _pending_draft_hashes(drafts, option_drafts),
-        "payload_hash": content_hash(canonical_json(pending["payload"])),
-    }
-    if binding != expected_binding:
-        raise ValueError("Critic output binding does not match pending batch content")
-    critics = [CriticVerdict.from_dict(item) for item in critic_payload.get("critics", [])]
-    critic_ids = {item.draft_id for item in critics}
-    required_ids = {item.draft_id for item in drafts} | {
-        item.source_draft_id or item.draft_id for item in option_drafts
-    }
-    if critic_ids != required_ids:
-        raise ValueError("Independent critics must cover every required draft exactly")
-    analyst_model_id = str(pending["analyst_model_id"]).strip()
-    allowed_critic_models = {item.casefold() for item in ALLOWED_CRITIC_MODELS}
-    if any(
-        item.model_id.strip().casefold() not in allowed_critic_models
-        or item.model_id.strip().casefold() == analyst_model_id.casefold()
-        for item in critics
-    ):
-        raise ValueError("Every critic must record an approved independent critic model ID")
-    if any(set(dict(item.soft_checks)) != CRITIC_SOFT_DIMENSIONS for item in critics):
-        raise ValueError("Every critic must provide all five structured soft checks")
-    payload["critics"] = [item.to_dict() for item in critics]
-    run_id = next(iter({item.run_id for item in [*drafts, *option_drafts]}))
-    ledger.put_run(
-        run_id,
-        content_hash("ai-picker-research"),
-        created_at,
-        as_of,
-        analyst_model_id,
-        str(pending["prompt_hash"]),
-        metadata={
-            "batch_id": pending["batch_id"],
-            "schema": "ai_picker_v1_unvalidated",
-            "critic": "independent_model",
-        },
-    )
-    for item in evidence:
-        ledger.put_evidence(item)
-    for item in drafts:
-        ledger.put_draft(item)
-    stock_draft_ids = {item.draft_id for item in drafts}
-    for item in critics:
-        if item.draft_id in stock_draft_ids:
-            ledger.put_critic(item)
-    ledger.stage_batch(
-        str(pending["batch_id"]),
-        as_of,
-        created_at,
-        str(pending["prompt_hash"]),
-        analyst_model_id,
-        payload,
-    )
-    ledger.finalize_pending_batch(str(pending["batch_id"]), "finalized", now)
-    ledger.finish_research_cycle(str(payload["cycle_id"]), "finalized")
-    result = {
-        "finalized": True,
-        "batch_id": pending["batch_id"],
-        "critics": len(critics),
-    }
-    print(json.dumps(result))
     return 0
 
 
@@ -3120,33 +3001,139 @@ def command_picker_record_close(args: argparse.Namespace) -> int:
     return 2
 
 
+def _single_model_batch_payload(
+    batch: dict[str, object],
+    *,
+    as_of: date,
+    allowed_statuses: set[str],
+) -> dict[str, object]:
+    if batch["as_of"] != as_of:
+        raise ValueError("Research batch as_of does not match the requested session")
+    if batch["status"] not in allowed_statuses:
+        raise ValueError(f"Research batch status is not eligible: {batch['status']}")
+    require_research_model_id(batch["model_id"])
+    payload = batch["payload"]
+    if not isinstance(payload, dict):
+        raise ValueError("Research batch payload must be a JSON object")
+    require_research_model_id(payload.get("model_id"))
+    if payload.get("review_mode") != RESEARCH_REVIEW_MODE:
+        raise ValueError("Legacy review-stage research batches are not eligible")
+    if "critics" in payload or "_critic_binding" in payload:
+        raise ValueError("Legacy multi-model review fields are not eligible")
+    if payload.get("batch_id") != batch["batch_id"]:
+        raise ValueError("Research batch payload identity mismatch")
+    return payload
+
+
+def _exact_batch_stock_packets(
+    ledger: PostgresLedger,
+    batch: dict[str, object],
+    batch_payload: dict[str, object],
+    as_of: date,
+    now: datetime | None = None,
+) -> list[DecisionPacket]:
+    drafts = {
+        (draft.run_id, draft.draft_id): draft
+        for draft in (PickerDraft.from_dict(item) for item in batch_payload.get("drafts", []))
+    }
+    exact_packets: list[DecisionPacket] = []
+    for packet in ledger.authorized_packets(as_of, now):
+        draft = drafts.get((packet.run_id, packet.draft_id))
+        if draft is None:
+            continue
+        expected_action = "buy" if draft.action == "long" else draft.action
+        if (
+            packet.prompt_hash == batch["prompt_hash"]
+            and packet.model_id == RESEARCH_MODEL_ID
+            and packet.symbol == draft.symbol
+            and packet.action == expected_action
+            and packet.horizon_trading_days == draft.horizon_trading_days
+            and packet.thesis_hash == content_hash(draft.thesis)
+            and packet.evidence_ids == draft.evidence_ids
+        ):
+            exact_packets.append(packet)
+    return exact_packets
+
+
+def _picker_sell_authority(
+    valid_packets: dict[str, DecisionPacket],
+    requested_ids: set[str],
+    active_theses: list[ActiveThesis],
+    prices: dict[str, float],
+    as_of: date,
+    targets: dict[str, float],
+    requested_sells: set[str],
+    now: datetime | None = None,
+) -> tuple[tuple[str, ...], list[str]]:
+    if "SPY" not in prices:
+        raise ValueError("Picker live plans require a current SPY price")
+    authority_plan = build_picker_portfolio(
+        [packet for packet_id, packet in valid_packets.items() if packet_id in requested_ids],
+        active_theses,
+        prices,
+        spy_price=prices["SPY"],
+        as_of=as_of,
+        now=now,
+    )
+    current_batch_close_symbols = {
+        packet.symbol
+        for packet_id, packet in valid_packets.items()
+        if packet_id in requested_ids and packet.action == "close"
+    }
+    lifecycle_sell_symbols = set(authority_plan.authorized_sell_symbols)
+    permitted_sells = lifecycle_sell_symbols | current_batch_close_symbols
+    failures: list[str] = []
+    unauthorized_sells = requested_sells - permitted_sells
+    if unauthorized_sells:
+        failures.append(
+            "picker_sell_symbol_not_authorized_by_database_or_lifecycle:"
+            + ",".join(sorted(unauthorized_sells))
+        )
+    for symbol in requested_sells & permitted_sells:
+        expected_target = (
+            0.0 if symbol in current_batch_close_symbols else authority_plan.targets.get(symbol)
+        )
+        if expected_target is None or abs(targets.get(symbol, 0.0) - expected_target) > 1e-9:
+            failures.append(f"picker_sell_target_not_code_derived:{symbol}")
+    return tuple(sorted(requested_sells & permitted_sells)), failures
+
+
+def _exact_batch_option_close_packets(
+    ledger: PostgresLedger,
+    batch: dict[str, object],
+    batch_payload: dict[str, object],
+    as_of: date,
+    now: datetime | None = None,
+) -> list[OptionDecisionPacket]:
+    close_drafts = {
+        (draft.run_id, draft.draft_id): draft.draft_hash
+        for draft in (
+            OptionDraft.from_dict(item) for item in batch_payload.get("option_drafts", [])
+        )
+        if draft.action == "close"
+    }
+    return [
+        packet
+        for packet in ledger.valid_option_packets(as_of, now)
+        if packet.position_effect == "close"
+        and close_drafts.get((packet.run_id, packet.draft_id)) == packet.draft_hash
+        and packet.prompt_hash == batch["prompt_hash"]
+        and packet.model_id == RESEARCH_MODEL_ID
+    ]
+
+
 def command_picker_authorize_batch(args: argparse.Namespace) -> int:
-    """Authorize today's latest staged batch using fresh execution-side quant data."""
+    """Authorize one exact staged batch using fresh execution-side quant data."""
     as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.now(UTC).date()
     ledger = PostgresLedger.from_env()
-    batch = ledger.latest_staged_batch(as_of)
-    pending = ledger.latest_pending_batch(as_of)
-    if pending is not None and (batch is None or pending["created_at"] >= batch["created_at"]):
-        print(
-            json.dumps(
-                {
-                    "authorized": [],
-                    "reason": "newer_pending_batch_not_finalized",
-                    "pending_batch_id": pending["batch_id"],
-                }
-            )
-        )
-        return 2
+    batch = ledger.finalized_research_batch(args.batch_id)
     if batch is None:
-        print(json.dumps({"authorized": [], "reason": "no_staged_batch"}))
+        print(json.dumps({"authorized": [], "reason": "research_batch_not_finalized_or_found"}))
         return 2
-    payload = batch["payload"]
+    payload = _single_model_batch_payload(batch, as_of=as_of, allowed_statuses={"staged"})
     evidence_items = [EvidenceVersion.from_dict(raw) for raw in payload["evidence"]]
     _verify_official_issuer_mappings(evidence_items)
     evidence = {item.evidence_id: item for item in evidence_items}
-    critics = {
-        item.draft_id: item for item in (CriticVerdict.from_dict(raw) for raw in payload["critics"])
-    }
     quant_raw = json.loads(Path(args.quant).read_text())
     if isinstance(quant_raw, dict):
         quant_values = quant_raw.get("snapshots", quant_raw)
@@ -3161,16 +3148,11 @@ def command_picker_authorize_batch(args: argparse.Namespace) -> int:
     accepted_packets: list[DecisionPacket] = []
     for raw in payload["drafts"]:
         draft = PickerDraft.from_dict(raw)
-        critic = critics.get(draft.draft_id)
-        if critic is None:
-            raise ValueError(f"Missing critic verdict for {draft.draft_id}")
         result = validate_picker_draft(
             draft,
             evidence,
             snapshots.get(draft.symbol),
-            critic,
             prompt_hash=str(batch["prompt_hash"]),
-            model_id=str(batch["model_id"]),
         )
         results.append({"draft_id": draft.draft_id, **result.to_dict()})
         if result.packet is not None:
@@ -3182,6 +3164,7 @@ def command_picker_authorize_batch(args: argparse.Namespace) -> int:
     output_payload = {
         "batch_id": batch["batch_id"],
         "authorized": [packet.to_dict() for packet in accepted_packets],
+        "packets": [packet.to_dict() for packet in accepted_packets],
         "results": results,
     }
     output = Path(args.output)
@@ -3192,17 +3175,32 @@ def command_picker_authorize_batch(args: argparse.Namespace) -> int:
 
 
 def command_picker_plan(args: argparse.Namespace) -> int:
-    """Build a stock-picker target request from authorized packets and broker state."""
+    """Build a target request bound to one finalized research batch."""
     as_of = date.fromisoformat(args.as_of) if args.as_of else datetime.now(UTC).date()
     now = datetime.now(UTC)
-    if args.packets:
-        packets = [DecisionPacket.from_dict(item) for item in _json_items(args.packets, "packets")]
-    else:
-        packets = PostgresLedger.from_env().authorized_packets(as_of, now)
+    ledger = PostgresLedger.from_env()
+    batch = ledger.finalized_research_batch(args.batch_id)
+    if batch is None:
+        raise ValueError("Research batch is not finalized or does not exist")
+    batch_payload = _single_model_batch_payload(
+        batch,
+        as_of=as_of,
+        allowed_statuses={"authorized", "rejected"},
+    )
+    durable_packets = _exact_batch_stock_packets(ledger, batch, batch_payload, as_of, now)
+    supplied_packets = [
+        DecisionPacket.from_dict(item) for item in _json_items(args.packets, "packets")
+    ]
+    if len({packet.packet_id for packet in supplied_packets}) != len(supplied_packets):
+        raise ValueError("Packet fixture contains duplicate packet IDs")
+    durable_by_id = {packet.packet_id: packet for packet in durable_packets}
+    if any(durable_by_id.get(packet.packet_id) != packet for packet in supplied_packets):
+        raise ValueError("Packet fixture does not exactly match durable authorization")
+    packets = supplied_packets
     if args.theses:
         theses = [ActiveThesis.from_dict(item) for item in _json_items(args.theses, "theses")]
     else:
-        theses = PostgresLedger.from_env().active_theses()
+        theses = ledger.active_theses()
 
     snapshot = json.loads(Path(args.snapshot).read_text())
     account = snapshot["account"]
@@ -3296,14 +3294,14 @@ def command_picker_plan(args: argparse.Namespace) -> int:
         "picker_mode": True,
         "targets": targets,
         "buy_symbol_allowlist": list(plan.authorized_buy_symbols),
-        "sell_symbol_allowlist": sorted(set(plan.authorized_sell_symbols) | held_symbols),
+        "sell_symbol_allowlist": sorted(set(plan.authorized_sell_symbols) | set(legacy_closes)),
         "metadata_by_symbol": metadata,
         "authorization_packet_ids": authorization_packet_ids,
         "max_position_weight": 0.035,
         "picker_plan": plan.to_dict(),
         "unmanaged_positions": unmanaged_symbols,
         "legacy_position_closes": legacy_closes,
-        "research_batch_id": str(snapshot.get("research_batch_id", "")),
+        "research_batch_id": args.batch_id,
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -3887,27 +3885,25 @@ def _broker_equity_shares(
 
 
 def command_option_authorize_batch(args: argparse.Namespace) -> int:
-    """Authorize staged option drafts using fresh broker-native contract quotes."""
+    """Authorize one exact batch's option drafts using fresh broker-native quotes."""
     now = datetime.now(UTC)
     as_of = date.fromisoformat(args.as_of) if args.as_of else now.date()
     ledger = PostgresLedger.from_env()
-    batch = ledger.latest_research_batch(as_of)
-    pending = ledger.latest_pending_batch(as_of)
-    if pending is not None and (batch is None or pending["created_at"] >= batch["created_at"]):
+    batch = ledger.finalized_research_batch(args.batch_id)
+    if batch is None:
         payload = {
             "authorized": [],
             "results": [],
-            "reason": "newer_pending_batch_not_finalized",
-            "pending_batch_id": pending["batch_id"],
+            "reason": "research_batch_not_finalized_or_found",
         }
         print(json.dumps(payload))
         return 2
-    if batch is None:
-        payload = {"authorized": [], "results": [], "reason": "no_staged_batch"}
-        print(json.dumps(payload))
-        return 2
 
-    staged = batch["payload"]
+    staged = _single_model_batch_payload(
+        batch,
+        as_of=as_of,
+        allowed_statuses={"staged", "authorized", "rejected"},
+    )
     option_drafts = [OptionDraft.from_dict(item) for item in staged.get("option_drafts", [])]
     if not option_drafts:
         payload = {"authorized": [], "results": [], "reason": "no_option_drafts"}
@@ -3954,9 +3950,6 @@ def command_option_authorize_batch(args: argparse.Namespace) -> int:
         item.draft_id: item
         for item in (PickerDraft.from_dict(raw) for raw in staged.get("drafts", []))
     }
-    critics = {
-        item.draft_id: item for item in (CriticVerdict.from_dict(raw) for raw in staged["critics"])
-    }
     contracts = [OptionContractSnapshot.from_dict(raw) for raw in snapshot.get("contracts", [])]
     positions = ledger.option_positions()
     equity = float(account["equity"])
@@ -3983,25 +3976,22 @@ def command_option_authorize_batch(args: argparse.Namespace) -> int:
     authorized: list[OptionDecisionPacket] = []
 
     for draft in option_drafts:
-        source = source_drafts.get(draft.source_draft_id or "")
-        critic = critics.get(draft.source_draft_id or draft.draft_id)
-        if critic is None:
+        if draft.action not in {"close", "reject"} and not NEW_OPTION_OPENINGS_ALLOWED:
             results.append(
                 {
                     "draft_id": draft.draft_id,
                     "accepted": False,
-                    "reasons": ["missing_critic"],
+                    "reasons": ["new_option_openings_disabled"],
                     "packet": None,
                 }
             )
             continue
+        source = source_drafts.get(draft.source_draft_id or "")
         result = validate_option_draft(
             draft,
             evidence,
             contracts,
-            critic,
             prompt_hash=str(batch["prompt_hash"]),
-            model_id=str(batch["model_id"]),
             account_equity=equity,
             available_cash=available_cash,
             open_positions=positions,
@@ -4020,6 +4010,7 @@ def command_option_authorize_batch(args: argparse.Namespace) -> int:
 
     output_payload = {
         "batch_id": batch["batch_id"],
+        "new_option_openings_allowed": NEW_OPTION_OPENINGS_ALLOWED,
         "authorized": [packet.to_dict() for packet in authorized],
         "results": results,
     }
@@ -4216,6 +4207,21 @@ def _option_plan(args: argparse.Namespace) -> int:
     configured_account = _paired_broker_account(raw_account)
 
     ledger = PostgresLedger.from_env()
+    batch = ledger.finalized_research_batch(args.batch_id)
+    if batch is None:
+        raise ValueError("Option plan research batch is not finalized or does not exist")
+    batch_payload = _single_model_batch_payload(
+        batch,
+        as_of=as_of,
+        allowed_statuses={"authorized", "rejected"},
+    )
+    close_packets = _exact_batch_option_close_packets(
+        ledger,
+        batch,
+        batch_payload,
+        as_of,
+        now,
+    )
     control = ledger.control_state(account_key(configured_account))
     positions = ledger.option_positions()
     account_payload = dict(raw_account)
@@ -4227,11 +4233,12 @@ def _option_plan(args: argparse.Namespace) -> int:
     planned_equity_entry_orders = 0
     planned_equity_notional = 0.0
     planned_equity_entry_notional = 0.0
-    research_batch_id = ""
+    research_batch_id = args.batch_id
     equity_plan_path = Path(args.equity_plan)
     if equity_plan_path.exists():
         equity_plan = json.loads(equity_plan_path.read_text())
-        research_batch_id = str(equity_plan.get("research_batch_id", ""))
+        if str(equity_plan.get("research_batch_id", "")) != research_batch_id:
+            raise ValueError("Equity and option plans must use the same exact research batch")
         equity_approved_orders = equity_plan.get("approved_orders", [])
         planned_equity_orders = len(equity_approved_orders)
         equity_entry_orders = [
@@ -4264,7 +4271,6 @@ def _option_plan(args: argparse.Namespace) -> int:
         persisted_notional_today=persisted_notional_today,
         persisted_entry_notional_today=persisted_entry_notional_today,
     )
-    packets = ledger.valid_option_packets(as_of, now)
     contracts = {
         item.option_id: item
         for item in (OptionContractSnapshot.from_dict(raw) for raw in snapshot.get("contracts", []))
@@ -4297,47 +4303,38 @@ def _option_plan(args: argparse.Namespace) -> int:
             ),
         )
 
+    authorized_close_ids = {packet.option_id for packet in close_packets}
+    missing_mandatory_packet_ids = sorted(
+        option_id
+        for option_id in account.mandatory_close_option_ids
+        if option_id not in authorized_close_ids
+    )
+    if missing_mandatory_packet_ids:
+        account = replace(
+            account,
+            external_halt_reasons=(
+                *account.external_halt_reasons,
+                *(
+                    f"mandatory_option_close_packet_missing:{option_id}"
+                    for option_id in missing_mandatory_packet_ids
+                ),
+            ),
+        )
+
     orders: list[ProposedOptionOrder] = []
     order_packet_ids: dict[str, str] = {}
-    for position in positions:
-        if (
-            position.status not in {"pending_open", "open", "closing"}
-            or position.option_id not in account.mandatory_close_option_ids
-        ):
-            continue
-        contract = contracts.get(position.option_id)
-        if contract is None:
-            continue
-        side = "sell" if position.side == "long" else "buy"
-        limit_price = contract.bid if side == "sell" else contract.ask
-        order = ProposedOptionOrder(
-            account_number=configured_account,
-            option_id=position.option_id,
-            chain_symbol=position.underlying,
-            strategy="close",
-            option_type=position.option_type,
-            side=side,
-            position_effect="close",
-            quantity=1,
-            limit_price=limit_price,
-            bid_price=contract.bid,
-            ask_price=contract.ask,
-            quote_timestamp=contract.quote_at,
-            expiration_date=contract.expiration_date,
-            strike_price=contract.strike,
-            rationale="Mandatory close no later than five trading days before expiry",
-            order_date=as_of,
-        )
-        orders.append(order)
-        order_packet_ids[order.ref_id] = position.packet_id
-
-    planned_option_ids = {order.option_id for order in orders}
-    for packet in packets:
-        if packet.option_id in planned_option_ids:
+    unavailable_close_packet_ids: list[str] = []
+    active_option_ids = {
+        position.option_id
+        for position in positions
+        if position.status in {"pending_open", "open", "closing"}
+    }
+    for packet in close_packets:
+        if packet.option_id not in active_option_ids:
+            unavailable_close_packet_ids.append(packet.packet_id)
             continue
         order = _order_from_option_packet(packet, configured_account)
         orders.append(order)
-        planned_option_ids.add(order.option_id)
         order_packet_ids[order.ref_id] = packet.packet_id
 
     decisions = evaluate_option_batch(orders, account, root=args.root, now=now)
@@ -4360,6 +4357,15 @@ def _option_plan(args: argparse.Namespace) -> int:
         }
         for option_id in missing_mandatory_quote_ids
     )
+    rejected.extend(
+        {
+            "packet_id": packet_id,
+            "position_effect": "close",
+            "approved": False,
+            "reasons": ["authorized_close_position_unavailable"],
+        }
+        for packet_id in unavailable_close_packet_ids
+    )
     payload = {
         "mode": "PLAN_ONLY_REQUIRES_HUMAN_APPROVAL",
         "planned_at": now.isoformat(),
@@ -4379,6 +4385,7 @@ def _option_plan(args: argparse.Namespace) -> int:
         "option_openings_already_used_today": account.option_openings_today,
         "open_option_positions": account.open_option_positions,
         "research_batch_id": research_batch_id,
+        "new_option_openings_allowed": NEW_OPTION_OPENINGS_ALLOWED,
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -4443,6 +4450,38 @@ def command_option_reserve(args: argparse.Namespace) -> int:
         )
         for order in plan.get("approved_orders", [])
     ]
+    if any(item[2] for item in budget_reservations) and not NEW_OPTION_OPENINGS_ALLOWED:
+        raise ValueError("New option openings are disabled in the active canary")
+    batch = ledger.finalized_research_batch(research_batch_id)
+    if batch is None:
+        raise ValueError("Option reservation research batch is not finalized or does not exist")
+    batch_payload = _single_model_batch_payload(
+        batch,
+        as_of=trade_date,
+        allowed_statuses={"authorized", "rejected"},
+    )
+    close_packets = {
+        packet.packet_id: packet
+        for packet in _exact_batch_option_close_packets(
+            ledger,
+            batch,
+            batch_payload,
+            trade_date,
+            now,
+        )
+    }
+    for raw_order in plan.get("approved_orders", []):
+        packet_id = str(raw_order.get("packet_id") or "")
+        packet = close_packets.get(packet_id)
+        if packet is None:
+            raise ValueError(f"Option close plan references unavailable packet {packet_id}")
+        actual_order = ProposedOptionOrder.from_dict(raw_order)
+        expected_order = _order_from_option_packet(packet, configured_account)
+        if (
+            actual_order.review_parameters() != expected_order.review_parameters()
+            or actual_order.place_parameters() != expected_order.place_parameters()
+        ):
+            raise ValueError(f"Option close plan differs from authorized packet {packet_id}")
     exit_budget = [item for item in budget_reservations if not item[2]]
     entry_budget = [item for item in budget_reservations if item[2]]
     observed_usage = (
@@ -4490,9 +4529,6 @@ def command_option_reserve(args: argparse.Namespace) -> int:
         root=getattr(args, "root", "."),
         day=trade_date,
     )
-    packets = {
-        packet.packet_id: packet for packet in ledger.valid_option_packets(datetime.now(UTC).date())
-    }
     available_cash = float(account["cash"]) - float(account.get("pending_deposits", 0.0))
     broker_equity_positions = account.get("broker_equity_positions")
     if not isinstance(broker_equity_positions, list):
@@ -4508,7 +4544,7 @@ def command_option_reserve(args: argparse.Namespace) -> int:
         if str(order.get("position_effect")) != "open":
             continue
         packet_id = str(order.get("packet_id") or "")
-        packet = packets.get(packet_id)
+        packet = close_packets.get(packet_id)
         if packet is None:
             raise ValueError(f"Option plan references unavailable packet {packet_id}")
         if not (packet.collateral_required or packet.shares_encumbered):
@@ -4696,7 +4732,7 @@ def command_option_sync(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentic-trader",
-        description="Research and paper-trade a guarded momentum strategy.",
+        description="Research and plan guarded live trading.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -4997,30 +5033,21 @@ def build_parser() -> argparse.ArgumentParser:
     picker_validate.add_argument("--draft", required=True)
     picker_validate.add_argument("--evidence", required=True)
     picker_validate.add_argument("--quant", required=True)
-    picker_validate.add_argument("--critic", required=True)
     picker_validate.add_argument("--prompt-file")
     picker_validate.add_argument("--prompt-hash")
-    picker_validate.add_argument("--model-id", required=True)
     picker_validate.add_argument("--persist", action="store_true")
     picker_validate.add_argument("--output", default="artifacts/picker/validation.json")
     picker_validate.set_defaults(func=command_picker_validate)
 
     picker_stage = subparsers.add_parser(
-        "picker-stage", help="Stage a research/critic batch in the durable decision ledger"
+        "picker-stage", help="Directly stage one single-model research batch"
     )
     picker_stage.add_argument("--bundle", required=True)
     picker_stage.set_defaults(func=command_picker_stage)
 
-    picker_stage_pending = subparsers.add_parser(
-        "picker-stage-pending",
-        help="Stage analyst output for a separate independent critic",
-    )
-    picker_stage_pending.add_argument("--bundle", required=True)
-    picker_stage_pending.set_defaults(func=command_picker_stage_pending)
-
     picker_cycle_start = subparsers.add_parser(
         "picker-cycle-start",
-        help="Create a durable marker before an analyst cycle begins",
+        help="Create a durable marker before a research cycle begins",
     )
     picker_cycle_start.add_argument("--cycle-id", required=True)
     picker_cycle_start.add_argument("--as-of")
@@ -5028,26 +5055,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     picker_cycle_fail = subparsers.add_parser(
         "picker-cycle-fail",
-        help="Release a failed analyst or critic cycle marker",
+        help="Release a failed research cycle marker",
     )
     picker_cycle_fail.add_argument("--cycle-id", required=True)
     picker_cycle_fail.set_defaults(func=command_picker_cycle_fail)
-
-    picker_export_pending = subparsers.add_parser(
-        "picker-export-pending",
-        help="Export today's latest pending research batch for criticism",
-    )
-    picker_export_pending.add_argument("--as-of")
-    picker_export_pending.add_argument("--output", default="artifacts/picker/pending-research.json")
-    picker_export_pending.set_defaults(func=command_picker_export_pending)
-
-    picker_finalize_pending = subparsers.add_parser(
-        "picker-finalize-pending",
-        help="Attach independent critics and promote a pending batch",
-    )
-    picker_finalize_pending.add_argument("--critics", required=True)
-    picker_finalize_pending.add_argument("--as-of")
-    picker_finalize_pending.set_defaults(func=command_picker_finalize_pending)
 
     picker_verify = subparsers.add_parser(
         "picker-verify-evidence",
@@ -5077,8 +5088,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     picker_authorize = subparsers.add_parser(
         "picker-authorize-batch",
-        help="Authorize today's staged batch using fresh broker-side quant snapshots",
+        help="Authorize an exact staged batch using fresh broker-side quant snapshots",
     )
+    picker_authorize.add_argument("--batch-id", required=True)
     picker_authorize.add_argument("--quant", required=True)
     picker_authorize.add_argument("--as-of")
     picker_authorize.add_argument("--output", default="artifacts/picker/authorized-batch.json")
@@ -5087,8 +5099,9 @@ def build_parser() -> argparse.ArgumentParser:
     picker_plan = subparsers.add_parser(
         "picker-plan", help="Build a live-plan request from authorized AI stock picks"
     )
+    picker_plan.add_argument("--batch-id", required=True)
     picker_plan.add_argument("--snapshot", required=True)
-    picker_plan.add_argument("--packets", help="Authorized packet fixture; DB used when omitted")
+    picker_plan.add_argument("--packets", required=True, help="Exact authorization output")
     picker_plan.add_argument("--theses", help="Active-thesis fixture; DB used when omitted")
     picker_plan.add_argument("--as-of")
     picker_plan.add_argument("--output", default="artifacts/live/request.json")
@@ -5147,8 +5160,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     option_authorize = subparsers.add_parser(
         "option-authorize-batch",
-        help="Authorize staged Level 2 option drafts using live broker quotes",
+        help="Authorize an exact batch's Level 2 option drafts using live broker quotes",
     )
+    option_authorize.add_argument("--batch-id", required=True)
     option_authorize.add_argument("--snapshot", required=True)
     option_authorize.add_argument("--as-of")
     option_authorize.add_argument("--output", default="artifacts/options/authorized.json")
@@ -5170,8 +5184,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     option_plan = subparsers.add_parser(
         "option-plan",
-        help="Build a broker-ready plan from authorized Level 2 option packets",
+        help="Build an exact-batch close-only option plan",
     )
+    option_plan.add_argument("--batch-id", required=True)
     option_plan.add_argument("--snapshot", required=True)
     option_plan.add_argument("--as-of")
     option_plan.add_argument("--root", default=".")

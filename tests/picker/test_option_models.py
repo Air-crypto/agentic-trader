@@ -50,7 +50,7 @@ def packet(now) -> OptionDecisionPacket:
         shares_encumbered=0,
         evidence_ids=("issuer-1", "gov-1"),
         prompt_hash="a" * 64,
-        model_id="option-model",
+        model_id="gpt-5.6-sol",
         draft_hash="b" * 64,
         horizon_trading_days=20,
         invalidation="Close if the evidence-grounded catalyst is disproven.",
